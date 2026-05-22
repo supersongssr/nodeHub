@@ -781,6 +781,79 @@ Step3_InstallNginx() {
 }
 
 # ============================================================
+# Step 3.5: hy2 动态端口 iptables UDP 映射 (30000-32000 → 443)
+# 条件: 仅当 ~/.env 中 HY2_PORT_HOP="yes" 时执行
+# ============================================================
+Step3_5_SetupHy2PortHop() {
+    # 开关控制 — 未启用则跳过
+    if [ "${HY2_PORT_HOP:-}" != "yes" ]; then
+        log info "Step 3.5 跳过 — HY2_PORT_HOP 未启用"
+        return 0
+    fi
+
+    _hop_start="${HY2_PORT_HOP_START:-30000}"
+    _hop_end="${HY2_PORT_HOP_END:-32000}"
+    _hop_target="${HY2_PORT_HOP_TARGET:-443}"
+
+    log info "Step 3.5: 配置 hy2 动态端口映射 ${_hop_start}-${_hop_end}/UDP → ${_hop_target}/UDP"
+
+    # 安装 iptables-persistent
+    apt-get install -y -qq iptables-persistent
+
+    # IPv4 规则 (幂等: -C 检查存在则跳过)
+    if ! iptables -t nat -C PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}" 2>/dev/null; then
+        iptables -t nat -A PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}"
+        log info "IPv4 iptables 规则已添加"
+    else
+        log info "IPv4 iptables 规则已存在，跳过"
+    fi
+
+    # IPv6 规则 (幂等)
+    if ! ip6tables -t nat -C PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}" 2>/dev/null; then
+        ip6tables -t nat -A PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}"
+        log info "IPv6 iptables 规则已添加"
+    else
+        log info "IPv6 iptables 规则已存在，跳过"
+    fi
+
+    # 持久化
+    netfilter-persistent save
+    log info "iptables 规则已持久化 (netfilter-persistent)"
+
+    # 备用: 写入 systemd service 确保重启后生效
+    _rule_script="/usr/local/bin/hy2-port-hop-rules.sh"
+    cat > "$_rule_script" << RULE_EOF
+#!/bin/sh
+iptables -t nat -C PREROUTING -p udp --dport ${_hop_start}:${_hop_end} -j REDIRECT --to-port ${_hop_target} 2>/dev/null || \\
+    iptables -t nat -A PREROUTING -p udp --dport ${_hop_start}:${_hop_end} -j REDIRECT --to-port ${_hop_target}
+ip6tables -t nat -C PREROUTING -p udp --dport ${_hop_start}:${_hop_end} -j REDIRECT --to-port ${_hop_target} 2>/dev/null || \\
+    ip6tables -t nat -A PREROUTING -p udp --dport ${_hop_start}:${_hop_end} -j REDIRECT --to-port ${_hop_target}
+RULE_EOF
+    chmod +x "$_rule_script"
+
+    _service_file="/etc/systemd/system/hy2-port-hop.service"
+    cat > "$_service_file" << SVC_EOF
+[Unit]
+Description=Hysteria2 Port Hopping iptables rules (${_hop_start}-${_hop_end} → ${_hop_target}/UDP)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${_rule_script}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+
+    systemctl daemon-reload
+    systemctl enable hy2-port-hop
+    log info "hy2-port-hop systemd service 已启用"
+
+    log info "Step 3.5 完成 — 端口映射: ${_hop_start}-${_hop_end}/UDP → ${_hop_target}/UDP"
+}
+
+# ============================================================
 # Step 4: 部署 nodeAgent.sh 到 /etc/crontab
 # ============================================================
 Step4_DeployCrontab() {
@@ -826,6 +899,7 @@ Main() {
     Step1_5_DownloadSSL
     Step3_InstallNginx
     Step3_InstallXray
+    Step3_5_SetupHy2PortHop
     Step2_ResolveDns
     Step4_DeployCrontab
 
