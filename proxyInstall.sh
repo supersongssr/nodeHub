@@ -128,6 +128,11 @@ SetNodeEnv() {
 LoadEnv() {
     log info "===== proxyInstall.sh ${VERSION} 启动 ====="
 
+    # 0. 保存外部环境变量 (最高优先级)
+    _ENV_NODE_ID="${NODE_ID:-}"
+    _ENV_ROOT_DOMAIN="${ROOT_DOMAIN:-}"
+    _ENV_NODE_LEVEL="${NODE_LEVEL:-}"
+
     # 1. 加载 ~/.env (用户手工只读配置 — 全大写变量)
     if [ -f ~/.env ]; then
         # shellcheck disable=SC1090
@@ -176,6 +181,9 @@ LoadEnv() {
         log debug "~/node.env 不存在，首次安装"
     fi
 
+    # 外部环境变量 NODE_ID 为最高优先级，覆盖 ~/.env 和 ~/node.env 的值
+    [ -n "${_ENV_NODE_ID}" ] && NODE_ID="${_ENV_NODE_ID}" && log info "环境变量 NODE_ID=${NODE_ID} (最高优先级)"
+
     # ----------------------------------------------------------
     # ~/.env 大写变量 → 透传（无默认值，由 panel 下发）
     # 命名空间隔离: ~/.env 全大写 | ~/node.env 全小写
@@ -190,8 +198,9 @@ LoadEnv() {
     # 节点分组 (可选)
     node_group="${NODE_GROUP:-}"
 
-    # 访问等级 (可选)
-    node_level="${NODE_LEVEL:-}"
+    # 访问等级 (可选) — 环境变量 NODE_LEVEL > ~/.env 中的 NODE_LEVEL
+    node_level="${_ENV_NODE_LEVEL:-${NODE_LEVEL:-}}"
+    [ -n "${_ENV_NODE_LEVEL}" ] && log info "环境变量 NODE_LEVEL=${node_level} (最高优先级)"
 
     # 月流量额度 / 重置日 / 成本 (必填，已在上方校验)
     node_traffic_limit="${NODE_TRAFFIC_LIMIT}"
@@ -210,8 +219,12 @@ LoadEnv() {
     # 节点描述 (可选)
     node_info="${NODE_INFO:-}"
 
-    # root_domain: 优先使用 ~/node.env (API 分配的 root_domain)，其次 ~/.env (ROOT_DOMAIN)
+    # root_domain: 环境变量 ROOT_DOMAIN > ~/node.env (root_domain)
     root_domain="${root_domain:-${ROOT_DOMAIN:-}}"
+    [ -n "${_ENV_ROOT_DOMAIN}" ] && root_domain="${_ENV_ROOT_DOMAIN}" && log info "环境变量 ROOT_DOMAIN=${root_domain} (最高优先级)"
+
+    # node_level 三级优先级: 环境变量 > ~/.env > ~/node.json
+    # (~/node.json 缓存在 Step1_Register 中读取，若当前 node_level 为空则用缓存值填充)
 
     log debug "透传变量汇总:"
     log debug "  v2_name=${v2_name:-空} node_rxtx=${node_rxtx:-空} node_group=${node_group:-空}"
@@ -457,9 +470,150 @@ InitSystem() {
     apt-get update -qq
     command -v jq >/dev/null 2>&1     || apt-get install -y -qq jq
     command -v curl >/dev/null 2>&1   || apt-get install -y -qq curl
-    command -v nginx >/dev/null 2>&1  || apt-get install -y -qq nginx
     command -v vnstat >/dev/null 2>&1 || apt-get install -y -qq vnstat
+
+    # Nginx: 先安装系统默认版本, 后续由 EnsureNginxLatest 升级
+    command -v nginx >/dev/null 2>&1  || apt-get install -y -qq nginx
+
+    log info "预先停止 nginx xray 服务"
+    systemctl stop nginx 2>/dev/null || true
+    systemctl stop xray 2>/dev/null || true
+
     log info "基础系统调优完成"
+}
+
+# ============================================================
+# B1. 防火墙配置 — 自动检测 ufw / firewalld 并放行必要端口
+# 放行端口: 22/tcp (SSH), 80/tcp (HTTP/ACME), 443/tcp (VLESS/TLS),
+#           443/udp (Hysteria2), 30000-32000/udp (hy2 port hop)
+# 策略: 优先放行端口; 若 ufw/firewalld 均未安装则尝试禁用 iptables INPUT DROP
+# ============================================================
+ConfigureFirewall() {
+    log info "配置防火墙 — 禁用防火墙以确保代理端口可达"
+
+    # ---- ufw ----
+    if command -v ufw >/dev/null 2>&1; then
+        _ufw_status=$(ufw status 2>/dev/null | head -1 | awk '{print $2}')
+        if [ "${_ufw_status}" = "active" ]; then
+            echo "y" | ufw disable >/dev/null 2>&1
+            log info "ufw 已禁用"
+        else
+            log info "ufw 未启用，跳过"
+        fi
+        systemctl disable ufw 2>/dev/null || true
+    fi
+
+    # ---- firewalld ----
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+        systemctl stop firewalld
+        systemctl disable firewalld
+        log info "firewalld 已停止并禁用"
+    fi
+
+    # ---- iptables 兜底: 确保 INPUT 策略为 ACCEPT，并放行所有代理端口 ----
+    if ! command -v iptables >/dev/null 2>&1; then
+        log info "iptables 未安装，跳过 iptables 配置"
+        return 0
+    fi
+
+    _need_iptables=false
+    _input_policy=$(iptables -L INPUT -n 2>/dev/null | head -1 | awk '{print $NF}')
+    if [ "${_input_policy}" = "DROP" ] || [ "${_input_policy}" = "REJECT" ]; then
+        iptables -P INPUT ACCEPT
+        _need_iptables=true
+        log warn "iptables INPUT 默认策略已改为 ACCEPT"
+    fi
+
+    # 确保 22/tcp 80/tcp 443/tcp 443/udp 2053/tcp 2053/udp 30000-32000/udp 已放行
+    for _port in 22 80 443 2053; do
+        iptables -C INPUT -p tcp --dport "${_port}" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT 1 -p tcp --dport "${_port}" -j ACCEPT
+    done
+    for _port in 443 2053; do
+        iptables -C INPUT -p udp --dport "${_port}" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT 1 -p udp --dport "${_port}" -j ACCEPT
+    done
+    iptables -C INPUT -p udp -m multiport --dports 30000:32000 -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT 1 -p udp -m multiport --dports 30000:32000 -j ACCEPT
+
+    log info "防火墙配置完成 — iptables 端口已放行: 22/tcp 80/tcp 443/tcp+udp 2053/tcp+udp 30000-32000/udp"
+}
+
+# ============================================================
+# B2. 确保 Nginx >= 1.25.1 (避免 http2 监听语法混淆)
+# nginx < 1.25.1: listen 443 ssl http2;    (旧语法)
+# nginx >= 1.25.1: listen 443 ssl; http2 on; (新语法, 旧语法仅警告可用)
+# Debian 11(bullseye)/12(bookworm) 自带旧版, 需添加官方 mainline 源升级
+# Debian 13(trixie) 自带新版, 无需升级
+# ============================================================
+EnsureNginxLatest() {
+    log info "检查 Nginx 版本并确保 >= 1.25.1 ..."
+
+    # 安装前置依赖
+    apt-get install -y -qq curl gnupg2 ca-certificates lsb-release
+
+    # 获取 Debian 版本代号
+    _debian_codename=$(lsb_release -cs 2>/dev/null || echo "unknown")
+    log debug "Debian 版本代号: ${_debian_codename}"
+
+    # 获取当前 nginx 版本 (确保 nginx 已安装)
+    if ! command -v nginx >/dev/null 2>&1; then
+        log info "nginx 未安装，先安装系统默认版本..."
+        apt-get install -y -qq nginx || die "nginx 安装失败"
+    fi
+
+    _nginx_version=$(nginx -v 2>&1 | grep -oP 'nginx/\K[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
+    log info "当前 Nginx 版本: ${_nginx_version}"
+
+    # 版本比较: >= 1.25.1 则跳过升级
+    _need_upgrade=$(echo "${_nginx_version} 1.25.1" | awk '{if ($1 >= $2) print "no"; else print "yes"}')
+
+    if [ "${_need_upgrade}" = "no" ]; then
+        log info "Nginx 版本 ${_nginx_version} >= 1.25.1，无需升级"
+        return 0
+    fi
+
+    log info "Nginx ${_nginx_version} < 1.25.1，升级到官方 mainline..."
+
+    # Debian 13 自带新版，不应走到这里; 若走到此处则尝试升级
+    if [ "${_debian_codename}" = "trixie" ] || [ "${_debian_codename}" = "sid" ]; then
+        log warn "Debian ${_debian_codename} 自带 nginx 应 >= 1.26, 但检测到旧版, 尝试 apt upgrade..."
+        apt-get update -qq
+        apt-get install -y -qq nginx
+    else
+        # Debian 11/12: 添加官方 nginx mainline 仓库
+        log info "添加 nginx 官方 mainline 仓库 (Debian ${_debian_codename})..."
+
+        # 导入官方签名密钥
+        curl -fsSL https://nginx.org/keys/nginx_signing.key | \
+            gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg 2>/dev/null
+
+        # 写入 mainline 仓库源
+        cat > /etc/apt/sources.list.d/nginx.list << NGINX_REPO_EOF
+deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/mainline/debian/ ${_debian_codename} nginx
+NGINX_REPO_EOF
+
+        # Pin 优先级: 优先使用 nginx 官方仓库
+        cat > /etc/apt/preferences.d/99nginx << PIN_EOF
+Package: *
+Pin: origin nginx.org
+Pin: release o=nginx
+Pin-Priority: 900
+PIN_EOF
+
+        apt-get update -qq
+        apt-get install -y -qq nginx || die "nginx 升级失败"
+    fi
+
+    _new_version=$(nginx -v 2>&1 | grep -oP 'nginx/\K[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
+    log info "Nginx 已升级到 ${_new_version}"
+
+    # 二次校验
+    if [ "$(echo "${_new_version} 1.25.1" | awk '{if ($1 >= $2) print "ok"; else print "fail"}')" = "fail" ]; then
+        die "Nginx 升级后版本仍为 ${_new_version} < 1.25.1"
+    fi
+
+    log info "Nginx 版本检查通过 (>= 1.25.1)"
 }
 
 # ============================================================
@@ -480,7 +634,7 @@ ApiCall() {
 
     _url="${API_URL}${_path}"
     log info "API 调用: ${_method} ${_url}"
-    log debug "API 参数: $(printf '%.300s' "$_api_data")"
+    log debug "API 完整参数: ${_api_data}"
 
     _curl_err=/tmp/_v2_curl_err_$$
     if [ "$_method" = "GET" ]; then
@@ -507,7 +661,8 @@ ApiCall() {
     http_code=$(echo "$response" | tail -1)
     body=$(echo "$response" | sed '$d')
 
-    log debug "HTTP ${http_code} — body 长度=${#body} — $(printf '%.200s' "$body")"
+    log debug "HTTP ${http_code} — body 长度=${#body}"
+    log debug "HTTP ${http_code} — body 完整内容: ${body}"
 
     AssertNotEmpty "ApiCall: http_code 非空" "${http_code:-}"
     # 验证 http_code 为纯数字
@@ -536,6 +691,8 @@ ApiCall() {
 Step0_ApplyId() {
     if [ -n "${NODE_ID:-}" ]; then
         log info "Step 0 跳过 — 已有 NODE_ID=${NODE_ID}"
+        # 确保持久化到 ~/node.env (环境变量传入时 node.env 可能没有该值)
+        SetNodeEnv "node_id" "$NODE_ID"
         return 0
     fi
 
@@ -558,6 +715,34 @@ Step0_ApplyId() {
 }
 
 # ============================================================
+# Step 0.5: 安装 ServerStatus 客户端
+# 在 Step0 获取 node_id 之后，下载并运行 serverstatus_client_install.sh
+# ============================================================
+Step0_5_InstallServerStatus() {
+    log info "Step 0.5: 安装 ServerStatus 客户端"
+
+    # 已安装则跳过
+    if [ -f /opt/ServerStatus/client/stat_client ]; then
+        log info "stat_client 已存在，跳过安装"
+        return 0
+    fi
+
+    _script_name="serverstatus_client_install.sh"
+    _script_url="${NODEHUB_URL}/scripts/${_script_name}"
+
+    cd /tmp
+    wget -N --timeout=60 --tries=3 "${_script_url}" || die "${_script_name} 下载失败: ${_script_url}"
+    chmod +x "/tmp/${_script_name}"
+
+    log info "开始运行 ${_script_name}..."
+    if sh "/tmp/${_script_name}"; then
+        log info "Step 0.5 完成 — ServerStatus 客户端已安装"
+    else
+        log error "${_script_name} 运行失败，跳过 ServerStatus 安装"
+    fi
+}
+
+# ============================================================
 # Step 1: 注册节点信息与裂变
 # 所有字段严格对齐 npanel-node-api-v2.md 全量契约
 # ============================================================
@@ -567,6 +752,15 @@ Step1_Register() {
     # 采集硬件 + 地理 + 网络信息
     ProbeHardware
     ProbeGeo
+
+    # 采集网卡原始 rx/tx 字节数 (参考 nodeAgent.sh CollectRawTraffic)
+    _rx_file="/sys/class/net/${NET_CARD}/statistics/rx_bytes"
+    _tx_file="/sys/class/net/${NET_CARD}/statistics/tx_bytes"
+    [ ! -f "$_rx_file" ] && die "网卡 ${NET_CARD} 的 rx_bytes 文件不存在: ${_rx_file}"
+    [ ! -f "$_tx_file" ] && die "网卡 ${NET_CARD} 的 tx_bytes 文件不存在: ${_tx_file}"
+    raw_rx=$(cat "$_rx_file")
+    raw_tx=$(cat "$_tx_file")
+    log info "网卡流量采集 — raw_rx=${raw_rx} raw_tx=${raw_tx} (${NET_CARD})"
 
     # 媒体解锁检测
     RunMediaUnlockCheck
@@ -580,7 +774,8 @@ Step1_Register() {
         _cached_node_ids=$(jq -r '.node_ids // empty' ~/node.json 2>/dev/null || true)
         _cached_root_domain=$(jq -r '.root_domain // empty' ~/node.json 2>/dev/null || true)
         _cached_v2_name=$(jq -r '.v2_name // empty' ~/node.json 2>/dev/null || true)
-        log info "node.json 缓存: node_id=${_cached_node_id:-无} node_ids=${_cached_node_ids:-无} root_domain=${_cached_root_domain:-无} v2_name=${_cached_v2_name:-无}"
+        _cached_node_level=$(jq -r '.node_level // empty' ~/node.json 2>/dev/null || true)
+        log info "node.json 缓存: node_id=${_cached_node_id:-无} node_ids=${_cached_node_ids:-无} root_domain=${_cached_root_domain:-无} v2_name=${_cached_v2_name:-无} node_level=${_cached_node_level:-无}"
     else
         log debug "~/node.json 不存在，首次安装"
     fi
@@ -591,13 +786,16 @@ Step1_Register() {
         log debug "~/status.json 不存在，首次安装"
     fi
 
-    # 环境变量覆盖 — V2_NAME / TRAFFIC_USED 为最高优先级
+    # 环境变量覆盖 — V2_NAME / TRAFFIC_USED / TRAFFIC_USED_GB 为最高优先级
     if [ -n "${V2_NAME:-}" ]; then
         _cached_v2_name="${V2_NAME}"
         v2_name="${V2_NAME}"
         log info "V2_NAME 环境变量覆盖: v2_name=${V2_NAME}"
     fi
-    if [ -n "${TRAFFIC_USED_GB:-}" ]; then
+    if [ -n "${TRAFFIC_USED:-}" ]; then
+        _cached_traffic_used="${TRAFFIC_USED}"
+        log info "TRAFFIC_USED 环境变量覆盖: ${TRAFFIC_USED} bytes"
+    elif [ -n "${TRAFFIC_USED_GB:-}" ]; then
         _cached_traffic_used=$(awk "BEGIN {printf \"%.0f\", ${TRAFFIC_USED_GB} * 1073741824}")
         log info "TRAFFIC_USED_GB 环境变量覆盖: ${TRAFFIC_USED_GB} GB → ${_cached_traffic_used} bytes"
     fi
@@ -605,6 +803,8 @@ Step1_Register() {
     # 必需字段前置校验
     [ -z "${NODE_ID:-}" ] && die "Step 1 失败: NODE_ID 为空"
     [ -z "${node_ip:-}" ] && [ -z "${node_ipv6:-}" ] && die "Step 1 失败: node_ip 和 node_ipv6 均为空"
+
+    [ -n "${v2_name:-}" ] && log info "v2_name=${v2_name} (由 panel 端验证)" || log info "v2_name 为空，将由 panel 下发"
 
     # 构建 urlencode 参数字符串
     _reg_data="node_id=${NODE_ID}"
@@ -631,11 +831,19 @@ Step1_Register() {
 
 
     # 追加本地缓存字段 — panel 以节点上报值为第一优先级
-    [ -n "${_cached_node_id:-}" ]     && _reg_data="${_reg_data}&node_id=${_cached_node_id}"
+    # 注意: node_id / root_domain / traffic_used 使用缓存值覆盖
+    # v2_name 已在上方校验通过，不再从缓存重复追加 (避免 POST body 中出现两个 v2_name)
     [ -n "${_cached_node_ids:-}" ]    && _reg_data="${_reg_data}&node_ids=${_cached_node_ids}"
     [ -n "${_cached_root_domain:-}" ] && _reg_data="${_reg_data}&root_domain=${_cached_root_domain}"
-    [ -n "${_cached_v2_name:-}" ]     && _reg_data="${_reg_data}&v2_name=${_cached_v2_name}"
     [ -n "${_cached_traffic_used:-}" ] && _reg_data="${_reg_data}&traffic_used=${_cached_traffic_used}"
+
+    # node_level 三级优先级: 环境变量 > ~/.env > ~/node.json
+    # 若当前 node_level 仍为空 (环境变量和 .env 均未设置)，则使用 node.json 缓存值
+    if [ -z "${node_level:-}" ] && [ -n "${_cached_node_level:-}" ]; then
+        node_level="${_cached_node_level}"
+        _reg_data="${_reg_data}&node_level=${node_level}"
+        log info "node_level 使用 node.json 缓存值: ${node_level}"
+    fi
 
     [ -n "${unlock_netflix:-}" ]       && _reg_data="${_reg_data}&unlock_netflix=${unlock_netflix}"
     [ -n "${unlock_chatgpt:-}" ]       && _reg_data="${_reg_data}&unlock_chatgpt=${unlock_chatgpt}"
@@ -650,6 +858,10 @@ Step1_Register() {
     [ -n "${unlock_mewatch:-}" ]       && _reg_data="${_reg_data}&unlock_mewatch=${unlock_mewatch}"
     [ -n "${unlock_google_scholar:-}" ] && _reg_data="${_reg_data}&unlock_google_scholar=${unlock_google_scholar}"
     [ -n "${unlock_notebooklm:-}" ]    && _reg_data="${_reg_data}&unlock_notebooklm=${unlock_notebooklm}"
+
+    # 原始流量字节 — 供 panel 计算初始流量基线
+    [ -n "${raw_rx:-}" ]              && _reg_data="${_reg_data}&raw_rx=${raw_rx}"
+    [ -n "${raw_tx:-}" ]              && _reg_data="${_reg_data}&raw_tx=${raw_tx}"
 
     body=$(ApiCall POST "/api/node/register" "$_reg_data" "yes")
 
@@ -678,7 +890,17 @@ Step1_5_DownloadSSL() {
     wget -N --timeout=60 --tries=3 -P /etc/ssl "${NODEHUB_URL}/ssl/${root_domain}.pem" \
         || die "SSL pem 下载失败: ${NODEHUB_URL}/ssl/${root_domain}.pem"
 
-    log info "SSL 证书已下载: /etc/ssl/${root_domain}.key /etc/ssl/${root_domain}.pem"
+    # 校验 PEM 文件格式 — .pem 必须包含 CERTIFICATE，.key 必须包含 PRIVATE KEY
+    _pem_file="/etc/ssl/${root_domain}.pem"
+    _key_file="/etc/ssl/${root_domain}.key"
+    if ! grep -q 'BEGIN CERTIFICATE' "$_pem_file" 2>/dev/null; then
+        die "SSL 证书格式错误: ${_pem_file} 不包含 CERTIFICATE — 源文件可能损坏，请检查证书服务器"
+    fi
+    if ! grep -q 'PRIVATE KEY' "$_key_file" 2>/dev/null; then
+        die "SSL 私钥格式错误: ${_key_file} 不包含 PRIVATE KEY — 源文件可能损坏，请检查证书服务器"
+    fi
+
+    log info "SSL 证书已下载并校验通过: ${_pem_file} ${_key_file}"
 }
 
 # ============================================================
@@ -747,7 +969,29 @@ Step3_InstallXray() {
 
     systemctl restart xray
     systemctl enable xray
-    log info "Xray 服务已启动"
+
+    # 等待服务稳定后检查状态
+    sleep 2
+    _xray_start_status=$(systemctl is-active xray 2>/dev/null) || true
+    if [ "$_xray_start_status" = "active" ]; then
+        log info "Xray 服务已启动"
+    else
+        log error "Xray 服务启动失败，状态: ${_xray_start_status}"
+        log error "--- xray 诊断信息 ---"
+        # 配置文件校验
+        if [ -f /usr/local/etc/xray/config.json ]; then
+            _config_err=$(/usr/local/bin/xray run -test -config /usr/local/etc/xray/config.json 2>&1) || true
+            log error "配置校验: ${_config_err}"
+        fi
+        # journalctl 最近日志
+        log error "journalctl 最近 20 行:"
+        journalctl -u xray --no-pager -n 20 2>/dev/null | while IFS= read -r _line; do
+            log error "  ${_line}"
+        done
+        # 端口占用检查
+        _listen_ports=$(ss -tlnp 2>/dev/null | grep -E ':(443|80)\b' || true)
+        [ -n "$_listen_ports" ] && log error "端口占用: ${_listen_ports}"
+    fi
 }
 
 # ============================================================
@@ -755,6 +999,9 @@ Step3_InstallXray() {
 # ============================================================
 Step3_InstallNginx() {
     log info "Step 3: 配置 Nginx"
+
+    # 确保 Nginx >= 1.25.1 (新版 http2 语法: http2 on; 而非 listen ... http2)
+    EnsureNginxLatest
 
     # POST /api/node/nginx_config — 前端渲染完整 proxy.conf，节点直接落盘
     http_code=$(curl -sS --connect-timeout 30 --max-time 60 \
@@ -781,58 +1028,121 @@ Step3_InstallNginx() {
 }
 
 # ============================================================
-# Step 3.5: hy2 动态端口 iptables UDP 映射 (30000-32000 → 443)
-# 条件: 仅当 ~/.env 中 HY2_PORT_HOP="yes" 时执行
+# Step 3.5: hy2 动态端口 UDP 映射 (30000-32000 → 443)
+# 自动检测 nftables / iptables 后端，无需手动开关
 # ============================================================
 Step3_5_SetupHy2PortHop() {
-    # 开关控制 — 未启用则跳过
-    if [ "${HY2_PORT_HOP:-}" != "yes" ]; then
-        log info "Step 3.5 跳过 — HY2_PORT_HOP 未启用"
-        return 0
-    fi
-
     _hop_start="${HY2_PORT_HOP_START:-30000}"
     _hop_end="${HY2_PORT_HOP_END:-32000}"
     _hop_target="${HY2_PORT_HOP_TARGET:-443}"
 
-    log info "Step 3.5: 配置 hy2 动态端口映射 ${_hop_start}-${_hop_end}/UDP → ${_hop_target}/UDP"
-
-    # 安装 iptables-persistent
-    apt-get install -y -qq iptables-persistent
-
-    # IPv4 规则 (幂等: -C 检查存在则跳过)
-    if ! iptables -t nat -C PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}" 2>/dev/null; then
-        iptables -t nat -A PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}"
-        log info "IPv4 iptables 规则已添加"
+    # 自动检测可用的防火墙后端，均不可用时尝试安装
+    if command -v nft >/dev/null 2>&1; then
+        _backend="nft"
+    elif command -v iptables >/dev/null 2>&1; then
+        _backend="iptables"
     else
-        log info "IPv4 iptables 规则已存在，跳过"
+        log info "Step 3.5: nft 和 iptables 均不可用，尝试自动安装 nftables"
+        if apt-get install -y -qq nftables 2>/dev/null && command -v nft >/dev/null 2>&1; then
+            _backend="nft"
+            log info "nftables 安装成功"
+        elif apt-get install -y -qq iptables 2>/dev/null && command -v iptables >/dev/null 2>&1; then
+            _backend="iptables"
+            log info "iptables 安装成功"
+        else
+            log error "Step 3.5: nft 和 iptables 安装均失败，跳过端口映射"
+            return 1
+        fi
     fi
 
-    # IPv6 规则 (幂等)
-    if ! ip6tables -t nat -C PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}" 2>/dev/null; then
-        ip6tables -t nat -A PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}"
-        log info "IPv6 iptables 规则已添加"
+    log info "Step 3.5: 配置 hy2 动态端口映射 ${_hop_start}-${_hop_end}/UDP → ${_hop_target}/UDP (后端: ${_backend})"
+
+    # ============================================================
+    # nftables 分支 — 使用 inet 协议族，一条规则同时处理 IPv4+IPv6
+    # ============================================================
+    if [ "${_backend}" = "nft" ]; then
+        # 创建表和链 (幂等: 已存在不报错)
+        nft add table inet nat
+        nft add chain inet nat prerouting '{ type nat hook prerouting priority -100 ; }'
+
+        # 检查规则是否已存在
+        if nft list chain inet nat prerouting 2>/dev/null | grep -q "udp dport ${_hop_start}-${_hop_end} redirect to :${_hop_target}"; then
+            log info "nftables 规则已存在，跳过"
+        else
+            nft add rule inet nat prerouting udp dport "${_hop_start}-${_hop_end}" redirect to :"${_hop_target}"
+            log info "nftables 规则已添加 (inet, IPv4+IPv6)"
+        fi
+
+        # 持久化: 写入 systemd service
+        _rule_script="/usr/local/bin/hy2-port-hop-rules.sh"
+        cat > "$_rule_script" << RULE_EOF
+#!/bin/sh
+nft add table inet nat
+nft add chain inet nat prerouting '{ type nat hook prerouting priority -100 ; }'
+nft list chain inet nat prerouting 2>/dev/null | grep -q 'udp dport ${_hop_start}-${_hop_end} redirect to :${_hop_target}' || \\
+    nft add rule inet nat prerouting udp dport ${_hop_start}-${_hop_end} redirect to :${_hop_target}
+RULE_EOF
+        chmod +x "$_rule_script"
+
+        _service_file="/etc/systemd/system/hy2-port-hop.service"
+        cat > "$_service_file" << SVC_EOF
+[Unit]
+Description=Hysteria2 Port Hopping nftables rules (${_hop_start}-${_hop_end} → ${_hop_target}/UDP)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${_rule_script}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+
+        systemctl daemon-reload
+        systemctl enable hy2-port-hop
+        log info "hy2-port-hop systemd service 已启用 (nftables)"
+
+    # ============================================================
+    # iptables 分支 — 保持原有逻辑
+    # ============================================================
     else
-        log info "IPv6 iptables 规则已存在，跳过"
-    fi
+        # 安装 iptables-persistent
+        apt-get install -y -qq iptables-persistent
 
-    # 持久化
-    netfilter-persistent save
-    log info "iptables 规则已持久化 (netfilter-persistent)"
+        # IPv4 规则 (幂等: -C 检查存在则跳过)
+        if ! iptables -t nat -C PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}" 2>/dev/null; then
+            iptables -t nat -A PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}"
+            log info "IPv4 iptables 规则已添加"
+        else
+            log info "IPv4 iptables 规则已存在，跳过"
+        fi
 
-    # 备用: 写入 systemd service 确保重启后生效
-    _rule_script="/usr/local/bin/hy2-port-hop-rules.sh"
-    cat > "$_rule_script" << RULE_EOF
+        # IPv6 规则 (幂等)
+        if ! ip6tables -t nat -C PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}" 2>/dev/null; then
+            ip6tables -t nat -A PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}"
+            log info "IPv6 iptables 规则已添加"
+        else
+            log info "IPv6 iptables 规则已存在，跳过"
+        fi
+
+        # 持久化
+        netfilter-persistent save
+        log info "iptables 规则已持久化 (netfilter-persistent)"
+
+        # 备用: 写入 systemd service 确保重启后生效
+        _rule_script="/usr/local/bin/hy2-port-hop-rules.sh"
+        cat > "$_rule_script" << RULE_EOF
 #!/bin/sh
 iptables -t nat -C PREROUTING -p udp --dport ${_hop_start}:${_hop_end} -j REDIRECT --to-port ${_hop_target} 2>/dev/null || \\
     iptables -t nat -A PREROUTING -p udp --dport ${_hop_start}:${_hop_end} -j REDIRECT --to-port ${_hop_target}
 ip6tables -t nat -C PREROUTING -p udp --dport ${_hop_start}:${_hop_end} -j REDIRECT --to-port ${_hop_target} 2>/dev/null || \\
     ip6tables -t nat -A PREROUTING -p udp --dport ${_hop_start}:${_hop_end} -j REDIRECT --to-port ${_hop_target}
 RULE_EOF
-    chmod +x "$_rule_script"
+        chmod +x "$_rule_script"
 
-    _service_file="/etc/systemd/system/hy2-port-hop.service"
-    cat > "$_service_file" << SVC_EOF
+        _service_file="/etc/systemd/system/hy2-port-hop.service"
+        cat > "$_service_file" << SVC_EOF
 [Unit]
 Description=Hysteria2 Port Hopping iptables rules (${_hop_start}-${_hop_end} → ${_hop_target}/UDP)
 After=network.target
@@ -846,11 +1156,12 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 SVC_EOF
 
-    systemctl daemon-reload
-    systemctl enable hy2-port-hop
-    log info "hy2-port-hop systemd service 已启用"
+        systemctl daemon-reload
+        systemctl enable hy2-port-hop
+        log info "hy2-port-hop systemd service 已启用 (iptables)"
+    fi
 
-    log info "Step 3.5 完成 — 端口映射: ${_hop_start}-${_hop_end}/UDP → ${_hop_target}/UDP"
+    log info "Step 3.5 完成 — 后端: ${_backend}, 端口映射: ${_hop_start}-${_hop_end}/UDP → ${_hop_target}/UDP"
 }
 
 # ============================================================
@@ -895,20 +1206,36 @@ Main() {
     LoadEnv
     InitSystem
     Step0_ApplyId
+    Step0_5_InstallServerStatus
     Step1_Register
     Step1_5_DownloadSSL
     Step3_InstallNginx
     Step3_InstallXray
     Step3_5_SetupHy2PortHop
+    ConfigureFirewall
     Step2_ResolveDns
     Step4_DeployCrontab
 
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"
     log info "node_ids=${node_ids:-无}"
+    log info "API_PANEL=${API_PANEL}"
     log info "配置文件: ~/node.env | ~/node.json | ~/config.json"
-    log debug "文件校验: node.env=$(wc -c < ~/node.env 2>/dev/null || echo '不存在')B node.json=$(wc -c < ~/node.json 2>/dev/null || echo '不存在')B config.json=$(wc -c < ~/config.json 2>/dev/null || echo '不存在')B"
-    log debug "服务状态: xray=$(systemctl is-active xray 2>/dev/null || echo '未知') nginx=$(systemctl is-active nginx 2>/dev/null || echo '未知')"
+
+    # 服务状态 — 异常时红色标注
+    _xray_status=$(systemctl is-active xray 2>/dev/null) || true
+    _nginx_status=$(systemctl is-active nginx 2>/dev/null) || true
+    _stat_status=$(systemctl is-active stat_client 2>/dev/null) || true
+    [ -z "$_xray_status" ]  && _xray_status="未知"
+    [ -z "$_nginx_status" ] && _nginx_status="未知"
+    [ -z "$_stat_status" ]  && _stat_status="未安装"
+    if [ "$_xray_status" = "active" ] && [ "$_nginx_status" = "active" ] && [ "$_stat_status" = "active" ]; then
+        log info "服务状态: xray=${_xray_status} nginx=${_nginx_status} stat_client=${_stat_status}"
+    else
+        [ "$_xray_status" != "active" ]  && log error "服务状态: xray=${_xray_status}"
+        [ "$_nginx_status" != "active" ] && log error "服务状态: nginx=${_nginx_status}"
+        [ "$_stat_status" != "active" ]  && log error "服务状态: stat_client=${_stat_status}"
+    fi
 
     # 安装成功，清除 EXIT trap
     trap - EXIT
