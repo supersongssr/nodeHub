@@ -963,7 +963,7 @@ Step3_InstallXray() {
     log info "GeoIP/GeoSite 数据已下载到 /usr/local/share/xray/"
 
     # 下载 xray.service 守护文件
-    service_url="${NODEHUB_URL}/xray/xray.service"
+    service_url="${NODEHUB_URL}/configs/xray/xray.service"
     wget -N --timeout=60 --tries=3 -P /tmp "$service_url" \
         || die "xray.service 下载失败: ${service_url}"
 
