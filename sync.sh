@@ -64,7 +64,8 @@ Log() {
 
 NotifyTG() {
     [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ] && return 0
-    curl -s -d "chat_id=${TG_CHAT_ID}&text=from:sync:$1" \
+    curl -s --connect-timeout 5 --max-time 15 \
+        -d "chat_id=${TG_CHAT_ID}&text=from:sync:$1" \
         "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
 }
 
@@ -75,7 +76,10 @@ Init() {
     Log "=== 初始化 ==="
 
     # 创建数据目录
-    mkdir -p "${NODEHUB_DIR}"/{ssl/logs,geodat,xray,logs}
+    mkdir -p "${NODEHUB_DIR}/ssl/logs"
+    mkdir -p "${NODEHUB_DIR}/geodat"
+    mkdir -p "${NODEHUB_DIR}/xray"
+    mkdir -p "${NODEHUB_DIR}/logs"
 
     # 初始化 geodat 版本追踪
     touch "${NODEHUB_DIR}/geodat/config.sh"
@@ -106,8 +110,8 @@ SyncSSL() {
     for domain in $DOMAINS; do
         Log "同步: $domain"
 
-        wget -N -q -P "$SSL_DIR" "${BASE_URL}/${domain}.pem" 2>/dev/null && \
-        wget -N -q -P "$SSL_DIR" "${BASE_URL}/${domain}.key" 2>/dev/null
+        wget -N -q -T 30 -P "$SSL_DIR" "${BASE_URL}/${domain}.pem" 2>/dev/null && \
+        wget -N -q -T 30 -P "$SSL_DIR" "${BASE_URL}/${domain}.key" 2>/dev/null
 
         if [ $? -eq 0 ]; then
             updated=$((updated + 1))
@@ -141,15 +145,15 @@ SyncGeoData() {
     . "$CONF"
 
     # --- geosite ---
-    new_geosite=$(wget -qO- -t1 -T5 \
+    new_geosite=$(wget -qO- -t1 -T 15 \
         "https://api.github.com/repos/v2fly/domain-list-community/releases/latest" \
         | jq -r '.tag_name' 2>/dev/null || echo "")
 
     if [ -n "$new_geosite" ] && [ "$new_geosite" != "$geositeVersion" ]; then
         Log "geosite: ${geositeVersion:-无} → ${new_geosite}"
-        curl -sSLk -o /tmp/dlc.dat \
-            "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"
-        mv -f /tmp/dlc.dat "${GEO_DIR}/geosite.dat"
+        wget -N -q -T 120 -P "$GEO_DIR" \
+            "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat" && \
+        mv -f "${GEO_DIR}/dlc.dat" "${GEO_DIR}/geosite.dat"
         sed -i '/^geositeVersion=/d' "$CONF" 2>/dev/null || true
         echo "geositeVersion=${new_geosite}" >> "$CONF"
         Log "geosite 更新完成"
@@ -158,15 +162,14 @@ SyncGeoData() {
     fi
 
     # --- geoip ---
-    new_geoip=$(wget -qO- -t1 -T5 \
+    new_geoip=$(wget -qO- -t1 -T 15 \
         "https://api.github.com/repos/v2fly/geoip/releases/latest" \
         | jq -r '.tag_name' 2>/dev/null || echo "")
 
     if [ -n "$new_geoip" ] && [ "$new_geoip" != "$geoipVersion" ]; then
         Log "geoip: ${geoipVersion:-无} → ${new_geoip}"
-        curl -sSLk -o /tmp/geoip.dat \
+        wget -N -q -T 120 -P "$GEO_DIR" \
             "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
-        mv -f /tmp/geoip.dat "${GEO_DIR}/geoip.dat"
         sed -i '/^geoipVersion=/d' "$CONF" 2>/dev/null || true
         echo "geoipVersion=${new_geoip}" >> "$CONF"
         Log "geoip 更新完成"
@@ -174,6 +177,7 @@ SyncGeoData() {
         Log "geoip 未变化"
     fi
 }
+
 
 # ============================================================
 # Step 3: Xray 更新检测
@@ -183,7 +187,7 @@ SyncXray() {
 
     XRAY_DIR="${NODEHUB_DIR}/xray"
 
-    latest=$(wget -qO- -t1 -T5 \
+    latest=$(wget -qO- -t1 -T 15 \
         "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
         | jq -r '.tag_name' 2>/dev/null || echo "")
 
@@ -202,11 +206,11 @@ SyncXray() {
 
     Log "Xray: ${current:-无} → ${latest}, 下载中..."
 
-    wget -N -q -P "$XRAY_DIR" \
+    wget -N -q -T 120 -P "$XRAY_DIR" \
         "https://github.com/supersongssr/xray-plugin-srp/releases/download/v0.0.9/xray-plugin-srp-v0.0.9" \
         || { Log "Xray: srp 下载失败"; return 1; }
 
-    wget -N -q -P "$XRAY_DIR" \
+    wget -N -q -T 120 -P "$XRAY_DIR" \
         "https://github.com/supersongssr/xray-plugin-ssp/releases/download/v0.0.9/xray-plugin-ssp-v0.0.9" \
         || { Log "Xray: ssp 下载失败"; return 1; }
 
