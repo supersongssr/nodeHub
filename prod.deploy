@@ -7,13 +7,37 @@
 
 set -eu
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ============================================================
+# 从 .env 加载环境变量
+# ============================================================
+ENV_FILE="${SCRIPT_DIR}/.env"
+if [ -f "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE" || { echo "❌ 加载 ${ENV_FILE} 失败"; exit 1; }
+else
+    echo "❌ ${ENV_FILE} 不存在"; exit 1
+fi
+
 # ============================================================
 # 配置
 # ============================================================
 REMOTE_HOST="${PROD_REMOTE_HOST}"
 REMOTE_PATH="${PROD_REMOTE_PATH}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GITIGNORE="${SCRIPT_DIR}/.gitignore"
+
+# ============================================================
+# 环境变量校验
+# ============================================================
+_err=""
+[ -z "${PROD_REMOTE_HOST:-}" ]  && _err="${_err}  ❌ PROD_REMOTE_HOST — 生产服务器地址\n"
+[ -z "${PROD_REMOTE_PATH:-}" ]  && _err="${_err}  ❌ PROD_REMOTE_PATH — 生产服务器路径\n"
+if [ -n "$_err" ]; then
+    echo "❌ 以下必需环境变量未设置:"; echo ""
+    printf "%b" "$_err"
+    exit 1
+fi
 
 # ============================================================
 # 前置检查: 必须在 main 分支
