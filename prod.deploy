@@ -79,7 +79,6 @@ echo ""
 echo "🚀 开始部署..."
 
 rsync -avz \
-    --delete \
     --exclude-from="$GITIGNORE" \
     --exclude='.git/' \
     "${SCRIPT_DIR}/" \
