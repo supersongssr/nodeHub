@@ -1,1 +1,14 @@
+# 敏感配置
 .env
+
+# 运行时日志
+logs/
+
+# SSL 证书数据
+ssl/
+
+# GeoData 数据
+geodat/
+
+# Xray 二进制
+xray/

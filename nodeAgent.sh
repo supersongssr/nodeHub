@@ -50,16 +50,15 @@ LoadEnv() {
     fi
 
     # 必需字段
-    if [ -z "${API_TOKEN:-}" ]; then
-        log error "~/.env 缺少 API_TOKEN"
-        return 1
-    fi
-    if [ -z "${API_URL:-}" ]; then
-        log error "~/.env 缺少 API_URL"
-        return 1
-    fi
-    if [ -z "${node_id:-}" ]; then
-        log error "~/node.env 缺少 node_id，请先运行 proxyInstall.sh"
+    _missing=""
+    [ -z "${API_TOKEN:-}" ] && _missing="${_missing}  API_TOKEN       — 面板 API 认证 Token\n"
+    [ -z "${API_URL:-}" ]   && _missing="${_missing}  API_URL         — 面板 API 地址\n"
+    [ -z "${node_id:-}" ]   && _missing="${_missing}  node_id         — 节点 ID (由 proxyInstall.sh 自动分配)\n"
+    if [ -n "$_missing" ]; then
+        log error "以下必需环境变量未设置:"
+        printf "%b" "$_missing" | while IFS= read -r _line; do log error "$_line"; done
+        log error "请在 ~/.env 中配置 API_TOKEN / API_URL"
+        log error "node_id 由 proxyInstall.sh 自动写入 ~/node.env"
         return 1
     fi
 

@@ -143,13 +143,17 @@ LoadEnv() {
     fi
 
     # 必需字段校验 — 缺失任何一个立即终止
-    [ -z "${API_TOKEN:-}" ]             && die "~/.env 缺少必需字段: API_TOKEN"
-    [ -z "${API_URL:-}" ]               && die "~/.env 缺少必需字段: API_URL"
-    [ -z "${NODEHUB_URL:-}" ]           && die "~/.env 缺少必需字段: NODEHUB_URL"
-    [ -z "${NODE_TRAFFIC_LIMIT:-}" ]    && die "~/.env 缺少必需字段: NODE_TRAFFIC_LIMIT"
-    [ -z "${NODE_TRAFFIC_RESETDAY:-}" ] && die "~/.env 缺少必需字段: NODE_TRAFFIC_RESETDAY"
-    [ -z "${NODE_COST:-}" ]             && die "~/.env 缺少必需字段: NODE_COST"
-    [ -z "${API_PANEL:-}" ]             && die "~/.env 缺少必需字段: API_PANEL"
+    _missing=""
+    [ -z "${API_TOKEN:-}" ]             && _missing="${_missing}  API_TOKEN             — 面板 API 认证 Token\n"
+    [ -z "${API_URL:-}" ]               && _missing="${_missing}  API_URL               — 面板 API 地址\n"
+    [ -z "${NODEHUB_URL:-}" ]           && _missing="${_missing}  NODEHUB_URL           — 节点资源下载地址\n"
+    [ -z "${NODE_TRAFFIC_LIMIT:-}" ]    && _missing="${_missing}  NODE_TRAFFIC_LIMIT    — 月流量额度 (GB)\n"
+    [ -z "${NODE_TRAFFIC_RESETDAY:-}" ] && _missing="${_missing}  NODE_TRAFFIC_RESETDAY — 流量重置日 (1-28)\n"
+    [ -z "${NODE_COST:-}" ]             && _missing="${_missing}  NODE_COST             — 节点月成本\n"
+    [ -z "${API_PANEL:-}" ]             && _missing="${_missing}  API_PANEL             — 面板类型 (ssp 或 srp)\n"
+    if [ -n "$_missing" ]; then
+        die "以下必需环境变量未设置，请在 ~/.env 中配置:\n$_missing"
+    fi
 
     # API_PANEL 校验
     case "${API_PANEL}" in
