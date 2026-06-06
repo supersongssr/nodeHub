@@ -405,7 +405,7 @@ GetMediaUnlockInfo() {
     log info "解锁结果: google_scholar=${unlock_google_scholar:-空} notebooklm=${unlock_notebooklm:-空}"
 }
 
-# 地理位置探测 — 通过 ip-api.com 获取国家/城市/ISO代码
+# 地理位置探测 — 优先 ipinfo.io，兜底 ip-api.com
 ProbeGeo() {
     log info "开始地理位置探测"
 
@@ -418,15 +418,46 @@ ProbeGeo() {
         return 0
     fi
 
-    # 通过 ip-api.com 探测 (只支持 IPv4 查询)
+    # 1) 优先 ipinfo.io (支持 IPv4/IPv6，无需 token 即可获取 country/city/org)
     geo_response=$(curl -sS --connect-timeout 10 --max-time 15 \
-        "http://ip-api.com/json/${node_ip}?fields=country,city,countryCode" 2>/dev/null) || true
-    log debug "ip-api.com 响应: ${geo_response:-空}"
+        "https://ipinfo.io/${node_ip}/json" 2>/dev/null) || true
+    log debug "ipinfo.io 响应: ${geo_response:-空}"
 
     if [ -n "$geo_response" ]; then
-        node_country=$(echo "$geo_response" | jq -r '.country // empty' 2>/dev/null || echo "")
-        node_city=$(echo "$geo_response" | jq -r '.city // empty' 2>/dev/null || echo "")
-        node_country_code=$(echo "$geo_response" | jq -r '.countryCode // empty' 2>/dev/null || echo "")
+        _geo_country=$(echo "$geo_response" | jq -r '.country // empty' 2>/dev/null || echo "")
+        _geo_city=$(echo "$geo_response" | jq -r '.city // empty' 2>/dev/null || echo "")
+        # ipinfo.io 返回 ISO 国家代码 (如 KR/JP)，转小写存储
+        if [ -n "$_geo_country" ]; then
+            node_country_code=$(echo "$_geo_country" | tr 'A-Z' 'a-z')
+            # 将 ISO 代码映射为完整国家名 (常见国家)
+            case "$node_country_code" in
+                kr) node_country="South Korea";;
+                jp) node_country="Japan";;
+                us) node_country="United States";;
+                hk) node_country="Hong Kong";;
+                tw) node_country="Taiwan";;
+                sg) node_country="Singapore";;
+                de) node_country="Germany";;
+                gb) node_country="United Kingdom";;
+                *)  node_country="$_geo_country";;
+            esac
+            node_city="${_geo_city:-Unknown}"
+            log info "ipinfo.io 地理位置解析成功"
+        fi
+    fi
+
+    # 2) 兜底 ip-api.com (仅支持 IPv4)
+    if [ -z "${node_country:-}" ] || [ "$node_country" = "Unknown" ]; then
+        log info "ipinfo.io 未返回有效结果，尝试 ip-api.com 兜底"
+        geo_response=$(curl -sS --connect-timeout 10 --max-time 15 \
+            "http://ip-api.com/json/${node_ip}?fields=country,city,countryCode" 2>/dev/null) || true
+        log debug "ip-api.com 响应: ${geo_response:-空}"
+
+        if [ -n "$geo_response" ]; then
+            node_country=$(echo "$geo_response" | jq -r '.country // empty' 2>/dev/null || echo "")
+            node_city=$(echo "$geo_response" | jq -r '.city // empty' 2>/dev/null || echo "")
+            node_country_code=$(echo "$geo_response" | jq -r '.countryCode // empty' 2>/dev/null || echo "" | tr 'A-Z' 'a-z')
+        fi
     fi
 
     # 兜底默认值
