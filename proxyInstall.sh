@@ -1200,8 +1200,10 @@ SVC_EOF
     # iptables 分支 — 保持原有逻辑
     # ============================================================
     else
-        # 安装 iptables-persistent
-        apt-get install -y -qq iptables-persistent
+        # 安装 iptables-persistent — 预先注入 debconf 应答，避免交互式弹窗阻塞自动化脚本
+        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null || true
+        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent
 
         # IPv4 规则 (幂等: -C 检查存在则跳过)
         if ! iptables -t nat -C PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}" 2>/dev/null; then
