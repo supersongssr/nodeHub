@@ -132,6 +132,7 @@ LoadEnv() {
     _ENV_NODE_ID="${NODE_ID:-}"
     _ENV_ROOT_DOMAIN="${ROOT_DOMAIN:-}"
     _ENV_NODE_LEVEL="${NODE_LEVEL:-}"
+    _ENV_NODE_PORT="${NODE_PORT:-}"
 
     # 1. 加载 ~/.env (用户手工只读配置 — 全大写变量)
     if [ -f ~/.env ]; then
@@ -230,11 +231,57 @@ LoadEnv() {
     # node_level 三级优先级: 环境变量 > ~/.env > ~/node.json
     # (~/node.json 缓存在 Step1_Register 中读取，若当前 node_level 为空则用缓存值填充)
 
+    # ===========================================================
+    # NODE_PORT 解析 — 四层优先级
+    #   1. 外部环境变量 NODE_PORT (最高)
+    #   2. ~/.env 中的 NODE_PORT
+    #   3. ~/node.env 中的 node_port
+    #   4. ~/node.json 中的 node_port (最低)
+    #   默认: 443
+    # ===========================================================
+    node_port="443"
+
+    # 来源 4: ~/node.json (最低优先级)
+    if [ -f ~/node.json ]; then
+        _jp=$(jq -r '.node_port // empty' ~/node.json 2>/dev/null || true)
+        if [ -n "$_jp" ]; then
+            node_port="$_jp"
+            log debug "NODE_PORT 来源: ~/node.json = ${node_port}"
+        fi
+    fi
+
+    # 来源 3: ~/node.env
+    if [ -f ~/node.env ]; then
+        _nep=$(grep '^node_port=' ~/node.env 2>/dev/null | tail -1 | sed 's/^node_port="//;s/"$//' || true)
+        if [ -n "$_nep" ]; then
+            node_port="$_nep"
+            log debug "NODE_PORT 来源: ~/node.env = ${node_port}"
+        fi
+    fi
+
+    # 来源 2: ~/.env (已被 source，变量名 NODE_PORT)
+    if [ -n "${NODE_PORT:-}" ]; then
+        node_port="${NODE_PORT}"
+        log debug "NODE_PORT 来源: ~/.env = ${node_port}"
+    fi
+
+    # 来源 1: 外部环境变量 (最高优先级)
+    if [ -n "${_ENV_NODE_PORT}" ]; then
+        node_port="${_ENV_NODE_PORT}"
+        log info "NODE_PORT 来源: 环境变量 = ${node_port} (最高优先级)"
+    fi
+
+    # 数字校验
+    node_port=$(sanitize_int "$node_port")
+    [ -z "$node_port" ] && node_port=443
+
+    log info "NODE_PORT 最终值: ${node_port}"
+
     log debug "透传变量汇总:"
     log debug "  v2_name=${v2_name:-空} node_rxtx=${node_rxtx:-空} node_group=${node_group:-空}"
     log debug "  node_level=${node_level:-空} node_sort=${node_sort:-空} node_traffic_rate=${node_traffic_rate:-空}"
     log debug "  node_bandwidth=${node_bandwidth:-空} node_info=${node_info:-空} root_domain=${root_domain:-空}"
-    log debug "  node_traffic_limit=${node_traffic_limit} node_traffic_resetday=${node_traffic_resetday} node_cost=${node_cost}"
+    log debug "  node_traffic_limit=${node_traffic_limit} node_traffic_resetday=${node_traffic_resetday} node_cost=${node_cost} node_port=${node_port}"
 
     # ----------------------------------------------------------
     # 自动探测默认网卡并持久化到 ~/node.env
@@ -519,8 +566,8 @@ InitSystem() {
 
 # ============================================================
 # B1. 防火墙配置 — 自动检测 ufw / firewalld 并放行必要端口
-# 放行端口: 22/tcp (SSH), 80/tcp (HTTP/ACME), 443/tcp (VLESS/TLS),
-#           443/udp (Hysteria2), 30000-32000/udp (hy2 port hop)
+# 放行端口: 22/tcp (SSH), 80/tcp (HTTP/ACME), node_port/tcp (VLESS/TLS),
+#           node_port/udp (Hysteria2), 30000-32000/udp (hy2 port hop)
 # 策略: 优先放行端口; 若 ufw/firewalld 均未安装则尝试禁用 iptables INPUT DROP
 # ============================================================
 ConfigureFirewall() {
@@ -559,19 +606,19 @@ ConfigureFirewall() {
         log warn "iptables INPUT 默认策略已改为 ACCEPT"
     fi
 
-    # 确保 22/tcp 80/tcp 443/tcp 443/udp 2053/tcp 2053/udp 30000-32000/udp 已放行
-    for _port in 22 80 443 2053; do
+    # 确保 22/tcp 80/tcp node_port/tcp node_port/udp 2053/tcp 2053/udp 30000-32000/udp 已放行
+    for _port in 22 80 ${node_port} 2053; do
         iptables -C INPUT -p tcp --dport "${_port}" -j ACCEPT 2>/dev/null || \
             iptables -I INPUT 1 -p tcp --dport "${_port}" -j ACCEPT
     done
-    for _port in 443 2053; do
+    for _port in ${node_port} 2053; do
         iptables -C INPUT -p udp --dport "${_port}" -j ACCEPT 2>/dev/null || \
             iptables -I INPUT 1 -p udp --dport "${_port}" -j ACCEPT
     done
     iptables -C INPUT -p udp -m multiport --dports 30000:32000 -j ACCEPT 2>/dev/null || \
         iptables -I INPUT 1 -p udp -m multiport --dports 30000:32000 -j ACCEPT
 
-    log info "防火墙配置完成 — iptables 端口已放行: 22/tcp 80/tcp 443/tcp+udp 2053/tcp+udp 30000-32000/udp"
+    log info "防火墙配置完成 — iptables 端口已放行: 22/tcp 80/tcp ${node_port}/tcp+udp 2053/tcp+udp 30000-32000/udp"
 }
 
 # ============================================================
@@ -898,6 +945,9 @@ Step1_Register() {
     [ -n "${raw_rx:-}" ]              && _reg_data="${_reg_data}&raw_rx=${raw_rx}"
     [ -n "${raw_tx:-}" ]              && _reg_data="${_reg_data}&raw_tx=${raw_tx}"
 
+    # node_port — 上报自定义端口
+    _reg_data="${_reg_data}&node_port=${node_port}"
+
     body=$(ApiCall POST "/api/node/register" "$_reg_data" "yes")
 
     # 安全落盘
@@ -908,6 +958,14 @@ Step1_Register() {
     root_domain=$(jq -r '.root_domain // empty' ~/node.json 2>/dev/null || true)
     v2_name=$(jq -r '.v2_name // empty' ~/node.json 2>/dev/null || true)
     node_ids=$(jq -r '.node_ids // empty' ~/node.json 2>/dev/null || true)
+
+    # 从面板返回的 node.json 读取确认的 node_port 并持久化
+    _returned_port=$(jq -r '.node_port // empty' ~/node.json 2>/dev/null || true)
+    if [ -n "$_returned_port" ]; then
+        node_port="$_returned_port"
+        SetNodeEnv "node_port" "$node_port"
+        log info "面板确认 node_port=${node_port}，已持久化到 ~/node.env"
+    fi
 
     log info "分配的 root_domain=${root_domain:-未分配} v2_name=${v2_name:-未分配} node_ids=${node_ids:-未分配}"
 }
@@ -1024,7 +1082,7 @@ Step3_InstallXray() {
             log error "  ${_line}"
         done
         # 端口占用检查
-        _listen_ports=$(ss -tlnp 2>/dev/null | grep -E ':(443|80)\b' || true)
+        _listen_ports=$(ss -tlnp 2>/dev/null | grep -E ':(${node_port}|80)\b' || true)
         [ -n "$_listen_ports" ] && log error "端口占用: ${_listen_ports}"
     fi
 }
@@ -1063,13 +1121,13 @@ Step3_InstallNginx() {
 }
 
 # ============================================================
-# Step 3.5: hy2 动态端口 UDP 映射 (30000-32000 → 443)
+# Step 3.5: hy2 动态端口 UDP 映射 (30000-32000 → node_port)
 # 自动检测 nftables / iptables 后端，无需手动开关
 # ============================================================
 Step3_5_SetupHy2PortHop() {
     _hop_start="${HY2_PORT_HOP_START:-30000}"
     _hop_end="${HY2_PORT_HOP_END:-32000}"
-    _hop_target="${HY2_PORT_HOP_TARGET:-443}"
+    _hop_target="${HY2_PORT_HOP_TARGET:-${node_port}}"
 
     # 自动检测可用的防火墙后端，均不可用时尝试安装
     if command -v nft >/dev/null 2>&1; then
@@ -1254,6 +1312,7 @@ Main() {
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"
     log info "node_ids=${node_ids:-无}"
+    log info "node_port=${node_port}"
     log info "API_PANEL=${API_PANEL}"
     log info "配置文件: ~/node.env | ~/node.json | ~/config.json"
 
