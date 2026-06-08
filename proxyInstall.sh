@@ -123,6 +123,55 @@ SetNodeEnv() {
 }
 
 # ============================================================
+# APT 锁等待 — 检测到 dpkg/apt 锁被占用时自动等待释放
+# 最大等待 300 秒 (5 分钟)，每 5 秒检测一次
+# ============================================================
+WaitForAptLock() {
+    _max_wait=300
+    _interval=5
+    _elapsed=0
+
+    while [ "$_elapsed" -lt "$_max_wait" ]; do
+        # 检查是否存在持有 apt/dpkg 锁的进程
+        _holders=$(ps aux 2>/dev/null | grep -E '(unattended-upgr|apt-get|apt|dpkg)' | grep -v grep || true)
+
+        if [ -z "$_holders" ]; then
+            # 无持有者，再确认锁文件不在被占用
+            if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
+               ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 && \
+               ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+                [ "$_elapsed" -gt 0 ] && log info "APT 锁已释放，继续执行 (等待了 ${_elapsed} 秒)"
+                return 0
+            fi
+        fi
+
+        if [ "$_elapsed" -eq 0 ]; then
+            log warn "检测到 APT/dpkg 锁被占用，等待释放 (最多 ${_max_wait} 秒)..."
+            _holder_info=$(echo "$_holders" | head -3)
+            log debug "锁持有进程:\n$_holder_info"
+        fi
+
+        sleep "$_interval"
+        _elapsed=$(( _elapsed + _interval ))
+
+        # 每 30 秒报告一次等待进度
+        if [ $(( _elapsed % 30 )) -eq 0 ]; then
+            log info "仍在等待 APT 锁释放... (${_elapsed}/${_max_wait} 秒)"
+        fi
+    done
+
+    die "等待 APT 锁超时 (${_max_wait} 秒)，请手动处理: systemctl stop unattended-upgrades"
+}
+
+# APT 安全包装器 — 先等待锁释放，再执行 apt-get 命令
+# 用法: AptGet <apt-get 的所有参数>
+# 例:   AptGet install -y -qq jq
+AptGet() {
+    WaitForAptLock
+    apt-get "$@"
+}
+
+# ============================================================
 # A. 环境读取与变量洗白映射
 # ============================================================
 LoadEnv() {
@@ -549,13 +598,13 @@ InitSystem() {
     id www-data >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin www-data
     log info "www-data 用户就绪"
 
-    apt-get update -qq
-    command -v jq >/dev/null 2>&1     || apt-get install -y -qq jq
-    command -v curl >/dev/null 2>&1   || apt-get install -y -qq curl
-    command -v vnstat >/dev/null 2>&1 || apt-get install -y -qq vnstat
+    AptGet update -qq
+    command -v jq >/dev/null 2>&1     || AptGet install -y -qq jq
+    command -v curl >/dev/null 2>&1   || AptGet install -y -qq curl
+    command -v vnstat >/dev/null 2>&1 || AptGet install -y -qq vnstat
 
     # Nginx: 先安装系统默认版本, 后续由 EnsureNginxLatest 升级
-    command -v nginx >/dev/null 2>&1  || apt-get install -y -qq nginx
+    command -v nginx >/dev/null 2>&1  || AptGet install -y -qq nginx
 
     log info "预先停止 nginx xray 服务"
     systemctl stop nginx 2>/dev/null || true
@@ -632,7 +681,7 @@ EnsureNginxLatest() {
     log info "检查 Nginx 版本并确保 >= 1.25.1 ..."
 
     # 安装前置依赖
-    apt-get install -y -qq curl gnupg2 ca-certificates lsb-release
+    AptGet install -y -qq curl gnupg2 ca-certificates lsb-release
 
     # 获取 Debian 版本代号
     _debian_codename=$(lsb_release -cs 2>/dev/null || echo "unknown")
@@ -641,7 +690,7 @@ EnsureNginxLatest() {
     # 获取当前 nginx 版本 (确保 nginx 已安装)
     if ! command -v nginx >/dev/null 2>&1; then
         log info "nginx 未安装，先安装系统默认版本..."
-        apt-get install -y -qq nginx || die "nginx 安装失败"
+        AptGet install -y -qq nginx || die "nginx 安装失败"
     fi
 
     _nginx_version=$(nginx -v 2>&1 | grep -oP 'nginx/\K[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
@@ -660,8 +709,8 @@ EnsureNginxLatest() {
     # Debian 13 自带新版，不应走到这里; 若走到此处则尝试升级
     if [ "${_debian_codename}" = "trixie" ] || [ "${_debian_codename}" = "sid" ]; then
         log warn "Debian ${_debian_codename} 自带 nginx 应 >= 1.26, 但检测到旧版, 尝试 apt upgrade..."
-        apt-get update -qq
-        apt-get install -y -qq nginx
+        AptGet update -qq
+        AptGet install -y -qq nginx
     else
         # Debian 11/12: 添加官方 nginx mainline 仓库
         log info "添加 nginx 官方 mainline 仓库 (Debian ${_debian_codename})..."
@@ -683,8 +732,8 @@ Pin: release o=nginx
 Pin-Priority: 900
 PIN_EOF
 
-        apt-get update -qq
-        apt-get install -y -qq nginx || die "nginx 升级失败"
+        AptGet update -qq
+        AptGet install -y -qq nginx || die "nginx 升级失败"
     fi
 
     _new_version=$(nginx -v 2>&1 | grep -oP 'nginx/\K[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
@@ -1136,10 +1185,10 @@ Step3_5_SetupHy2PortHop() {
         _backend="iptables"
     else
         log info "Step 3.5: nft 和 iptables 均不可用，尝试自动安装 nftables"
-        if apt-get install -y -qq nftables 2>/dev/null && command -v nft >/dev/null 2>&1; then
+        if AptGet install -y -qq nftables 2>/dev/null && command -v nft >/dev/null 2>&1; then
             _backend="nft"
             log info "nftables 安装成功"
-        elif apt-get install -y -qq iptables 2>/dev/null && command -v iptables >/dev/null 2>&1; then
+        elif AptGet install -y -qq iptables 2>/dev/null && command -v iptables >/dev/null 2>&1; then
             _backend="iptables"
             log info "iptables 安装成功"
         else
@@ -1203,7 +1252,7 @@ SVC_EOF
         # 安装 iptables-persistent — 预先注入 debconf 应答，避免交互式弹窗阻塞自动化脚本
         echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null || true
         echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections 2>/dev/null || true
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent
+        DEBIAN_FRONTEND=noninteractive AptGet install -y -qq iptables-persistent
 
         # IPv4 规则 (幂等: -C 检查存在则跳过)
         if ! iptables -t nat -C PREROUTING -p udp --dport "${_hop_start}:${_hop_end}" -j REDIRECT --to-port "${_hop_target}" 2>/dev/null; then
