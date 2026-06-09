@@ -350,6 +350,7 @@ LoadEnv() {
     [ -n "${NET_CARD}" ] && SetNodeEnv "net_card" "${NET_CARD}"
 
     log info "变量加载完成 — v2_name=${v2_name:-空} node_rxtx=${node_rxtx:-空} NET_CARD=${NET_CARD}"
+    log info "SKIP_MEDIA_UNLOCK=${SKIP_MEDIA_UNLOCK:-0} (1=跳过媒体解锁检测)"
 }
 
 # ============================================================
@@ -904,8 +905,12 @@ Step1_Register() {
     log info "网卡流量采集 — raw_rx=${raw_rx} raw_tx=${raw_tx} (${NET_CARD})"
 
     # 媒体解锁检测
-    RunMediaUnlockCheck
-    GetMediaUnlockInfo
+    if [ "${SKIP_MEDIA_UNLOCK:-0}" = "1" ]; then
+        log info "媒体解锁检测已跳过 (SKIP_MEDIA_UNLOCK=1)"
+    else
+        RunMediaUnlockCheck
+        GetMediaUnlockInfo
+    fi
 
     # 读取本地缓存 (node.json + status.json) — panel 以节点上报为第一优先级
     _cached_node_id="" _cached_node_ids="" _cached_root_domain="" _cached_v2_name=""
