@@ -123,44 +123,54 @@ SetNodeEnv() {
 }
 
 # ============================================================
-# APT 锁等待 — 检测到 dpkg/apt 锁被占用时自动等待释放
-# 最大等待 300 秒 (5 分钟)，每 5 秒检测一次
+# APT 锁清理 — 检测到 dpkg/apt 锁被占用时强制终止占用进程
+# 策略: 停止服务 → 杀进程 → 清锁文件 → 修复 dpkg 状态
 # ============================================================
 WaitForAptLock() {
-    _max_wait=300
-    _interval=5
-    _elapsed=0
+    log info "检查并清理 APT/dpkg 锁..."
 
-    while [ "$_elapsed" -lt "$_max_wait" ]; do
-        # 检查是否存在持有 apt/dpkg 锁的进程
-        _holders=$(ps aux 2>/dev/null | grep -E '(unattended-upgr|apt-get|apt|dpkg)' | grep -v grep || true)
+    # ---- 1. 停止 unattended-upgrades 服务 ----
+    if systemctl is-active unattended-upgrades >/dev/null 2>&1; then
+        log warn "unattended-upgrades 正在运行，停止并禁用"
+        systemctl stop unattended-upgrades 2>/dev/null || true
+        systemctl disable unattended-upgrades 2>/dev/null || true
+    fi
 
-        if [ -z "$_holders" ]; then
-            # 无持有者，再确认锁文件不在被占用
-            if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
-               ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 && \
-               ! fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
-                [ "$_elapsed" -gt 0 ] && log info "APT 锁已释放，继续执行 (等待了 ${_elapsed} 秒)"
-                return 0
-            fi
-        fi
+    # ---- 2. 查找并 SIGKILL 所有持有 apt/dpkg 锁的进程 ----
+    _holders=$(ps aux 2>/dev/null | grep -E '(unattended-upgr|apt-get|apt |dpkg)' | grep -v grep || true)
+    if [ -n "$_holders" ]; then
+        log warn "发现占用 APT/dpkg 锁的进程，强制终止:"
+        echo "$_holders" | while IFS= read -r _line; do
+            _pid=$(echo "$_line" | awk '{print $2}')
+            _cmd=$(echo "$_line" | awk '{for(i=11;i<=NF;i++) printf "%s ", $i; print ""}')
+            log warn "  kill -9 PID=${_pid} (${_cmd})"
+            kill -9 "$_pid" 2>/dev/null || true
+        done
+        sleep 1  # 等待内核回收资源
+    fi
 
-        if [ "$_elapsed" -eq 0 ]; then
-            log warn "检测到 APT/dpkg 锁被占用，等待释放 (最多 ${_max_wait} 秒)..."
-            _holder_info=$(echo "$_holders" | head -3)
-            log debug "锁持有进程:\n$_holder_info"
-        fi
-
-        sleep "$_interval"
-        _elapsed=$(( _elapsed + _interval ))
-
-        # 每 30 秒报告一次等待进度
-        if [ $(( _elapsed % 30 )) -eq 0 ]; then
-            log info "仍在等待 APT 锁释放... (${_elapsed}/${_max_wait} 秒)"
+    # ---- 3. 清理残留锁文件 ----
+    for _lock in \
+        /var/lib/dpkg/lock-frontend \
+        /var/lib/dpkg/lock \
+        /var/lib/apt/lists/lock \
+        /var/cache/apt/archives/lock; do
+        if [ -f "$_lock" ]; then
+            rm -f "$_lock"
+            log debug "已清理锁文件: ${_lock}"
         fi
     done
 
-    die "等待 APT 锁超时 (${_max_wait} 秒)，请手动处理: systemctl stop unattended-upgrades"
+    # ---- 4. 修复可能中断的 dpkg 状态 ----
+    dpkg --configure -a >/dev/null 2>&1 || true
+
+    # ---- 5. 最终验证 ----
+    _holders=$(ps aux 2>/dev/null | grep -E '(unattended-upgr|apt-get|apt |dpkg)' | grep -v grep || true)
+    if [ -n "$_holders" ]; then
+        die "APT/dpkg 锁清理后仍有进程占用，请手动处理: ${_holders}"
+    fi
+
+    log info "APT/dpkg 锁已就绪"
 }
 
 # APT 安全包装器 — 先等待锁释放，再执行 apt-get 命令
