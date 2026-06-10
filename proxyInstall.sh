@@ -351,7 +351,7 @@ LoadEnv() {
     [ -n "${NET_CARD}" ] && SetNodeEnv "net_card" "${NET_CARD}"
 
     log info "变量加载完成 — v2_name=${v2_name:-空} node_rxtx=${node_rxtx:-空} NET_CARD=${NET_CARD}"
-    log info "SKIP_MEDIA_UNLOCK=${SKIP_MEDIA_UNLOCK:-0} (1=跳过媒体解锁检测)"
+
 }
 
 # ============================================================
@@ -399,119 +399,7 @@ ProbeHardware() {
     log info "硬件采集完成 — node_cpu=${node_cpu} node_memory=${node_memory} node_disk=${node_disk} node_ip=${node_ip}"
 }
 
-# ============================================================
-# 媒体解锁信息采集
-# 参考 v2PluginDebian.sh 的 RunMediaUnlockCheck / GetMediaUnlockInfo
-# ============================================================
 
-# 执行流媒体解锁测试脚本
-RunMediaUnlockCheck() {
-    log info "开始媒体解锁检测"
-    cd /tmp || return
-
-    # Script 1: check.unlock.media — Netflix/Disney/ChatGPT/Claude/Gemini 等
-    if [ ! -f /tmp/media_unlock_clean.txt ]; then
-        log info "执行 check.unlock.media..."
-        curl -L -s check.unlock.media > /tmp/_media_unlock_script.sh 2>/dev/null || true
-        if [ -f /tmp/_media_unlock_script.sh ]; then
-            echo 66 | bash /tmp/_media_unlock_script.sh > /tmp/media_unlock.txt 2>/dev/null || true
-        fi
-        sed -r 's/\x1b\[[0-9;]*m//g' /tmp/media_unlock.txt > /tmp/media_unlock_clean.txt 2>/dev/null || true
-        log debug "check.unlock.media 结果行数: $(wc -l < /tmp/media_unlock_clean.txt 2>/dev/null || echo 0)"
-    else
-        log debug "check.unlock.media 结果已缓存，跳过"
-    fi
-
-    # Script 2: yeahwu/check — TikTok/Bilibili/iQIYI
-    if [ ! -f /tmp/media_check_clean.txt ]; then
-        log info "执行 yeahwu/check..."
-        wget -qO /tmp/_media_check_script.sh https://github.com/yeahwu/check/raw/main/check.sh 2>/dev/null || true
-        if [ -f /tmp/_media_check_script.sh ]; then
-            bash /tmp/_media_check_script.sh > /tmp/media_check.txt 2>/dev/null || true
-        fi
-        sed -r 's/\x1b\[[0-9;]*m//g' /tmp/media_check.txt > /tmp/media_check_clean.txt 2>/dev/null || true
-        log debug "yeahwu/check 结果行数: $(wc -l < /tmp/media_check_clean.txt 2>/dev/null || echo 0)"
-    else
-        log debug "yeahwu/check 结果已缓存，跳过"
-    fi
-
-    # Script 3: Google Scholar
-    if [ ! -f /tmp/check_google_scholar_unlock.json ]; then
-        log info "执行 Google Scholar 检测..."
-        wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/scripts/check_google_scholar_standalone.py" 2>/dev/null || true
-        [ -f /tmp/check_google_scholar_standalone.py ] && python3 /tmp/check_google_scholar_standalone.py 2>/dev/null || true
-        log debug "Google Scholar 结果: $(head -c 200 /tmp/check_google_scholar_unlock.json 2>/dev/null || echo '无结果')"
-    else
-        log debug "Google Scholar 结果已缓存，跳过"
-    fi
-
-    # Script 4: Google NotebookLM
-    if [ ! -f /tmp/notebooklm_check_result.json ]; then
-        log info "执行 NotebookLM 检测..."
-        wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/scripts/notebooklm_unlock_checker.py" 2>/dev/null || true
-        [ -f /tmp/notebooklm_unlock_checker.py ] && python3 /tmp/notebooklm_unlock_checker.py 2>/dev/null || true
-        log debug "NotebookLM 结果: $(head -c 200 /tmp/notebooklm_check_result.json 2>/dev/null || echo '无结果')"
-    else
-        log debug "NotebookLM 结果已缓存，跳过"
-    fi
-
-    log info "媒体解锁脚本执行完成"
-}
-
-# 解析解锁结果，每个服务存为独立变量 unlock_xxx
-GetMediaUnlockInfo() {
-    log info "解析媒体解锁信息"
-    cd /tmp || return
-
-    # --- 从 media_unlock_clean.txt 解析 ---
-
-    unlock_netflix=$(sed -n '/^============\[ Multination \]====/,/^====/ { /Netflix:/ { s/.*Netflix://p;q } }' /tmp/media_unlock_clean.txt 2>/dev/null | xargs | tr -d ' ')
-
-    unlock_chatgpt=$(sed -n '/^============\[ Multination \]====/,/^====/ { /ChatGPT:/ { s/.*ChatGPT://p;q } }' /tmp/media_unlock_clean.txt 2>/dev/null | xargs | tr -d ' ')
-
-    unlock_disney=$(sed -n '/^============\[ Multination \]====/,/^====/ { /Disney+:/ { s/.*Disney+://p;q } }' /tmp/media_unlock_clean.txt 2>/dev/null | xargs | tr -d ' ')
-
-    unlock_bing=$(sed -n '/^============\[ Multination \]====/,/^====/ { /Bing Region:/ { s/.*Bing Region://p;q } }' /tmp/media_unlock_clean.txt 2>/dev/null | xargs | tr -d ' ')
-
-    unlock_claude=$(sed -n '/^============\[ Multination \]====/,/^====/ { /Claude:/ { s/.*Claude://p;q } }' /tmp/media_unlock_clean.txt 2>/dev/null | xargs | tr -d ' ')
-
-    unlock_gemini=$(sed -n '/^============\[ Multination \]====/,/^====/ { /Google Gemini:/ { s/.*Google Gemini://p;q } }' /tmp/media_unlock_clean.txt 2>/dev/null | xargs | tr -d ' ')
-
-    unlock_bahamut=$(sed -n '/^==============\[ Taiwan \]====/,/^====/ { /Bahamut Anime:/ { s/.*Bahamut Anime://p;q } }' /tmp/media_unlock_clean.txt 2>/dev/null | xargs | tr -d ' ')
-
-    unlock_mewatch=$(sed -n '/==========\[ SouthEastAsia \]====/,/^====/ { /MeWatch:/ { s/.*MeWatch://p;q } }' /tmp/media_unlock_clean.txt 2>/dev/null | xargs | tr -d ' ')
-
-    # --- 从 media_check_clean.txt 解析 ---
-    unlock_tiktok=$(grep '^ TikTok' /tmp/media_check_clean.txt 2>/dev/null | cut -d':' -f2- | xargs | tr -d ' ')
-
-    unlock_bilibili=$(grep '^ BiliBili China' /tmp/media_check_clean.txt 2>/dev/null | cut -d':' -f2- | xargs | tr -d ' ')
-
-    unlock_iqiyi=$(grep '^ iQIYI International' /tmp/media_check_clean.txt 2>/dev/null | cut -d':' -f2- | xargs | tr -d ' ')
-
-    # --- 从 JSON 文件解析 ---
-    unlock_google_scholar=""
-    if [ -f /tmp/check_google_scholar_unlock.json ]; then
-        scholar_status=$(jq -r '.access_status.overall_status' /tmp/check_google_scholar_unlock.json 2>/dev/null || echo "unknown")
-        case "$scholar_status" in
-            accessible|captcha) unlock_google_scholar="Yes(${scholar_status})" ;;
-            *)                  unlock_google_scholar="No(${scholar_status})" ;;
-        esac
-    fi
-
-    unlock_notebooklm=""
-    if [ -f /tmp/notebooklm_check_result.json ]; then
-        nb_status=$(jq -r '.ipv4.access_status' /tmp/notebooklm_check_result.json 2>/dev/null || echo "")
-        case "$nb_status" in
-            *yes*) unlock_notebooklm="Yes" ;;
-            *)     unlock_notebooklm="No" ;;
-        esac
-    fi
-
-    log info "解锁结果: netflix=${unlock_netflix:-空} chatgpt=${unlock_chatgpt:-空} claude=${unlock_claude:-空} gemini=${unlock_gemini:-空}"
-    log info "解锁结果: disney=${unlock_disney:-空} bing=${unlock_bing:-空} tiktok=${unlock_tiktok:-空} bilibili=${unlock_bilibili:-空}"
-    log info "解锁结果: bahamut=${unlock_bahamut:-空} mewatch=${unlock_mewatch:-空} iqiyi=${unlock_iqiyi:-空}"
-    log info "解锁结果: google_scholar=${unlock_google_scholar:-空} notebooklm=${unlock_notebooklm:-空}"
-}
 
 # 地理位置探测 — 优先 ipinfo.io，兜底 ip-api.com
 ProbeGeo() {
@@ -905,14 +793,6 @@ Step1_Register() {
     raw_tx=$(cat "$_tx_file")
     log info "网卡流量采集 — raw_rx=${raw_rx} raw_tx=${raw_tx} (${NET_CARD})"
 
-    # 媒体解锁检测
-    if [ "${SKIP_MEDIA_UNLOCK:-0}" = "1" ]; then
-        log info "媒体解锁检测已跳过 (SKIP_MEDIA_UNLOCK=1)"
-    else
-        RunMediaUnlockCheck
-        GetMediaUnlockInfo
-    fi
-
     # 读取本地缓存 (node.json + status.json) — panel 以节点上报为第一优先级
     _cached_node_id="" _cached_node_ids="" _cached_root_domain="" _cached_v2_name=""
     _cached_traffic_used=""
@@ -991,20 +871,6 @@ Step1_Register() {
         _reg_data="${_reg_data}&node_level=${node_level}"
         log info "node_level 使用 node.json 缓存值: ${node_level}"
     fi
-
-    [ -n "${unlock_netflix:-}" ]       && _reg_data="${_reg_data}&unlock_netflix=${unlock_netflix}"
-    [ -n "${unlock_chatgpt:-}" ]       && _reg_data="${_reg_data}&unlock_chatgpt=${unlock_chatgpt}"
-    [ -n "${unlock_disney:-}" ]        && _reg_data="${_reg_data}&unlock_disney=${unlock_disney}"
-    [ -n "${unlock_bing:-}" ]          && _reg_data="${_reg_data}&unlock_bing=${unlock_bing}"
-    [ -n "${unlock_claude:-}" ]        && _reg_data="${_reg_data}&unlock_claude=${unlock_claude}"
-    [ -n "${unlock_gemini:-}" ]        && _reg_data="${_reg_data}&unlock_gemini=${unlock_gemini}"
-    [ -n "${unlock_tiktok:-}" ]        && _reg_data="${_reg_data}&unlock_tiktok=${unlock_tiktok}"
-    [ -n "${unlock_bilibili:-}" ]      && _reg_data="${_reg_data}&unlock_bilibili=${unlock_bilibili}"
-    [ -n "${unlock_iqiyi:-}" ]         && _reg_data="${_reg_data}&unlock_iqiyi=${unlock_iqiyi}"
-    [ -n "${unlock_bahamut:-}" ]       && _reg_data="${_reg_data}&unlock_bahamut=${unlock_bahamut}"
-    [ -n "${unlock_mewatch:-}" ]       && _reg_data="${_reg_data}&unlock_mewatch=${unlock_mewatch}"
-    [ -n "${unlock_google_scholar:-}" ] && _reg_data="${_reg_data}&unlock_google_scholar=${unlock_google_scholar}"
-    [ -n "${unlock_notebooklm:-}" ]    && _reg_data="${_reg_data}&unlock_notebooklm=${unlock_notebooklm}"
 
     # 原始流量字节 — 供 panel 计算初始流量基线
     [ -n "${raw_rx:-}" ]              && _reg_data="${_reg_data}&raw_rx=${raw_rx}"
@@ -1360,6 +1226,22 @@ Step4_DeployCrontab() {
 }
 
 # ============================================================
+# Step 4.5: 下载并后台启动 unlockCheck.sh
+# ============================================================
+Step4_5_LaunchUnlockCheck() {
+    log info "Step 4.5: 下载并后台启动 unlockCheck.sh"
+
+    wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/unlockCheck.sh" \
+        || { log error "unlockCheck.sh 下载失败"; return 1; }
+    chmod +x /tmp/unlockCheck.sh
+    log info "unlockCheck.sh 已下载到 /tmp/"
+
+    nohup sh /tmp/unlockCheck.sh > /tmp/unlockCheck.out 2>&1 &
+    _pid=$!
+    log info "unlockCheck.sh 已后台启动 (PID=${_pid})，输出: /tmp/unlockCheck.out"
+}
+
+# ============================================================
 # 主流程
 # ============================================================
 Main() {
@@ -1375,6 +1257,7 @@ Main() {
     ConfigureFirewall
     Step2_ResolveDns
     Step4_DeployCrontab
+    Step4_5_LaunchUnlockCheck
 
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"
