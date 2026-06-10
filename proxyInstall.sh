@@ -178,7 +178,8 @@ WaitForAptLock() {
 # 例:   AptGet install -y -qq jq
 AptGet() {
     WaitForAptLock
-    apt-get "$@"
+    DEBIAN_FRONTEND=noninteractive \
+    apt-get -o Dpkg::Options::="--force-confold" "$@"
 }
 
 # ============================================================
