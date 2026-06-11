@@ -12,3 +12,5 @@ geodat/
 
 # Xray 二进制
 xray/
+
+.scripts/

@@ -496,13 +496,59 @@ InitSystem() {
     command -v vnstat >/dev/null 2>&1 || AptGet install -y -qq vnstat
 
     # Nginx: 先安装系统默认版本, 后续由 EnsureNginxLatest 升级
-    command -v nginx >/dev/null 2>&1  || AptGet install -y -qq nginx
+    # 若检测到管理面板则跳过 nginx 安装 — 面板自行管理
+    if [ -z "${_PANEL_DETECTED:-}" ]; then
+        command -v nginx >/dev/null 2>&1  || AptGet install -y -qq nginx
+    else
+        log info "检测到面板 ${_PANEL_DETECTED}，跳过 nginx 安装"
+    fi
 
-    log info "预先停止 nginx xray 服务"
-    systemctl stop nginx 2>/dev/null || true
+    log info "预先停止 xray 服务"
+    [ -z "${_PANEL_DETECTED:-}" ] && systemctl stop nginx 2>/dev/null || true
     systemctl stop xray 2>/dev/null || true
 
     log info "基础系统调优完成"
+}
+
+# ============================================================
+# B0. 面板检测 — 检测 1Panel / 宝塔 (btpanel) / AA Panel
+# 若检测到任意面板，设置 _PANEL_DETECTED 变量并发出警告
+# 面板管理权限高于脚本，不能终止面板进程或覆盖面板管理的 nginx
+# ============================================================
+DetectPanel() {
+    _PANEL_DETECTED=""
+
+    # 1Panel — 官方 CLI / 安装目录 / systemd 服务
+    if command -v 1pctl >/dev/null 2>&1 \
+       || [ -d /opt/1panel ] \
+       || systemctl is-active 1panel >/dev/null 2>&1; then
+        _PANEL_DETECTED="1Panel"
+    fi
+
+    # 宝塔面板 (btpanel) — bt CLI / 安装目录 / systemd 服务
+    if command -v bt >/dev/null 2>&1 \
+       || [ -d /www/server/panel ] \
+       || systemctl is-active bt >/dev/null 2>&1; then
+        [ -n "$_PANEL_DETECTED" ] && _PANEL_DETECTED="${_PANEL_DETECTED} + "
+        _PANEL_DETECTED="${_PANEL_DETECTED}宝塔面板(btpanel)"
+    fi
+
+    # AA Panel — 安装目录 / systemd 服务
+    if [ -d /www/server/aapanel ] \
+       || systemctl is-active aapanel >/dev/null 2>&1; then
+        [ -n "$_PANEL_DETECTED" ] && _PANEL_DETECTED="${_PANEL_DETECTED} + "
+        _PANEL_DETECTED="${_PANEL_DETECTED}AA Panel"
+    fi
+
+    if [ -n "$_PANEL_DETECTED" ]; then
+        log warn "============================================================"
+        log warn "  ⚠️  检测到面板: ${_PANEL_DETECTED}"
+        log warn "  面板管理权限高于本脚本，将跳过 Nginx 的安装与配置"
+        log warn "  请在面板中手动配置 Nginx 反向代理"
+        log warn "============================================================"
+    else
+        log info "未检测到管理面板 (1Panel/宝塔/AA Panel)"
+    fi
 }
 
 # ============================================================
@@ -1016,6 +1062,30 @@ Step3_InstallXray() {
 Step3_InstallNginx() {
     log info "Step 3: 配置 Nginx"
 
+    # 若检测到管理面板，跳过整个 Nginx 安装与配置
+    if [ -n "${_PANEL_DETECTED:-}" ]; then
+        log warn "⚠️  检测到面板: ${_PANEL_DETECTED}，跳过 Nginx 安装与配置"
+        log warn "⚠️  请在面板中手动配置 Nginx 反向代理 (参考下方 proxy.conf)"
+
+        # 仍然下载配置供参考
+        _conf_result=$(curl -sS --connect-timeout 30 --max-time 60 \
+            -o /etc/nginx/conf.d/proxy.conf \
+            -w "%{http_code}" \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            -d "node_id=${NODE_ID}" \
+            "${API_URL}/api/node/nginx_config") || true
+
+        case "$_conf_result" in
+            200) log info "proxy.conf 已下载到 /etc/nginx/conf.d/proxy.conf (供面板参考)" ;;
+            404) log info "该节点无 Nginx 配置 (如 vision 模式)" ;;
+            *)   log warn "Nginx 配置下载: HTTP ${_conf_result} (非致命，面板模式下继续)" ;;
+        esac
+
+        return 0
+    fi
+
+    # 无面板 — 正常安装流程
+
     # 确保 Nginx >= 1.25.1 (新版 http2 语法: http2 on; 而非 listen ... http2)
     EnsureNginxLatest
 
@@ -1238,6 +1308,7 @@ Step4_5_LaunchUnlockCheck() {
 # ============================================================
 Main() {
     LoadEnv
+    DetectPanel
     InitSystem
     Step0_ApplyId
     Step0_5_InstallServerStatus
@@ -1265,7 +1336,11 @@ Main() {
     [ -z "$_xray_status" ]  && _xray_status="未知"
     [ -z "$_nginx_status" ] && _nginx_status="未知"
     [ -z "$_stat_status" ]  && _stat_status="未安装"
-    if [ "$_xray_status" = "active" ] && [ "$_nginx_status" = "active" ] && [ "$_stat_status" = "active" ]; then
+
+    # 面板模式下 nginx 状态不做异常判断 (由面板管理)
+    if [ -n "${_PANEL_DETECTED:-}" ]; then
+        log info "服务状态: xray=${_xray_status} nginx=${_nginx_status} (面板管理) stat_client=${_stat_status}"
+    elif [ "$_xray_status" = "active" ] && [ "$_nginx_status" = "active" ] && [ "$_stat_status" = "active" ]; then
         log info "服务状态: xray=${_xray_status} nginx=${_nginx_status} stat_client=${_stat_status}"
     else
         [ "$_xray_status" != "active" ]  && log error "服务状态: xray=${_xray_status}"
