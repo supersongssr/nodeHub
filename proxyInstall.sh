@@ -556,9 +556,9 @@ DetectPanel() {
         SetNodeEnv "panel_detected" "${_PANEL_DETECTED}"
 
         # source 面板配置脚本
-        # 查找路径: 1) 脚本同目录/panels  2) ~/panels  3) 从 NODEHUB_URL 下载到 ~/panels
+        # 查找路径: 1) 脚本同目录/panels  2) /tmp/panels  3) ~/panels  4) 从 NODEHUB_URL 下载到 ~/panels
         _panel_dir=""
-        for _d in "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/panels" "$HOME/panels"; do
+        for _d in "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/panels" "/tmp/panels" "$HOME/panels"; do
             if [ -f "${_d}/panel-common.sh" ]; then
                 _panel_dir="$_d"
                 break
@@ -1172,14 +1172,76 @@ Step3_InstallNginx() {
 Step3_InstallNginx_Panel() {
     log info "Step 3 (面板模式): 检测传输模式并配置 Nginx"
 
+    # 0. 确保 panel-common.sh 已加载 (DetectPanel 可能因路径问题未找到)
+    if ! type DetectTransportMode >/dev/null 2>&1; then
+        log warn "DetectTransportMode 未定义，尝试重新加载 panel-common.sh"
+        _panel_dir=""
+        for _d in "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/panels" "/tmp/panels" "$HOME/panels"; do
+            if [ -f "${_d}/panel-common.sh" ]; then
+                _panel_dir="$_d"
+                break
+            fi
+        done
+        # 仍未找到 → 从 NODEHUB_URL 下载
+        if [ -z "$_panel_dir" ] && [ -n "${NODEHUB_URL:-}" ]; then
+            _dl_dir="$HOME/panels"
+            mkdir -p "$_dl_dir"
+            for _f in panel-common.sh panel-1panel.sh panel-btpanel.sh; do
+                wget -q --timeout=30 --tries=2 -O "${_dl_dir}/${_f}" "${NODEHUB_URL}/panels/${_f}" 2>/dev/null || true
+            done
+            if [ -f "${_dl_dir}/panel-common.sh" ]; then
+                _panel_dir="$_dl_dir"
+                log info "面板脚本已从 ${NODEHUB_URL}/panels/ 下载到 ${_dl_dir}"
+            fi
+        fi
+        if [ -n "$_panel_dir" ] && [ -f "${_panel_dir}/panel-common.sh" ]; then
+            # shellcheck disable=SC1090
+            . "${_panel_dir}/panel-common.sh"
+            log info "已加载 ${_panel_dir}/panel-common.sh"
+            # 按面板类型加载专用脚本
+            case "${_PANEL_TYPE:-}" in
+                1panel)
+                    [ -f "${_panel_dir}/panel-1panel.sh" ] && . "${_panel_dir}/panel-1panel.sh" && log info "已加载 panel-1panel.sh"
+                    ;;
+                btpanel|aapanel)
+                    [ -f "${_panel_dir}/panel-btpanel.sh" ] && . "${_panel_dir}/panel-btpanel.sh" && log info "已加载 panel-btpanel.sh"
+                    ;;
+            esac
+        else
+            # 最后兜底: 内联实现核心函数
+            log warn "panel-common.sh 无法加载，使用内联兜底实现"
+            _TRANSPORT_MODE="other"
+            if [ -f ~/node.json ]; then
+                _v2_name=$(jq -r '.v2_name // empty' ~/node.json 2>/dev/null || true)
+                case "$_v2_name" in
+                    *xhttp*) _TRANSPORT_MODE="xhttp" ;;
+                    *vision*|*reality*) _TRANSPORT_MODE="vision" ;;
+                esac
+            fi
+        fi
+    fi
+
     # 1. 从 ~/node.json 的 v2_name 判断传输模式
-    DetectTransportMode
+    DetectTransportMode 2>/dev/null || true
     _PANEL_TRANSPORT="${_TRANSPORT_MODE}"
     log info "面板传输模式: ${_PANEL_TRANSPORT} (由 v2_name 判定)"
 
     # 2. vision 模式: 面板占用 443, vision 需独占 TLS 端口
     if [ "${_PANEL_TRANSPORT}" = "vision" ]; then
-        Detect443Usage
+        if type Detect443Usage >/dev/null 2>&1; then
+            Detect443Usage
+        else
+            # 兜底: 用 ss 检测 443 端口占用
+            _PORT443_OWNER=""
+            _443_listener=$(ss -tlnp 2>/dev/null | grep ':443 ' | head -1 || true)
+            if [ -n "$_443_listener" ]; then
+                _PORT443_OWNER=$(echo "$_443_listener" | grep -oP 'users:\(\("\K[^"]+' || true)
+                [ -z "$_PORT443_OWNER" ] && _PORT443_OWNER="unknown"
+                log info "443 端口被占用: ${_PORT443_OWNER}"
+            else
+                log info "443 端口空闲"
+            fi
+        fi
         if [ "${node_port}" = "443" ]; then
             log error "============================================================"
             log error "  ❌ vision 模式 + 面板: node_port=443 被面板占用"
@@ -1228,7 +1290,15 @@ Step3_InstallNginx_Panel() {
     fi
 
     # 5. 从面板下发的 proxy.conf 提取 xray upstream 端口
-    ParsePanelProxyConf "${_panel_proxy_conf}"
+    if type ParsePanelProxyConf >/dev/null 2>&1; then
+        ParsePanelProxyConf "${_panel_proxy_conf}"
+    else
+        # 兜底: 内联解析 proxy.conf
+        _extracted_upstream=$(grep -oP 'server\s+127\.0\.0\.1:\K[0-9]+' "${_panel_proxy_conf}" 2>/dev/null | head -1 || true)
+        [ -z "$_extracted_upstream" ] && _extracted_upstream=$(grep -oP 'proxy_pass\s+http://127\.0\.0\.1:\K[0-9]+' "${_panel_proxy_conf}" 2>/dev/null | head -1 || true)
+        [ -z "$_extracted_upstream" ] && _extracted_upstream="8443"
+        log info "proxy.conf 解析 (内联): upstream_port=${_extracted_upstream}"
+    fi
     _xray_upstream_port="${_extracted_upstream}"
     log info "xray upstream 端口: ${_xray_upstream_port}"
 

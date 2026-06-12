@@ -94,6 +94,18 @@ Panel1Panel_ConfigureSite() {
         fi
     fi
 
+    # Docker 模式: SSL 证书需要映射到容器可访问的路径
+    # 宿主机 /opt/1panel/apps/openresty/openresty/www/ → 容器 /www/
+    _ssl_dir="/opt/1panel/apps/openresty/openresty/www/ssl"
+    if echo "${_1PANEL_NGINX_CMD}" | grep -q "docker exec"; then
+        mkdir -p "${_ssl_dir}"
+        cp -f "${_cert_path}" "${_ssl_dir}/$(basename "${_cert_path}")" 2>/dev/null
+        cp -f "${_key_path}" "${_ssl_dir}/$(basename "${_key_path}")" 2>/dev/null
+        _cert_path="/www/ssl/$(basename "${_cert_path}")"
+        _key_path="/www/ssl/$(basename "${_key_path}")"
+        log info "1Panel Docker: SSL 证书已复制到 ${_ssl_dir}/ (容器内路径: /www/ssl/)"
+    fi
+
     # 生成 nginx 配置 (调用 panel-common.sh 中的 GenerateProxyServerBlock)
     GenerateProxyServerBlock "$_domain" "$_cert_path" "$_key_path" "$_xray_port" "$_panel_proxy_conf" > "$_target_conf"
 

@@ -142,9 +142,8 @@ server {
 
 # HTTPS 反向代理 → xray
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
     server_name proxy.${_domain} *.${_domain};
 
     ssl_certificate ${_cert};
