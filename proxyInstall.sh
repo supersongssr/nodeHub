@@ -500,7 +500,7 @@ InitSystem() {
     if [ -z "${_PANEL_DETECTED:-}" ]; then
         command -v nginx >/dev/null 2>&1  || AptGet install -y -qq nginx
     else
-        log info "检测到面板 ${_PANEL_DETECTED}，跳过 nginx 安装"
+        log info "检测到面板 ${_PANEL_DETECTED}，跳过 nginx 安装 (由面板管理)"
     fi
 
     log info "预先停止 xray 服务"
@@ -512,17 +512,20 @@ InitSystem() {
 
 # ============================================================
 # B0. 面板检测 — 检测 1Panel / 宝塔 (btpanel) / AA Panel
-# 若检测到任意面板，设置 _PANEL_DETECTED 变量并发出警告
-# 面板管理权限高于脚本，不能终止面板进程或覆盖面板管理的 nginx
+# 设置 _PANEL_DETECTED (显示用) 和 _PANEL_TYPE (脚本分派用)
+# _PANEL_TYPE: "1panel" | "btpanel" | "aapanel" | "" (无面板)
+# 检测到面板后自动 source 对应的配置脚本
 # ============================================================
 DetectPanel() {
     _PANEL_DETECTED=""
+    _PANEL_TYPE=""
 
     # 1Panel — 官方 CLI / 安装目录 / systemd 服务
     if command -v 1pctl >/dev/null 2>&1 \
        || [ -d /opt/1panel ] \
        || systemctl is-active 1panel >/dev/null 2>&1; then
         _PANEL_DETECTED="1Panel"
+        _PANEL_TYPE="1panel"
     fi
 
     # 宝塔面板 (btpanel) — bt CLI / 安装目录 / systemd 服务
@@ -531,6 +534,7 @@ DetectPanel() {
        || systemctl is-active bt >/dev/null 2>&1; then
         [ -n "$_PANEL_DETECTED" ] && _PANEL_DETECTED="${_PANEL_DETECTED} + "
         _PANEL_DETECTED="${_PANEL_DETECTED}宝塔面板(btpanel)"
+        [ -z "$_PANEL_TYPE" ] && _PANEL_TYPE="btpanel"
     fi
 
     # AA Panel — 安装目录 / systemd 服务
@@ -538,14 +542,75 @@ DetectPanel() {
        || systemctl is-active aapanel >/dev/null 2>&1; then
         [ -n "$_PANEL_DETECTED" ] && _PANEL_DETECTED="${_PANEL_DETECTED} + "
         _PANEL_DETECTED="${_PANEL_DETECTED}AA Panel"
+        _PANEL_TYPE="aapanel"
     fi
 
     if [ -n "$_PANEL_DETECTED" ]; then
-        log warn "============================================================"
-        log warn "  ⚠️  检测到面板: ${_PANEL_DETECTED}"
-        log warn "  面板管理权限高于本脚本，将跳过 Nginx 的安装与配置"
-        log warn "  请在面板中手动配置 Nginx 反向代理"
-        log warn "============================================================"
+        log info "============================================================"
+        log info "  🔧 检测到面板: ${_PANEL_DETECTED} (类型: ${_PANEL_TYPE})"
+        log info "  将使用面板专用脚本配置 Nginx 代理"
+        log info "============================================================"
+
+        # 持久化面板类型到 ~/node.env
+        SetNodeEnv "panel_type" "${_PANEL_TYPE}"
+        SetNodeEnv "panel_detected" "${_PANEL_DETECTED}"
+
+        # source 面板配置脚本
+        # 查找路径: 1) 脚本同目录/panels  2) ~/panels  3) 从 NODEHUB_URL 下载到 ~/panels
+        _panel_dir=""
+        for _d in "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/panels" "$HOME/panels"; do
+            if [ -f "${_d}/panel-common.sh" ]; then
+                _panel_dir="$_d"
+                break
+            fi
+        done
+
+        # 仍未找到 → 从 NODEHUB_URL 下载
+        if [ -z "$_panel_dir" ] && [ -n "${NODEHUB_URL:-}" ]; then
+            _dl_dir="$HOME/panels"
+            mkdir -p "$_dl_dir"
+            for _f in panel-common.sh panel-1panel.sh panel-btpanel.sh; do
+                wget -q --timeout=30 --tries=2 -O "${_dl_dir}/${_f}" "${NODEHUB_URL}/panels/${_f}" 2>/dev/null || true
+            done
+            if [ -f "${_dl_dir}/panel-common.sh" ]; then
+                _panel_dir="$_dl_dir"
+                log info "面板脚本已从 ${NODEHUB_URL}/panels/ 下载到 ${_dl_dir}"
+            fi
+        fi
+
+        # 加载 panel-common.sh (共享函数, 必需)
+        if [ -n "$_panel_dir" ] && [ -f "${_panel_dir}/panel-common.sh" ]; then
+            # shellcheck disable=SC1090
+            . "${_panel_dir}/panel-common.sh"
+            log info "已加载 panel-common.sh"
+        else
+            log warn "panel-common.sh 未找到且下载失败，降级为无面板模式"
+            _PANEL_TYPE=""
+        fi
+
+        # 加载面板专用脚本 (依赖 panel-common.sh 已加载)
+        case "${_PANEL_TYPE}" in
+            1panel)
+                if [ -f "${_panel_dir}/panel-1panel.sh" ]; then
+                    # shellcheck disable=SC1090
+                    . "${_panel_dir}/panel-1panel.sh"
+                    log info "已加载 panel-1panel.sh"
+                else
+                    log warn "panel-1panel.sh 未找到，降级为无面板模式"
+                    _PANEL_TYPE=""
+                fi
+                ;;
+            btpanel|aapanel)
+                if [ -f "${_panel_dir}/panel-btpanel.sh" ]; then
+                    # shellcheck disable=SC1090
+                    . "${_panel_dir}/panel-btpanel.sh"
+                    log info "已加载 panel-btpanel.sh"
+                else
+                    log warn "panel-btpanel.sh 未找到，降级为无面板模式"
+                    _PANEL_TYPE=""
+                fi
+                ;;
+        esac
     else
         log info "未检测到管理面板 (1Panel/宝塔/AA Panel)"
     fi
@@ -1058,33 +1123,19 @@ Step3_InstallXray() {
 
 # ============================================================
 # Step 3: 配置 Nginx (前端下发完整 proxy.conf)
+# 面板模式: 调用专用面板脚本配置代理
+# 无面板:   直接落盘 + systemctl
 # ============================================================
 Step3_InstallNginx() {
     log info "Step 3: 配置 Nginx"
 
-    # 若检测到管理面板，跳过整个 Nginx 安装与配置
-    if [ -n "${_PANEL_DETECTED:-}" ]; then
-        log warn "⚠️  检测到面板: ${_PANEL_DETECTED}，跳过 Nginx 安装与配置"
-        log warn "⚠️  请在面板中手动配置 Nginx 反向代理 (参考下方 proxy.conf)"
-
-        # 仍然下载配置供参考
-        _conf_result=$(curl -sS --connect-timeout 30 --max-time 60 \
-            -o /etc/nginx/conf.d/proxy.conf \
-            -w "%{http_code}" \
-            -H "Authorization: Bearer ${API_TOKEN}" \
-            -d "node_id=${NODE_ID}" \
-            "${API_URL}/api/node/nginx_config") || true
-
-        case "$_conf_result" in
-            200) log info "proxy.conf 已下载到 /etc/nginx/conf.d/proxy.conf (供面板参考)" ;;
-            404) log info "该节点无 Nginx 配置 (如 vision 模式)" ;;
-            *)   log warn "Nginx 配置下载: HTTP ${_conf_result} (非致命，面板模式下继续)" ;;
-        esac
-
-        return 0
+    # ---- 面板模式: 调用专用脚本 ----
+    if [ -n "${_PANEL_TYPE:-}" ]; then
+        Step3_InstallNginx_Panel
+        return $?
     fi
 
-    # 无面板 — 正常安装流程
+    # ---- 无面板 — 正常安装流程 ----
 
     # 确保 Nginx >= 1.25.1 (新版 http2 语法: http2 on; 而非 listen ... http2)
     EnsureNginxLatest
@@ -1111,6 +1162,90 @@ Step3_InstallNginx() {
             die "Nginx 配置下载失败: HTTP ${http_code}"
             ;;
     esac
+}
+
+# ============================================================
+# Step 3 (面板模式): 检测传输模式并调用对应面板脚本
+# xhttp 模式: 下载面板下发的 proxy.conf, 处理后注入面板 nginx
+# vision 模式: 检测 443 占用情况, 非法则警告退出
+# ============================================================
+Step3_InstallNginx_Panel() {
+    log info "Step 3 (面板模式): 检测传输模式并配置 Nginx"
+
+    # 1. 从 ~/node.json 的 v2_name 判断传输模式
+    DetectTransportMode
+    _PANEL_TRANSPORT="${_TRANSPORT_MODE}"
+    log info "面板传输模式: ${_PANEL_TRANSPORT} (由 v2_name 判定)"
+
+    # 2. vision 模式: 面板占用 443, vision 需独占 TLS 端口
+    if [ "${_PANEL_TRANSPORT}" = "vision" ]; then
+        Detect443Usage
+        if [ "${node_port}" = "443" ]; then
+            log error "============================================================"
+            log error "  ❌ vision 模式 + 面板: node_port=443 被面板占用"
+            log error "  面板 (${_PANEL_DETECTED}) 会优先占用 443 端口"
+            log error "  vision 模式 (vless tcp vision) 需要独占 TLS 端口"
+            log error "  解决方案: 修改 node_port 为非 443 端口 (如 2053)"
+            log error "  或在 ~/.env 中设置 NODE_PORT=2053"
+            log error "============================================================"
+            return 1
+        else
+            log info "vision 模式: node_port=${node_port} (非 443)，可以继续"
+            log info "vision 模式下不需要 nginx 配置，xray 直接监听 ${node_port}"
+            return 0
+        fi
+    fi
+
+    # 3. xhttp 模式: 从面板 API 下载 proxy.conf
+    if [ "${_PANEL_TRANSPORT}" != "xhttp" ]; then
+        log warn "未知传输模式 (${_PANEL_TRANSPORT})，跳过 Nginx 配置"
+        return 0
+    fi
+
+    _panel_proxy_conf="/tmp/panel-proxy.conf"
+    _conf_http_code=$(curl -sS --connect-timeout 30 --max-time 60 \
+        -o "${_panel_proxy_conf}" \
+        -w "%{http_code}" \
+        -H "Authorization: Bearer ${API_TOKEN}" \
+        -d "node_id=${NODE_ID}" \
+        "${API_URL}/api/node/nginx_config") || true
+
+    log info "面板 nginx_config API 返回: HTTP ${_conf_http_code}"
+
+    if [ "${_conf_http_code}" != "200" ]; then
+        log error "xhttp 模式需要 nginx 配置，但面板 API 返回 HTTP ${_conf_http_code}"
+        return 1
+    fi
+
+    # 4. 确认 SSL 证书 (由 Step1_5_DownloadSSL 下载)
+    _cert_path="/etc/ssl/${root_domain}.pem"
+    _key_path="/etc/ssl/${root_domain}.key"
+
+    if [ ! -f "${_cert_path}" ] || [ ! -f "${_key_path}" ]; then
+        log error "SSL 证书不存在: ${_cert_path} 或 ${_key_path}"
+        log error "请确保 Step 1.5 已正常执行"
+        return 1
+    fi
+
+    # 5. 从面板下发的 proxy.conf 提取 xray upstream 端口
+    ParsePanelProxyConf "${_panel_proxy_conf}"
+    _xray_upstream_port="${_extracted_upstream}"
+    log info "xray upstream 端口: ${_xray_upstream_port}"
+
+    # 6. 按面板类型调用专用脚本
+    case "${_PANEL_TYPE}" in
+        1panel)
+            Panel1Panel_Setup "${root_domain}" "${_cert_path}" "${_key_path}" "${_xray_upstream_port}" "${_panel_proxy_conf}"
+            ;;
+        btpanel|aapanel)
+            PanelBtPanel_Setup "${root_domain}" "${_cert_path}" "${_key_path}" "${_xray_upstream_port}" "${_panel_proxy_conf}"
+            ;;
+        *)
+            log error "未知面板类型: ${_PANEL_TYPE}，跳过 Nginx 配置"
+            return 1
+            ;;
+    esac
+    return $?
 }
 
 # ============================================================
@@ -1328,6 +1463,18 @@ Main() {
     log info "node_port=${node_port}"
     log info "API_PANEL=${API_PANEL}"
     log info "配置文件: ~/node.env | ~/node.json | ~/config.json"
+
+    # 面板信息
+    if [ -n "${_PANEL_DETECTED:-}" ]; then
+        log info "面板: ${_PANEL_DETECTED} (${_PANEL_TYPE:-未知})"
+        [ -n "${_PANEL_TRANSPORT:-}" ] && log info "传输模式: ${_PANEL_TRANSPORT}"
+
+        # 写入备注到 ~/node.env
+        SetNodeEnv "panel_detected" "${_PANEL_DETECTED}"
+        SetNodeEnv "panel_type" "${_PANEL_TYPE:-unknown}"
+        [ -n "${_PANEL_TRANSPORT:-}" ] && SetNodeEnv "panel_transport" "${_PANEL_TRANSPORT}"
+        SetNodeEnv "panel_remark" "auto-detected-by-proxyInstall"
+    fi
 
     # 服务状态 — 异常时红色标注
     _xray_status=$(systemctl is-active xray 2>/dev/null) || true
