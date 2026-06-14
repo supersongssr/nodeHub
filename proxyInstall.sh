@@ -8,6 +8,10 @@
 set -eu
 
 VERSION="v2.3.0-20260429"
+ARIANG_VERSION="1.3.13"
+ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
+ARIANG_DIR="/var/www/ariang"
+ARIANG_ZIP="/tmp/AriaNg-${ARIANG_VERSION}.zip"
 
 # ============================================================
 # ERR Trap — 任何命令失败时打印诊断信息后终止
@@ -1031,6 +1035,40 @@ Step1_5_DownloadSSL() {
 }
 
 # ============================================================
+# Step 2.5: 安装本地 AriaNg 静态站 (用于 nginx location / 本地回落)
+# 下载到 /tmp (wget -N 幂等), 解压到 /var/www/ariang
+# 纯静态站点, 无面板/面板模式均安装
+# ============================================================
+Step2_5_InstallAriaNg() {
+    log info "Step 2.5: 安装本地 AriaNg 静态站 (${ARIANG_VERSION})"
+
+    command -v unzip >/dev/null 2>&1 || AptGet install -y -qq unzip
+
+    (
+        cd /tmp
+        wget -N --timeout=60 --tries=3 "${ARIANG_URL}"
+    ) || die "AriaNg 下载失败: ${ARIANG_URL}"
+    AssertFileValid "AriaNg zip" "${ARIANG_ZIP}"
+
+    _ariang_stage="$(mktemp -d)"
+    if ! unzip -q -o "${ARIANG_ZIP}" -d "${_ariang_stage}"; then
+        rm -rf "${_ariang_stage}"
+        die "AriaNg 解压失败: ${ARIANG_ZIP}"
+    fi
+
+    mkdir -p "${ARIANG_DIR}"
+    rm -rf "${ARIANG_DIR:?}/"*
+    cp -a "${_ariang_stage}/." "${ARIANG_DIR}/"
+    rm -rf "${_ariang_stage}"
+
+    [ -f "${ARIANG_DIR}/index.html" ] || die "AriaNg 安装异常: index.html 缺失"
+    chown -R root:root "${ARIANG_DIR}"
+    chmod -R a+rX "${ARIANG_DIR}"
+
+    log info "AriaNg 已安装到 ${ARIANG_DIR}"
+}
+
+# ============================================================
 # Step 2: 解析 DNS (前端负责解析，节点只触发)
 # ============================================================
 Step2_ResolveDns() {
@@ -1519,6 +1557,7 @@ Main() {
     Step0_5_InstallServerStatus
     Step1_Register
     Step1_5_DownloadSSL
+    Step2_5_InstallAriaNg
     Step3_InstallNginx
     Step3_InstallXray
     Step3_5_SetupHy2PortHop

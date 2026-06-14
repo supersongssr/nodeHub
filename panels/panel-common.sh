@@ -90,7 +90,7 @@ Detect443Usage() {
 # 输出: stdout = 生成的 nginx server 配置
 #
 # xhttp 模式下, 从面板下发的 proxy.conf 中提取所有 location 块
-# 附加到生成的 server block 中, 其余路径走默认 proxy_pass
+# 附加到生成的 server block 中, 其余路径走本地 AriaNg 静态站
 # ============================================================
 GenerateProxyServerBlock() {
     _domain="$1"
@@ -128,7 +128,7 @@ GenerateProxyServerBlock() {
 # ============================================================
 # NodeHub Proxy — 自动生成 (面板模式)
 # 域名: proxy.${_domain} + *.${_domain}
-# 后端: xray 127.0.0.1:${_xray_port}
+# 后端: xray 127.0.0.1:${_xray_port}, 默认回落: /var/www/ariang
 # 由 proxyInstall.sh 面板集成脚本维护，勿手动修改
 # ============================================================
 
@@ -140,7 +140,7 @@ server {
     return 301 https://\$host\$request_uri;
 }
 
-# HTTPS 反向代理 → xray
+# HTTPS 分流 → xray, 默认回落 → 本地 AriaNg
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
@@ -153,20 +153,10 @@ server {
 
     # --- xhttp 分流路径 (从面板下发的配置中提取) ---
 ${_location_blocks}
-    # --- 默认回退: 转发到 xray ---
+    # --- 默认回退: 本地 AriaNg 静态站 ---
     location / {
-        proxy_pass http://127.0.0.1:${_xray_port};
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-
-        # xhttp (WebSocket/SSE) 支持
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        root /var/www/ariang;
+        index index.html;
     }
 }
 SERVERBLOCK_EOF
