@@ -1501,6 +1501,22 @@ SVC_EOF
 Step4_DeployCrontab() {
     log info "Step 4: 部署定时任务"
 
+    # ------------------------------------------------------------
+    # 0. 确保 cron 守护进程已安装并运行
+    # 最小化 Debian/Ubuntu 镜像 (容器/云主机) 可能未预装 cron,
+    # 导致 /etc/crontab 不存在 → sed -i 报 "can't read /etc/crontab"
+    # ------------------------------------------------------------
+    if [ ! -x /usr/sbin/cron ] && [ ! -x /usr/sbin/crond ]; then
+        log info "cron 未安装，安装中..."
+        AptGet install -y -qq cron || die "cron 安装失败"
+    fi
+
+    # 双保险: 即使已安装 cron 也确保 /etc/crontab 存在 (touch 幂等)
+    if [ ! -f /etc/crontab ]; then
+        log warn "/etc/crontab 不存在，创建空文件"
+        touch /etc/crontab
+    fi
+
     # 下载 nodeAgent.sh (每小时执行)
     wget -N --timeout=60 --tries=3 -P ~ "${NODEHUB_URL}/nodeAgent.sh" \
         || die "nodeAgent.sh 下载失败: ${NODEHUB_URL}/nodeAgent.sh"
@@ -1526,6 +1542,25 @@ Step4_DeployCrontab() {
         echo "${install_min} * * * * ${_cron_user} /bin/sh ~/nodeAgent.sh >> ~/nodeLogs 2>&1"
         echo "* * * * * ${_cron_user} /bin/sh ~/nodeMonitor.sh >> /tmp/nodeMonitor.log 2>&1"
     } >> /etc/crontab
+
+    # ------------------------------------------------------------
+    # 启用并重启 cron 服务, 使新条目立即生效
+    # Debian/Ubuntu: cron.service | RHEL 系: crond.service
+    # ------------------------------------------------------------
+    _cron_started=""
+    for _cron_svc in cron crond; do
+        if systemctl list-unit-files 2>/dev/null | grep -q "^${_cron_svc}\.service"; then
+            systemctl enable "$_cron_svc" 2>/dev/null || true
+            systemctl restart "$_cron_svc" 2>/dev/null || true
+            _cron_started="$_cron_svc"
+            break
+        fi
+    done
+    if [ -n "$_cron_started" ]; then
+        log info "${_cron_started} 服务已启用并重启"
+    else
+        log warn "未找到 cron/crond systemd 服务单元，请手动确认定时任务守护进程在运行"
+    fi
 
     log info "/etc/crontab 已配置: nodeAgent 每小时第 ${install_min} 分钟 | nodeMonitor 每分钟"
 }
