@@ -63,10 +63,13 @@ Log() {
 }
 
 NotifyTG() {
-    [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ] && return 0
+    # 通知为 “尽力而为”, 任何失败都不得中断主流程 (配合 set -e)
+    if [ -z "${TG_BOT_TOKEN:-}" ] || [ -z "${TG_CHAT_ID:-}" ]; then
+        return 0
+    fi
     curl -s --connect-timeout 5 --max-time 15 \
         -d "chat_id=${TG_CHAT_ID}&text=from:sync:$1" \
-        "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1
+        "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" >/dev/null 2>&1 || true
 }
 
 # ============================================================
@@ -110,10 +113,9 @@ SyncSSL() {
     for domain in $DOMAINS; do
         Log "同步: $domain"
 
-        wget -N -q -T 30 -P "$SSL_DIR" "${BASE_URL}/${domain}.pem" 2>/dev/null && \
-        wget -N -q -T 30 -P "$SSL_DIR" "${BASE_URL}/${domain}.key" 2>/dev/null
-
-        if [ $? -eq 0 ]; then
+        # 用 if 条件包裹 wget, 使其免受 set -e 影响 (条件中的命令不会触发 errexit)
+        if wget -N -q -T 30 -P "$SSL_DIR" "${BASE_URL}/${domain}.pem" 2>/dev/null && \
+           wget -N -q -T 30 -P "$SSL_DIR" "${BASE_URL}/${domain}.key" 2>/dev/null; then
             updated=$((updated + 1))
             Log "完成: $domain"
         else
@@ -151,12 +153,15 @@ SyncGeoData() {
 
     if [ -n "$new_geosite" ] && [ "$new_geosite" != "$geositeVersion" ]; then
         Log "geosite: ${geositeVersion:-无} → ${new_geosite}"
-        wget -N -q -T 120 -P "$GEO_DIR" \
-            "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat" && \
-        mv -f "${GEO_DIR}/dlc.dat" "${GEO_DIR}/geosite.dat"
-        sed -i '/^geositeVersion=/d' "$CONF" 2>/dev/null || true
-        echo "geositeVersion=${new_geosite}" >> "$CONF"
-        Log "geosite 更新完成"
+        if wget -N -q -T 120 -P "$GEO_DIR" \
+            "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"; then
+            mv -f "${GEO_DIR}/dlc.dat" "${GEO_DIR}/geosite.dat"
+            sed -i '/^geositeVersion=/d' "$CONF" 2>/dev/null || true
+            echo "geositeVersion=${new_geosite}" >> "$CONF"
+            Log "geosite 更新完成"
+        else
+            Log "geosite 下载失败, 跳过"
+        fi
     else
         Log "geosite 未变化"
     fi
@@ -168,11 +173,14 @@ SyncGeoData() {
 
     if [ -n "$new_geoip" ] && [ "$new_geoip" != "$geoipVersion" ]; then
         Log "geoip: ${geoipVersion:-无} → ${new_geoip}"
-        wget -N -q -T 120 -P "$GEO_DIR" \
-            "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
-        sed -i '/^geoipVersion=/d' "$CONF" 2>/dev/null || true
-        echo "geoipVersion=${new_geoip}" >> "$CONF"
-        Log "geoip 更新完成"
+        if wget -N -q -T 120 -P "$GEO_DIR" \
+            "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"; then
+            sed -i '/^geoipVersion=/d' "$CONF" 2>/dev/null || true
+            echo "geoipVersion=${new_geoip}" >> "$CONF"
+            Log "geoip 更新完成"
+        else
+            Log "geoip 下载失败, 跳过"
+        fi
     else
         Log "geoip 未变化"
     fi
