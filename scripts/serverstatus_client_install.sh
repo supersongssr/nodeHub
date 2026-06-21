@@ -1,8 +1,9 @@
 #!/bin/sh
 # ============================================================
 # serverstatus_client_install.sh — ServerStatus-Rust 客户端安装脚本
-# 架构: 仿 V2 瘦节点风格 — 配置从 ~/.env + ~/node.env 读取
-# 生命周期: LoadEnv → Download → Install → WriteService → Enable → Verify
+# 配置参数: 纯透传 — 由调用方 (proxyInstall.sh / 人工) 在命令行提供 stat_client 参数
+#           脚本不读取 ~/.env, 不解释参数语义, 原封不动写入 systemd ExecStart
+# 生命周期: ProbeArch → GetLatestVersion → Download → WriteService($@) → Enable → Verify
 # ============================================================
 
 set -eu
@@ -16,7 +17,6 @@ OnError() {
     _exit_code=$?
     [ "$_exit_code" -eq 0 ] && exit 0
     printf '\033[31m%s [FATAL] 💥 命令失败 — 退出码=%d\033[0m\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$_exit_code" >&2
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [FATAL] 💥 命令失败 — 退出码=${_exit_code}" >> ~/nodeLogs 2>/dev/null || true
     exit "$_exit_code"
 }
 trap 'OnError' EXIT
@@ -41,75 +41,11 @@ log() {
 
     _log_message="${_timestamp} [${_level}] ${_emoji} ${_message}"
     printf '%b%s%b\n' "$_color_code" "$_log_message" "\033[0m" >&2
-    echo "$_log_message" >> ~/nodeLogs 2>/dev/null || true
 }
 
 die() {
     log error "$*"
     exit 1
-}
-
-# ============================================================
-# ~/node.env 原子写入
-# ============================================================
-SetNodeEnv() {
-    _key="$1"
-    _value="$2"
-    _env_file=~/node.env
-    _lock_file=/tmp/nodeEnv.lock
-
-    [ -f "$_env_file" ] || touch "$_env_file"
-
-    flock "$_lock_file" sed -i "/^${_key}=/d" "$_env_file" 2>/dev/null || true
-    echo "${_key}=\"${_value}\"" >> "$_env_file"
-}
-
-# ============================================================
-# A. 环境读取
-# ============================================================
-LoadEnv() {
-    log info "===== serverstatus_client_install.sh ${VERSION} 启动 ====="
-
-    # 1. 加载 ~/.env (用户手工只读配置)
-    if [ -f ~/.env ]; then
-        # shellcheck disable=SC1090
-        . ~/.env || die "加载 ~/.env 失败"
-        log info "已加载 ~/.env"
-    else
-        die "~/.env 不存在，请先创建并填入必要配置"
-    fi
-
-    # 2. 加载 ~/node.env (脚本自动生成)
-    if [ -f ~/node.env ]; then
-        # shellcheck disable=SC1090
-        . ~/node.env || die "加载 ~/node.env 失败"
-        log info "已加载 ~/node.env"
-    else
-        log warn "~/node.env 不存在，ALIAS 将为空 (需先运行 proxyInstall.sh)"
-    fi
-
-    # 必需字段校验
-    [ -z "${STAT_API_URL:-}" ]       && die "~/.env 缺少必需字段: STAT_API_URL"
-    [ -z "${STAT_API_PASSWORD:-}" ]   && die "~/.env 缺少必需字段: STAT_API_PASSWORD"
-    [ -z "${API_PANEL:-}" ]           && die "~/.env 缺少必需字段: API_PANEL"
-
-    case "${API_PANEL}" in
-        ssp|srp) ;;
-        *) die "API_PANEL 值无效: ${API_PANEL} — 仅支持 ssp 或 srp" ;;
-    esac
-
-    # ALIAS = node.env 中的 node_id
-    ALIAS="${node_id:-}"
-    if [ -z "$ALIAS" ]; then
-        die "ALIAS (node_id) 为空 — 请先运行 proxyInstall.sh 注册节点获取 node_id"
-    fi
-    log info "ALIAS (node_id) = ${ALIAS}"
-
-    STAT_USER="${API_PANEL}"
-    # 服务端唯一节点标识: {API_PANEL}_{node_id}
-    STAT_NAME="${API_PANEL}_${ALIAS}"
-
-    log info "变量加载完成 — STAT_API_URL=${STAT_API_URL} API_PANEL=${API_PANEL} STAT_USER=${STAT_USER} STAT_NAME=${STAT_NAME}"
 }
 
 # ============================================================
@@ -172,8 +108,11 @@ Download() {
 # ============================================================
 # E. 写入 systemd 服务
 # ============================================================
+# 参数透传: 第一个参数即 stat_client 的全部命令行参数 (已由调用方拼好)
 WriteService() {
-    log info "写入 systemd 配置 (版本 ${_latest})"
+    STAT_ARGS="$1"
+    [ -z "$STAT_ARGS" ] && die "缺少 stat_client 参数 — 用法: $0 '<stat_client 的 -a/-u/-p/[-g]/... 参数>'"
+    log info "写入 systemd 配置 (版本 ${_latest}) — ExecStart 参数: ${STAT_ARGS}"
     cat > "${SERVICE_CONF}" <<-EOF
 #Version=${_latest}
 [Unit]
@@ -185,7 +124,7 @@ User=root
 Group=root
 Environment="RUST_BACKTRACE=1"
 WorkingDirectory=${WORKING_DIR}
-ExecStart=${CLIENT_FILE} -a ${STAT_API_URL} -g ${STAT_USER} -p ${STAT_API_PASSWORD} -u ${STAT_NAME} --alias ${ALIAS} --interval 17
+ExecStart=${CLIENT_FILE} ${STAT_ARGS}
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
@@ -217,10 +156,6 @@ Verify() {
     else
         die "❌ stat_client 启动失败，请检查: journalctl -u stat_client -n 50"
     fi
-
-    # 记录版本到 ~/node.env
-    SetNodeEnv "stat_client_version" "${_latest}"
-    log info "版本 ${_latest} 已记录到 ~/node.env"
 }
 
 # ============================================================
@@ -235,23 +170,11 @@ Cleanup() {
 # 主流程
 # ============================================================
 main() {
-    LoadEnv
     ProbeArch
     GetLatestVersion
 
-    # 幂等检查: 已安装且版本相同则跳过
-    if [ -f "$CLIENT_FILE" ]; then
-        _installed_version=""
-        _installed_version=$(grep -oP '(?<=#Version=)[^\s]+' "$SERVICE_CONF" 2>/dev/null || true)
-        if [ "$_installed_version" = "$_latest" ] && systemctl is-active --quiet stat_client 2>/dev/null; then
-            log info "stat_client 已安装 (${_installed_version}) 且运行中，跳过安装"
-            return 0
-        fi
-        log info "stat_client 已存在 (版本 ${_installed_version:-未知})，将升级到 ${_latest}"
-    fi
-
     Download
-    WriteService
+    WriteService "$*"
     EnableService
     Verify
     Cleanup
