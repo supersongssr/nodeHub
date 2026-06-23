@@ -952,23 +952,39 @@ Step0_5_InstallServerStatus() {
 
     # ---- 拼装 stat_client 参数 (透传给子脚本, 子脚本不读 .env) ----
     # proxyInstall 已 . ~/.env + export 覆盖, 故 STAT_API_URL / STAT_API_PASSWORD / STAT_GID / STAT_USER / STAT_NAME 直接可用
-    # NODE_ID 已在 LoadEnv/Step0 解析
-    # USER 取值顺序: STAT_USER → STAT_NAME → 报错 (二者必居其一)
-    # GID:  STAT_GID 存在 → 追加 -g; 否则不加 (即 user 模式)
+    # NODE_ID 已在 LoadEnv/Step0 解析; API_PANEL 必存在 (LoadEnv 已校验)
+    #
+    # 模式判定 (3 选 1):
+    #   1. STAT_GID 存在               → group 模式 (-g), USER 自动取 = GID (可被 STAT_USER/STAT_NAME 覆盖)
+    #   2. STAT_USER 或 STAT_NAME 存在 → user 模式 (无 -g)
+    #   3. 两者都没有                  → 默认 group 模式: STAT_GID=${API_PANEL}, USER 自动生成
     [ -z "${STAT_API_URL:-}" ]      && { log error "~/.env 缺少 STAT_API_URL，跳过 ServerStatus 安装"; return 0; }
     [ -z "${STAT_API_PASSWORD:-}" ] && { log error "~/.env 缺少 STAT_API_PASSWORD，跳过 ServerStatus 安装"; return 0; }
 
-    # 1. 定 USER: STAT_USER 优先 → STAT_NAME 兜底 → 都没有则报错 (不再自动生成)
-    if [ -n "${STAT_USER:-}" ]; then
+    # 1. 定模式 & GID: STAT_GID 优先 → 有 USER 则纯 user 模式 → 都没有则默认 group 模式 (GID=${API_PANEL})
+    if   [ -n "${STAT_GID:-}" ]; then
+        : # group 模式 — GID 已显式指定
+    elif [ -n "${STAT_USER:-}" ] || [ -n "${STAT_NAME:-}" ]; then
+        : # user 模式 — 不带 -g
+    else
+        STAT_GID="${API_PANEL}"
+        log info "STAT_GID / STAT_USER 均未指定 → 默认 group 模式 (STAT_GID=${STAT_GID})"
+    fi
+
+    # 2. 定 USER: STAT_USER 优先 → STAT_NAME 兜底 → group 模式自动取 = GID
+    if   [ -n "${STAT_USER:-}" ]; then
         _stat_u="${STAT_USER}"
     elif [ -n "${STAT_NAME:-}" ]; then
         _stat_u="${STAT_NAME}"
+    elif [ -n "${STAT_GID:-}" ]; then
+        _stat_u="${STAT_GID}"
+        log info "group 模式自动生成 USER: ${_stat_u} (可设 STAT_USER 覆盖)"
     else
-        log error "缺少 STAT_USER / STAT_NAME，无法生成 -u，跳过 ServerStatus 安装"
+        log error "无法确定 USER (STAT_USER/STAT_NAME/STAT_GID 均为空)，跳过 ServerStatus 安装"
         return 0
     fi
 
-    # 2. 定 GID: STAT_GID 存在 → group 模式 (追加 -g 与 --alias); 否则纯 user 模式
+    # 3. 拼参: STAT_GID 存在 → group 模式 (追加 -g 与 --alias); 否则纯 user 模式
     if [ -n "${STAT_GID:-}" ]; then
         _stat_args="-a ${STAT_API_URL} -u ${_stat_u} -p ${STAT_API_PASSWORD} -g ${STAT_GID} --alias ${NODE_ID} --interval 17"
         log info "stat_client (group 模式): GID=${STAT_GID} USER=${_stat_u} ALIAS=${NODE_ID}"
