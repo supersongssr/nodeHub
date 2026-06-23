@@ -197,6 +197,7 @@ LoadEnv() {
     _ENV_ROOT_DOMAIN="${ROOT_DOMAIN:-}"
     _ENV_NODE_LEVEL="${NODE_LEVEL:-}"
     _ENV_NODE_PORT="${NODE_PORT:-}"
+    _ENV_V2_NAME="${V2_NAME:-}"
     # ServerStatus 配置也支持 export 覆盖 .env
     _ENV_STAT_GID="${STAT_GID:-}"
     _ENV_STAT_USER="${STAT_USER:-}"
@@ -269,8 +270,47 @@ LoadEnv() {
     # 命名空间隔离: ~/.env 全大写 | ~/node.env 全小写
     # ----------------------------------------------------------
 
-    # 协议模板名称 (可选)
-    v2_name="${V2_NAME:-}"
+    # ===========================================================
+    # v2_name 解析 — 四层优先级
+    #   1. 外部环境变量 V2_NAME (最高)
+    #   2. ~/.env 中的 V2_NAME
+    #   3. ~/node.env 中的 v2_name
+    #   4. ~/node.json 中的 v2_name (最低)
+    #   默认: 空 (由 panel 下发)
+    # ===========================================================
+    v2_name=""
+
+    # 来源 4: ~/node.json (最低优先级)
+    if [ -f ~/node.json ]; then
+        _v2nj=$(jq -r '.v2_name // empty' ~/node.json 2>/dev/null || true)
+        if [ -n "$_v2nj" ]; then
+            v2_name="$_v2nj"
+            log debug "v2_name 来源: ~/node.json = ${v2_name}"
+        fi
+    fi
+
+    # 来源 3: ~/node.env
+    if [ -f ~/node.env ]; then
+        _v2ne=$(grep '^v2_name=' ~/node.env 2>/dev/null | tail -1 | sed 's/^v2_name="//;s/"$//' || true)
+        if [ -n "$_v2ne" ]; then
+            v2_name="$_v2ne"
+            log debug "v2_name 来源: ~/node.env = ${v2_name}"
+        fi
+    fi
+
+    # 来源 2: ~/.env (已被 source，变量名 V2_NAME)
+    if [ -n "${V2_NAME:-}" ]; then
+        v2_name="${V2_NAME}"
+        log debug "v2_name 来源: ~/.env = ${v2_name}"
+    fi
+
+    # 来源 1: 外部环境变量 (最高优先级)
+    if [ -n "${_ENV_V2_NAME:-}" ]; then
+        v2_name="${_ENV_V2_NAME}"
+        log info "v2_name 来源: 环境变量 = ${v2_name} (最高优先级)"
+    fi
+
+    log info "v2_name 最终值: ${v2_name:-空}"
 
     # 计费模式 (可选) — API v2.0.2 参数名改为 node_rxtx
     node_rxtx="${NODE_RXTX:-${NODE_RXTX_MODE:-}}"
@@ -987,12 +1027,8 @@ Step1_Register() {
         log debug "~/status.json 不存在，首次安装"
     fi
 
-    # 环境变量覆盖 — V2_NAME / TRAFFIC_USED / TRAFFIC_USED_GB 为最高优先级
-    if [ -n "${V2_NAME:-}" ]; then
-        _cached_v2_name="${V2_NAME}"
-        v2_name="${V2_NAME}"
-        log info "V2_NAME 环境变量覆盖: v2_name=${V2_NAME}"
-    fi
+    # 环境变量覆盖 — TRAFFIC_USED / TRAFFIC_USED_GB 为最高优先级
+    # 注: v2_name 的优先级 (环境变量 > ~/.env > ~/node.env > ~/node.json) 已在 LoadEnv 中解析完成
     if [ -n "${TRAFFIC_USED:-}" ]; then
         _cached_traffic_used="${TRAFFIC_USED}"
         log info "TRAFFIC_USED 环境变量覆盖: ${TRAFFIC_USED} bytes"
