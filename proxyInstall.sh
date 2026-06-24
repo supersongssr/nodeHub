@@ -977,7 +977,7 @@ Step0_5_InstallServerStatus() {
     elif [ -n "${STAT_NAME:-}" ]; then
         _stat_u="${STAT_NAME}"
     elif [ -n "${STAT_GID:-}" ]; then
-        _stat_u="${STAT_GID}"
+        _stat_u="${API_PANEL}_${NODE_ID}"
         log info "group 模式自动生成 USER: ${_stat_u} (可设 STAT_USER 覆盖)"
     else
         log error "无法确定 USER (STAT_USER/STAT_NAME/STAT_GID 均为空)，跳过 ServerStatus 安装"
