@@ -407,6 +407,16 @@ LoadEnv() {
 
     log info "变量加载完成 — v2_name=${v2_name:-空} node_rxtx=${node_rxtx:-空} NET_CARD=${NET_CARD}"
 
+    # 全新安装判定: ~/node.json 不存在 = 全新 (node.json 在 Step1_Register 才创建)
+    # 后续步骤 (如 probe 部署) 据此决定是否执行, 避免重复安装时重复注入
+    if [ -f ~/node.json ]; then
+        IS_NEW_VPS_INSTALL=false
+        log info "检测到 ~/node.json → 重复安装 (IS_NEW_VPS_INSTALL=false)"
+    else
+        IS_NEW_VPS_INSTALL=true
+        log info "~/node.json 不存在 → 全新安装 (IS_NEW_VPS_INSTALL=true)"
+    fi
+
 }
 
 # ============================================================
@@ -1648,12 +1658,14 @@ Step4_DeployCrontab() {
     chmod +x ~/nodeMonitor.sh
     log info "nodeMonitor.sh 已下载到 ~/"
 
+    # probe 组件由 Step4_6_LaunchProbeInstall 独立部署 (仅全新安装), 不在此内联
+
     # 错峰调度: 使用安装时的分钟数
     install_min=$(date +%M)
 
     # 写入 /etc/crontab: 清除旧条目后追加新条目
-    # 清除旧的 nodeAgent/nodeMonitor/nodeStatus 条目
-    sed -i '/nodeAgent\.sh/d; /nodeMonitor\.sh/d; /nodeStatus\.sh/d' /etc/crontab
+    # 清除旧的 nodeAgent/nodeMonitor/nodeStatus/probeReporter 条目 (probeReporter 已废弃, 清理残留 cron)
+    sed -i '/nodeAgent\.sh/d; /nodeMonitor\.sh/d; /nodeStatus\.sh/d; /probeReporter\.sh/d' /etc/crontab
 
     # /etc/crontab 需要指定用户字段
     _cron_user="$(whoami)"
@@ -1661,6 +1673,8 @@ Step4_DeployCrontab() {
         echo "${install_min} * * * * ${_cron_user} /bin/sh ~/nodeAgent.sh >> ~/nodeLogs 2>&1"
         echo "* * * * * ${_cron_user} /bin/sh ~/nodeMonitor.sh >> /tmp/nodeMonitor.log 2>&1"
     } >> /etc/crontab
+
+    log info "/etc/crontab 已配置: nodeAgent 每小时第 ${install_min} 分钟 | nodeMonitor 每分钟"
 
     # ------------------------------------------------------------
     # 启用并重启 cron 服务, 使新条目立即生效
@@ -1701,6 +1715,36 @@ Step4_5_LaunchUnlockCheck() {
 }
 
 # ============================================================
+# Step 4.6: 部署 Probe (被墙原因采集系统) — 仅全新安装
+# 镜像 unlockCheck 的 nohup 后台模式, 不阻塞主流程
+# probeInstall.sh 是独立安装器, 负责全部 probe 组件部署:
+#   probeTask.sh + probeHelper.py + MONITOR_* 配置 + probe_collect_phase + logrotate
+# 双重门控: IS_NEW_VPS_INSTALL=true (有 node.json=重复安装则跳过) + MONITOR_* 配齐
+# ==========================================
+Step4_6_LaunchProbeInstall() {
+    # 仅全新安装才部署 (重复安装不重复注入)
+    [ "${IS_NEW_VPS_INSTALL:-false}" = "true" ] || {
+        log info "Step 4.6 跳过: 重复安装 (IS_NEW_VPS_INSTALL!=true), probe 保持原状"
+        return 0
+    }
+    # 部署机必须配齐 MONITOR_* (不硬编码, 缺失则跳过)
+    { [ -z "${MONITOR_INGEST_URL:-}" ] || [ -z "${MONITOR_INGEST_TOKEN:-}" ]; } && {
+        log warn "Step 4.6 跳过: 未配置 MONITOR_INGEST_URL/MONITOR_INGEST_TOKEN (部署机 .env 提供)"
+        return 0
+    }
+
+    log info "Step 4.6: 后台部署 probe (全新安装)"
+    wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/scripts/probe/probeInstall.sh" \
+        || { log error "probeInstall.sh 下载失败"; return 1; }
+    chmod +x /tmp/probeInstall.sh
+
+    # nohup 后台: 继承父环境 (MONITOR_*/NODEHUB_URL/IS_NEW_VPS_INSTALL/ENABLE_JA3)
+    nohup sh /tmp/probeInstall.sh > /tmp/probeInstall.out 2>&1 &
+    _pid=$!
+    log info "probeInstall.sh 已后台启动 (PID=${_pid}), 输出: /tmp/probeInstall.out"
+}
+
+# ============================================================
 # 主流程
 # ============================================================
 Main() {
@@ -1719,6 +1763,7 @@ Main() {
     Step2_ResolveDns
     Step4_DeployCrontab
     Step4_5_LaunchUnlockCheck
+    Step4_6_LaunchProbeInstall
 
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"

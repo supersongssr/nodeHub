@@ -17,3 +17,7 @@ xray/
 
 
 .tmp/
+probe.env
+
+__pycache__
+node.env
