@@ -1242,6 +1242,14 @@ Step3_InstallXray() {
     cp -f ~/config.json /usr/local/etc/xray/config.json
     log info "Xray 配置已同步到 /usr/local/etc/xray/config.json"
 
+    # 创建 Xray 日志目录 — 面板下发的 config.json 通常配置 access log 落到
+    # /var/log/xray/access.log; 若目录不存在, xray 启动时会因无法创建日志文件
+    # 而失败 (exit 23, "no such file or directory")。提前 mkdir 避免该问题。
+    mkdir -p /var/log/xray
+    chmod 755 /var/log/xray
+    chown -R root:root /var/log/xray 2>/dev/null || true
+    log info "Xray 日志目录就绪: /var/log/xray"
+
     # 下载 GeoIP/GeoSite 数据文件
     mkdir -p /usr/local/share/xray
     log info "下载 geosite.dat..."
