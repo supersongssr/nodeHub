@@ -1658,7 +1658,26 @@ Step4_DeployCrontab() {
     wget -N --timeout=60 --tries=3 -P ~ "${NODEHUB_URL}/nodeAgent.sh" \
         || die "nodeAgent.sh 下载失败: ${NODEHUB_URL}/nodeAgent.sh"
     chmod +x ~/nodeAgent.sh
-    log info "nodeAgent.sh 已下载到 ~/"
+
+    # 校验 nodeAgent.sh 下载完整性 (与前端通信的关键文件)
+    # why: nodeAgent.sh 是与前端通信的关键文件, 缺失/为空会导致节点无法使用。
+    #   某些网络异常下 wget 仍可能返回成功但写入空文件或 HTML 错误页,
+    #   仅靠 wget 退出码无法识别, 故必须显式校验: 文件非空 且 以 #! 开头。
+    #   另: wget -N 在本地已存在脏文件且服务器时间戳未更新时会跳过下载,
+    #   导致历史脏文件永久残留, 故校验失败时强制删除后重新下载修复。
+    _agent_file=~/nodeAgent.sh
+    if [ ! -s "$_agent_file" ] || [ "$(head -c 2 "$_agent_file" 2>/dev/null)" != "#!" ]; then
+        log warn "nodeAgent.sh 校验失败 (空文件或非 #! 开头), 强制删除后重新下载"
+        rm -f "$_agent_file"
+        wget --timeout=60 --tries=3 -O "$_agent_file" "${NODEHUB_URL}/nodeAgent.sh" \
+            || die "nodeAgent.sh 强制重新下载失败: ${NODEHUB_URL}/nodeAgent.sh"
+        chmod +x "$_agent_file"
+        if [ ! -s "$_agent_file" ] || [ "$(head -c 2 "$_agent_file" 2>/dev/null)" != "#!" ]; then
+            log error "nodeAgent.sh 文件内容前 200 字符: $(head -c 200 "$_agent_file" 2>/dev/null)"
+            die "nodeAgent.sh 校验失败: 文件为空或未以 #! 开头 (${_agent_file}) — 下载源可能损坏: ${NODEHUB_URL}/nodeAgent.sh"
+        fi
+    fi
+    log info "nodeAgent.sh 已下载并校验通过 (以 #! 开头, $(wc -c < "$_agent_file") bytes)"
 
     # 下载 nodeMonitor.sh (每分钟执行)
     wget -N --timeout=60 --tries=3 -P ~ "${NODEHUB_URL}/nodeMonitor.sh" \
