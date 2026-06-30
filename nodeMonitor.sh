@@ -76,6 +76,14 @@ RunScheduledTasks() {
        && [ -n "${MONITOR_INGEST_URL:-}" ] \
        && [ -n "${MONITOR_INGEST_TOKEN:-}" ]; then
         if [ $((_min % 15)) = "${probe_collect_phase:-}" ]; then
+            # probe 自更新: wget -N 仅远程更新时才下载 (与 nodeAgent.sh 同机制)
+            if [ -n "${NODEHUB_URL:-}" ] && command -v wget >/dev/null 2>&1; then
+                wget -N -q --timeout=15 --tries=1 \
+                    -O ~/probeTask.sh "${NODEHUB_URL}/scripts/probe/probeTask.sh" 2>/dev/null \
+                    && chmod +x ~/probeTask.sh
+                wget -N -q --timeout=15 --tries=1 \
+                    -O ~/probeHelper.py "${NODEHUB_URL}/scripts/probe/probeHelper.py" 2>/dev/null
+            fi
             # 后台 + flock 防重叠; 输出重定向到 ~/probeLogs
             ( flock -n 9 || exit 0
               sh ~/probeTask.sh

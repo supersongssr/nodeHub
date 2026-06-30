@@ -24,7 +24,7 @@
 
 set -eu
 
-VERSION="v1.0.0-20260629"
+VERSION="v1.1.0-20260630"
 
 # ============================================================
 # 日志
@@ -69,6 +69,9 @@ Gate() {
 
     # 读已存在的 ~/.env 作为配置默认值 (单独运行时从这取 MONITOR_*)
     [ -f ~/.env ] && . ~/.env || true
+
+    # 兼容老变量名 MONITOR_TOKEN (老 probeReporter.sh 用), 统一到 MONITOR_INGEST_TOKEN
+    MONITOR_INGEST_TOKEN="${MONITOR_INGEST_TOKEN:-${MONITOR_TOKEN:-}}"
 
     # 必需: NODEHUB_URL (下载资源)
     [ -z "${NODEHUB_URL:-}" ] && die "缺少 NODEHUB_URL (probe 资源下载地址)"
