@@ -198,6 +198,7 @@ LoadEnv() {
     _ENV_NODE_LEVEL="${NODE_LEVEL:-}"
     _ENV_NODE_PORT="${NODE_PORT:-}"
     _ENV_V2_NAME="${V2_NAME:-}"
+    _ENV_IS_NEW_VPS_INSTALL="${IS_NEW_VPS_INSTALL:-}"
     # ServerStatus 配置也支持 export 覆盖 .env
     _ENV_STAT_GID="${STAT_GID:-}"
     _ENV_STAT_USER="${STAT_USER:-}"
@@ -416,6 +417,25 @@ LoadEnv() {
         IS_NEW_VPS_INSTALL=true
         log info "~/node.json 不存在 → 全新安装 (IS_NEW_VPS_INSTALL=true)"
     fi
+
+    # 环境变量 IS_NEW_VPS_INSTALL 为最高优先级，覆盖自动探测结果
+    # 支持值 (大小写不敏感): true/1/yes → true | false/0/no → false | 其他 → 忽略并告警
+    if [ -n "${_ENV_IS_NEW_VPS_INSTALL:-}" ]; then
+        case "$(echo "$_ENV_IS_NEW_VPS_INSTALL" | tr 'A-Z' 'a-z')" in
+            true|1|yes)
+                IS_NEW_VPS_INSTALL=true
+                log info "环境变量 IS_NEW_VPS_INSTALL=true (最高优先级)"
+                ;;
+            false|0|no)
+                IS_NEW_VPS_INSTALL=false
+                log info "环境变量 IS_NEW_VPS_INSTALL=false (最高优先级)"
+                ;;
+            *)
+                log warn "环境变量 IS_NEW_VPS_INSTALL 值无效: \"${_ENV_IS_NEW_VPS_INSTALL}\" (仅支持 true/false/yes/no/1/0)，忽略并使用自动探测值: ${IS_NEW_VPS_INSTALL}"
+                ;;
+        esac
+    fi
+    log info "IS_NEW_VPS_INSTALL 最终值: ${IS_NEW_VPS_INSTALL}"
 
 }
 
