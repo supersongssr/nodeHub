@@ -215,11 +215,11 @@ SyncXray() {
     Log "Xray: ${current:-无} → ${latest}, 下载中..."
 
     wget -N -q -T 120 -P "$XRAY_DIR" \
-        "https://github.com/supersongssr/xray-plugin-srp/releases/download/v0.0.9/xray-plugin-srp-v0.0.9" \
+        "https://github.com/supersongssr/xray-plugin-srp/releases/download/v0.0.9/xray-plugin-srp-v26.6.27" \
         || { Log "Xray: srp 下载失败"; return 1; }
 
     wget -N -q -T 120 -P "$XRAY_DIR" \
-        "https://github.com/supersongssr/xray-plugin-ssp/releases/download/v0.0.9/xray-plugin-ssp-v0.0.9" \
+        "https://github.com/supersongssr/xray-plugin-ssp/releases/download/v0.0.9/xray-plugin-ssp-v26.6.27" \
         || { Log "Xray: ssp 下载失败"; return 1; }
 
     echo "$latest" > "${XRAY_DIR}/.version"
