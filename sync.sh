@@ -188,31 +188,13 @@ SyncGeoData() {
 
 
 # ============================================================
-# Step 3: Xray 更新检测
+# Step 3: Xray 插件下载
+# 说明: 插件更新与 Xray core 版本无关, 直接下载最新插件即可
 # ============================================================
 SyncXray() {
-    Log "=== 检查 Xray ==="
+    Log "=== 下载 Xray 插件 ==="
 
     XRAY_DIR="${NODEHUB_DIR}/xray"
-
-    latest=$(wget -qO- -t1 -T 15 \
-        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" \
-        | jq -r '.tag_name' 2>/dev/null || echo "")
-
-    if [ -z "$latest" ]; then
-        Log "Xray: 无法获取版本, 跳过"
-        return 0
-    fi
-
-    current=""
-    [ -f "${XRAY_DIR}/.version" ] && current=$(cat "${XRAY_DIR}/.version")
-
-    if [ "$latest" = "$current" ]; then
-        Log "Xray: 已是最新 ${latest}"
-        return 0
-    fi
-
-    Log "Xray: ${current:-无} → ${latest}, 下载中..."
 
     wget -N -q -T 120 -P "$XRAY_DIR" \
         "https://github.com/supersongssr/xray-plugin-srp/releases/download/v0.0.9/xray-plugin-srp-v26.6.27" \
@@ -222,8 +204,7 @@ SyncXray() {
         "https://github.com/supersongssr/xray-plugin-ssp/releases/download/v0.0.9/xray-plugin-ssp-v26.6.27" \
         || { Log "Xray: ssp 下载失败"; return 1; }
 
-    echo "$latest" > "${XRAY_DIR}/.version"
-    Log "Xray: 已更新到 ${latest}"
+    Log "Xray 插件下载完成"
 }
 
 # ============================================================
