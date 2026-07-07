@@ -1055,7 +1055,7 @@ Step1_Register() {
 
     # 读取本地缓存 (node.json + status.json) — panel 以节点上报为第一优先级
     _cached_node_id="" _cached_node_ids="" _cached_root_domain="" _cached_v2_name=""
-    _cached_traffic_used=""
+    _cached_traffic_used="" _cached_traffic_max_day=""
     if [ -f ~/node.json ]; then
         _cached_node_id=$(jq -r '.node_id // empty' ~/node.json 2>/dev/null || true)
         _cached_node_ids=$(jq -r '.node_ids // empty' ~/node.json 2>/dev/null || true)
@@ -1068,7 +1068,8 @@ Step1_Register() {
     fi
     if [ -f ~/status.json ]; then
         _cached_traffic_used=$(jq -r '.traffic_used // empty' ~/status.json 2>/dev/null || true)
-        log info "status.json 缓存: traffic_used=${_cached_traffic_used:-无}"
+        _cached_traffic_max_day=$(jq -r '.traffic_max_day_value // empty' ~/status.json 2>/dev/null || true)
+        log info "status.json 缓存: traffic_used=${_cached_traffic_used:-无} traffic_max_day_value=${_cached_traffic_max_day:-无}"
     else
         log debug "~/status.json 不存在，首次安装"
     fi
@@ -1119,6 +1120,8 @@ Step1_Register() {
     [ -n "${_cached_node_ids:-}" ]    && _reg_data="${_reg_data}&node_ids=${_cached_node_ids}"
     [ -n "${_cached_root_domain:-}" ] && _reg_data="${_reg_data}&root_domain=${_cached_root_domain}"
     [ -n "${_cached_traffic_used:-}" ] && _reg_data="${_reg_data}&traffic_used=${_cached_traffic_used}"
+    # 历史日峰值 (traffic_max_day_value) — 供 panel 在重注册时继承, 避免死节点回收时前任旧峰值残留
+    [ -n "${_cached_traffic_max_day:-}" ] && _reg_data="${_reg_data}&traffic_max_day_value=${_cached_traffic_max_day}"
 
     # node_level 三级优先级: 环境变量 > ~/.env > ~/node.json
     # 若当前 node_level 仍为空 (环境变量和 .env 均未设置)，则使用 node.json 缓存值
