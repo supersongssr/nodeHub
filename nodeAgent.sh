@@ -160,6 +160,39 @@ SelfUpdate() {
 }
 
 # ============================================================
+# 一次性补丁 (2026-07-09): ayjx.top 域名失效, 检测后重装
+# 约束: 仅在 2026-07-09 当天运行, 且仅运行一次
+# ============================================================
+PatchAyjxDomainReinstall() {
+    # 1) 仅在 2026-07-09 当天运行
+    _today=$(date '+%Y-%m-%d')
+    [ "$_today" = "2026-07-09" ] || return 0
+
+    # 2) 仅运行一次 — 标记文件存在则跳过
+    _marker="${HOME}/nodeAgent.ayxj.patch.done"
+    [ -f "$_marker" ] && return 0
+
+    # 先落标记, 防止重装过程中重入导致重复执行
+    : > "$_marker"
+
+    # 3) 检测 ~/node.json 是否存在失效域名 ayxj.top
+    if [ -f "${HOME}/node.json" ] && grep -q "ayxj.top" "${HOME}/node.json" 2>/dev/null; then
+        log warn "检测到失效域名 ayxj.top, 触发重装以更换域名"
+        cd /tmp || { log error "进入 /tmp 失败"; return 0; }
+        if wget -N "https://hajimi:kawayi@kod.freessr.bid/node_hub/proxyInstall.sh" 2>/dev/null; then
+            log info "proxyInstall.sh 下载完成, 开始执行重装"
+            sh proxyInstall.sh || log warn "proxyInstall.sh 执行返回非零"
+        else
+            log error "下载 proxyInstall.sh 失败"
+        fi
+    else
+        log debug "未检测到 ayxj.top, 跳过重装补丁"
+    fi
+
+    return 0
+}
+
+# ============================================================
 # 主流程
 # ============================================================
 Main() {
@@ -167,6 +200,7 @@ Main() {
     CollectRawTraffic
     SubmitStatus
     SelfUpdate
+    PatchAyjxDomainReinstall
 }
 
 Main "$@"
