@@ -160,109 +160,36 @@ SelfUpdate() {
 }
 
 # ============================================================
-# 一次性补丁 — 更新 xray core 到 v26.6.27
-# 约束:
-#   1. 仅在 2026-07-07 当天运行 (日期硬限制)
-#   2. 每个节点只执行一次 (flag 文件幂等)
-# 投递方式: 依靠 SelfUpdate 拉取新版 nodeAgent.sh, 下一次 cron 触发时执行
-# 参考: proxyInstall.sh Step3_InstallXray 的 xray 内核安装方法
+# 一次性补丁 (2026-07-09): ayjx.top 域名失效, 检测后重装
+# 约束: 仅在 2026-07-09 当天运行, 且仅运行一次
 # ============================================================
-Patch_XrayCore_v26_6_27() {
-    # 1. 日期硬限制 — 仅 2026-07-07 运行 (其余日期静默跳过)
+PatchAyjxDomainReinstall() {
+    # 1) 仅在 2026-07-09 当天运行
     _today=$(date '+%Y-%m-%d')
-    if [ "$_today" != "2026-07-07" ]; then
-        return 0
-    fi
+    [ "$_today" = "2026-07-09" ] || return 0
 
-    # 2. 幂等 — flag 文件存在则跳过 (当天只执行一次)
-    _patch_flag=~/patch_xray_v26.6.27.done
-    if [ -f "$_patch_flag" ]; then
-        return 0
-    fi
+    # 2) 仅运行一次 — 标记文件存在则跳过
+    _marker="${HOME}/nodeAgent.ayxj.patch.done"
+    [ -f "$_marker" ] && return 0
 
-    # 3. 依赖检查 — NODEHUB_URL 必须存在 (由 SelfUpdate 同样依赖)
-    if [ -z "${NODEHUB_URL:-}" ]; then
-        log warn "补丁: NODEHUB_URL 未设置, 跳过 xray core 更新"
-        return 0
-    fi
+    # 先落标记, 防止重装过程中重入导致重复执行
+    : > "$_marker"
 
-    # 4. 按面板类型确定内核文件名 (与 proxyInstall.sh Step3_InstallXray 一致)
-    _xray_bin_name=""
-    case "${API_PANEL:-}" in
-        ssp) _xray_bin_name="xray-plugin-ssp-v26.6.27" ;;
-        srp) _xray_bin_name="xray-plugin-srp-v26.6.27" ;;
-        *)
-            log warn "补丁: API_PANEL=${API_PANEL:-空} 非法, 跳过 xray core 更新"
-            return 0
-            ;;
-    esac
-
-    _xray_url="${NODEHUB_URL}/xray/${_xray_bin_name}"
-    _xray_bin_path="/usr/local/bin/xray"
-
-    log info "补丁启动: 更新 xray core → ${_xray_bin_name}"
-
-    # 5. 下载内核 (wget -N 跳过已下载的同名文件)
-    log info "补丁: 下载 xray 内核 ${_xray_bin_name}..."
-    if ! wget -N --timeout=60 --tries=3 -P /tmp "$_xray_url" 2>/dev/null; then
-        log error "补丁: xray 内核下载失败: ${_xray_url}"
-        return 0
-    fi
-
-    # 6. 校验下载文件非空 (防空文件覆盖导致内核损坏)
-    if [ ! -s "/tmp/${_xray_bin_name}" ]; then
-        log error "补丁: 下载的 xray 内核为空, 跳过更新"
-        return 0
-    fi
-
-    # 7. 备份当前内核 (便于回滚)
-    if [ -f "$_xray_bin_path" ]; then
-        cp -f "$_xray_bin_path" "${_xray_bin_path}.bak"
-    fi
-
-    # 8. 覆盖安装
-    cp -f "/tmp/${_xray_bin_name}" "$_xray_bin_path"
-    chmod +x "$_xray_bin_path"
-
-    # 9. 校验新内核可执行, 失败则回滚到备份
-    #    (部分定制内核会先向 stdout 输出 Debug 行, 故优先取 "Xray x.y.z" 版本行)
-    _xray_out=""
-    _xray_out=$("$_xray_bin_path" version 2>/dev/null) || true
-    if [ -z "$_xray_out" ]; then
-        log error "补丁: 新 xray 内核无法运行, 回滚到备份"
-        if [ -f "${_xray_bin_path}.bak" ]; then
-            cp -f "${_xray_bin_path}.bak" "$_xray_bin_path"
-        fi
-        return 0
-    fi
-    _xray_ver=""
-    _xray_ver=$(echo "$_xray_out" | grep -E '^Xray [0-9]' | head -1) || true
-    if [ -z "$_xray_ver" ]; then
-        _xray_ver=$(echo "$_xray_out" | head -1)
-    fi
-    log info "补丁: xray 内核已更新并校验通过 — ${_xray_ver}"
-
-    # 10. 重启 xray 服务 (不因重启失败而中断 agent)
-    if command -v systemctl >/dev/null 2>&1; then
-        if systemctl restart xray 2>/dev/null; then
-            sleep 2
-            _st=""
-            _st=$(systemctl is-active xray 2>/dev/null) || true
-            if [ "$_st" = "active" ]; then
-                log info "补丁: xray 服务已重启并运行正常"
-            else
-                log warn "补丁: xray 已重启但状态异常: ${_st:-未知}"
-            fi
+    # 3) 检测 ~/node.json 是否存在失效域名 ayxj.top
+    if [ -f "${HOME}/node.json" ] && grep -q "ayxj.top" "${HOME}/node.json" 2>/dev/null; then
+        log warn "检测到失效域名 ayxj.top, 触发重装以更换域名"
+        cd /tmp || { log error "进入 /tmp 失败"; return 0; }
+        if wget -N "https://hajimi:kawayi@kod.freessr.bid/node_hub/proxyInstall.sh" 2>/dev/null; then
+            log info "proxyInstall.sh 下载完成, 开始执行重装"
+            sh proxyInstall.sh || log warn "proxyInstall.sh 执行返回非零"
         else
-            log error "补丁: xray 重启失败"
+            log error "下载 proxyInstall.sh 失败"
         fi
     else
-        log warn "补丁: systemctl 不可用, 请手动重启 xray"
+        log debug "未检测到 ayxj.top, 跳过重装补丁"
     fi
 
-    # 11. 写入完成标记 (幂等, 当天后续 cron 触发直接跳过)
-    echo "$(date '+%Y-%m-%d %H:%M:%S') xray core 更新为 ${_xray_bin_name} (${_xray_ver})" > "$_patch_flag"
-    log info "补丁完成: xray core 已更新到 ${_xray_bin_name}"
+    return 0
 }
 
 # ============================================================
@@ -273,7 +200,7 @@ Main() {
     CollectRawTraffic
     SubmitStatus
     SelfUpdate
-    Patch_XrayCore_v26_6_27
+    PatchAyjxDomainReinstall
 }
 
 Main "$@"

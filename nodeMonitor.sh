@@ -92,6 +92,32 @@ RunScheduledTasks() {
     fi
 
     # ---- ※ 未来新增定时任务在此追加 if 分支 ----
+
+    # ---- probeHunt: 每 15 分钟, 相位错开 (probe_collect_phase + 7) 避免与 probeTask
+    #      的 tcpdump 重叠. 仅 xray 前置节点有效 (probeHunt 内部跳过 xhttp).
+    #      门控: MONITOR_* 配齐; 首次 bootstrap 会从 NODEHUB_URL 拉 probeHunt.sh.
+    if [ -n "${MONITOR_INGEST_URL:-}" ] \
+       && [ -n "${MONITOR_INGEST_TOKEN:-}" ]; then
+        _hunt_phase=$(( (${probe_collect_phase:-0} + 7) % 15 ))
+        if [ $((_min % 15)) = "$_hunt_phase" ]; then
+            # hunt 自更新 (wget -N 幂等; 首次 bootstrap 从 CDN 拉取)
+            if [ -n "${NODEHUB_URL:-}" ] && command -v wget >/dev/null 2>&1; then
+                wget -N -q --timeout=15 --tries=1 \
+                    -O ~/probeHunt.sh "${NODEHUB_URL}/scripts/probe/probeHunt.sh" 2>/dev/null \
+                    && chmod +x ~/probeHunt.sh
+                wget -N -q --timeout=15 --tries=1 \
+                    -O ~/huntHelper.py "${NODEHUB_URL}/scripts/probe/huntHelper.py" 2>/dev/null
+                wget -N -q --timeout=15 --tries=1 \
+                    -O ~/huntWatchlist.conf "${NODEHUB_URL}/scripts/probe/huntWatchlist.conf" 2>/dev/null
+            fi
+            # 拉到才跑 (首次未拉到则跳过, 下个周期重试)
+            if [ -f ~/probeHunt.sh ] && [ -f ~/huntHelper.py ]; then
+                ( flock -n 9 || exit 0
+                  sh ~/probeHunt.sh
+                ) 9>/tmp/probeHunt.lock </dev/null >>~/huntLogs 2>&1 &
+            fi
+        fi
+    fi
 }
 
 # ============================================================

@@ -89,7 +89,7 @@ Gate() {
 # ============================================================
 DownloadFiles() {
     # 源文件在 NODEHUB_URL/scripts/probe/ 下 (与 probeInstall.sh 同目录)
-    for _f in probeTask.sh probeHelper.py; do
+    for _f in probeTask.sh probeHelper.py probeHunt.sh huntHelper.py huntWatchlist.conf; do
         if wget -q --timeout=60 --tries=2 -O "/tmp/${_f}.new" "${NODEHUB_URL}/scripts/probe/${_f}" 2>/dev/null \
            && [ -s "/tmp/${_f}.new" ]; then
             mv -f "/tmp/${_f}.new" ~/"$_f"
