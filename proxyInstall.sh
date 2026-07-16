@@ -1794,6 +1794,50 @@ Step4_6_LaunchProbeInstall() {
     log info "probeInstall.sh 已后台启动 (PID=${_pid}), 输出: /tmp/probeInstall.out"
 }
 
+# ------------------------------------------------------------
+# 辅助: 读取 nginx 实际链接的 OpenSSL 主.次版本 (来自 `nginx -V`, 而非系统 openssl 命令).
+# 为何用 nginx -V: nginx 可能静态链接与系统库不同的 OpenSSL (nginx.org 官方包即如此),
+#   系统库版本 != nginx 实际链接版本; 只有 nginx -V 的 "built with OpenSSL ..." 才权威.
+# 输出形如 "3.5"; nginx 未安装 / 非 OpenSSL 构建 / 解析失败 -> 输出空串.
+# ------------------------------------------------------------
+_NginxOpensslMajorMinor() {
+    command -v nginx >/dev/null 2>&1 || return 0
+    nginx -V 2>&1 | grep -oP 'built with OpenSSL \K[0-9]+\.[0-9]+\.[0-9]+' \
+        | awk -F. '{print $1"."$2}' | head -1
+}
+
+# ============================================================
+# Step 5: 后置校验 — xhttp-pq 要求 nginx 链接 OpenSSL >= 3.5
+# X25519MLKEM768 后量子曲线支持始于 OpenSSL 3.5.0; nginx 链接更低版本时, ssl_ecdh_curve
+# X25519MLKEM768 会让 nginx -t 报 unknown curve 拒绝加载, 节点直接下线.
+# 全部安装步骤完成后, 在结尾强制拦截并报错 (以 nginx -V 的 OpenSSL 版本为准, 非 Debian 版本).
+# (xhttp-pq 模拟 vision-curvePreferences, 服务端曲线锁死在 nginx, 见面板 V2Presets.)
+# ============================================================
+Step5_PostInstallChecks() {
+    _check_v2="${v2_name:-}"
+    [ -n "$_check_v2" ] || _check_v2=$(jq -r '.v2_name // empty' ~/node.json 2>/dev/null || true)
+
+    [ "$_check_v2" = "xhttp-pq" ] || return 0
+
+    _ossl=$(_NginxOpensslMajorMinor 2>/dev/null || echo "")
+    log info "后置校验: v2_name=xhttp-pq 需要 nginx 链接 OpenSSL >= 3.5 (X25519MLKEM768 始于 3.5.0), 当前=${_ossl:-未知}"
+
+    _ok=no
+    if [ -n "$_ossl" ]; then
+        _ok=$(echo "$_ossl" | awk -F. '{if ($1>3 || ($1==3 && $2>=5)) print "yes"; else print "no"}')
+    fi
+
+    if [ "$_ok" != "yes" ]; then
+        # 明确的校验失败: 清除 EXIT trap, 避免误报 "命令失败".
+        trap - EXIT
+        log error "xhttp-pq 需要 nginx 链接的 OpenSSL >= 3.5 (X25519MLKEM768 后量子曲线支持始于 3.5.0)"
+        log error "当前 nginx-OpenSSL 版本=${_ossl:-未知}, 不满足; nginx -t 会因 unknown curve 拒绝加载, 节点会下线"
+        log error "请为节点换用 OpenSSL >= 3.5 的 nginx 构建 (如 Debian 13 自带 nginx 库) 后重跑本安装脚本"
+        log error "(若 nginx 使用 BoringSSL 等已支持该曲线的库, 请以 nginx -t 实测为准自行确认)"
+        exit 1
+    fi
+}
+
 # ============================================================
 # 主流程
 # ============================================================
@@ -1814,6 +1858,7 @@ Main() {
     Step4_DeployCrontab
     Step4_5_LaunchUnlockCheck
     Step4_6_LaunchProbeInstall
+    Step5_PostInstallChecks
 
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"
