@@ -484,7 +484,63 @@ ProbeHardware() {
     log info "硬件采集完成 — node_cpu=${node_cpu} node_memory=${node_memory} node_disk=${node_disk} node_ip=${node_ip}"
 }
 
+# ============================================================
+# 系统版本探测 — 输出 node_os 变量, 格式: "发行版名 主版本号"
+# 例: debian 12 / debian 13 / centos 7 / centos 8 / ubuntu 22.04 /
+#     rocky 9 / almalinux 9 / fedora 39 / amzn 2
+# 探测链 (依次兜底):
+#   1. /etc/os-release  (systemd 标准, 现代发行版均具备)
+#   2. /etc/*-release   (传统发行版描述文件)
+#   3. uname            (最终兜底)
+# ============================================================
+ProbeOS() {
+    log info "开始系统版本探测"
 
+    node_os=""
+    _os_id=""
+    _os_ver=""
+
+    # 1. 优先解析 /etc/os-release — 逐行提取 ID / VERSION_ID, 避免污染当前 shell
+    if [ -f /etc/os-release ]; then
+        _os_id=$(grep -E '^ID=' /etc/os-release 2>/dev/null | head -1 \
+            | sed -E "s/^ID=[\"']?//; s/[\"']$//" | tr 'A-Z' 'a-z')
+        _os_ver=$(grep -E '^VERSION_ID=' /etc/os-release 2>/dev/null | head -1 \
+            | sed -E "s/^VERSION_ID=[\"']?//; s/[\"']$//")
+        if [ -n "$_os_id" ] && [ -n "$_os_ver" ]; then
+            node_os="${_os_id} ${_os_ver}"
+            log info "系统版本探测完成 (os-release): ${node_os}"
+            return 0
+        fi
+    fi
+
+    # 2. 兜底: 解析传统 /etc/*-release 描述文件
+    for _rel_file in /etc/centos-release /etc/redhat-release /etc/system-release; do
+        [ -f "$_rel_file" ] || continue
+        _rel_line=$(head -1 "$_rel_file" 2>/dev/null || true)
+        [ -n "$_rel_line" ] || continue
+        _os_id=$(echo "$_rel_line" | awk '{print tolower($1)}')
+        _os_ver=$(echo "$_rel_line" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)
+        if [ -n "$_os_id" ] && [ -n "$_os_ver" ]; then
+            node_os="${_os_id} ${_os_ver}"
+            log info "系统版本探测完成 (${_rel_file}): ${node_os}"
+            return 0
+        fi
+    done
+
+    # /etc/debian_version — 仅含版本号, 发行版名固定为 debian
+    if [ -f /etc/debian_version ]; then
+        _os_ver=$(grep -oE '[0-9]+(\.[0-9]+)?' /etc/debian_version 2>/dev/null | head -1 || true)
+        if [ -n "$_os_ver" ]; then
+            node_os="debian ${_os_ver}"
+            log info "系统版本探测完成 (debian_version): ${node_os}"
+            return 0
+        fi
+    fi
+
+    # 3. 最终兜底: 内核信息
+    node_os="unknown $(uname -s 2>/dev/null || echo os) $(uname -r 2>/dev/null || echo unknown)"
+    log warn "系统版本探测不完整, 使用内核信息: ${node_os}"
+}
 
 # 地理位置探测 — 优先 ip-api.com，兜底 ipinfo.io
 ProbeGeo() {
@@ -1040,8 +1096,9 @@ Step0_5_InstallServerStatus() {
 Step1_Register() {
     log info "Step 1: 注册节点信息与裂变"
 
-    # 采集硬件 + 地理 + 网络信息
+    # 采集硬件 + 系统 + 地理 + 网络信息
     ProbeHardware
+    ProbeOS
     ProbeGeo
 
     # 采集网卡原始 rx/tx 字节数 (参考 nodeAgent.sh CollectRawTraffic)
@@ -1099,6 +1156,7 @@ Step1_Register() {
     [ -n "${node_cpu:-}" ]             && _reg_data="${_reg_data}&node_cpu=${node_cpu}"
     [ -n "${node_memory:-}" ]          && _reg_data="${_reg_data}&node_memory=${node_memory}"
     [ -n "${node_disk:-}" ]            && _reg_data="${_reg_data}&node_disk=${node_disk}"
+    [ -n "${node_os:-}" ]              && _reg_data="${_reg_data}&node_os=${node_os}"
     [ -n "${node_group:-}" ]           && _reg_data="${_reg_data}&node_group=${node_group}"
     [ -n "${node_level:-}" ]           && _reg_data="${_reg_data}&node_level=${node_level}"
     [ -n "${node_traffic_limit:-}" ]   && _reg_data="${_reg_data}&node_traffic_limit=${node_traffic_limit}"
@@ -1794,50 +1852,6 @@ Step4_6_LaunchProbeInstall() {
     log info "probeInstall.sh 已后台启动 (PID=${_pid}), 输出: /tmp/probeInstall.out"
 }
 
-# ------------------------------------------------------------
-# 辅助: 读取 nginx 实际链接的 OpenSSL 主.次版本 (来自 `nginx -V`, 而非系统 openssl 命令).
-# 为何用 nginx -V: nginx 可能静态链接与系统库不同的 OpenSSL (nginx.org 官方包即如此),
-#   系统库版本 != nginx 实际链接版本; 只有 nginx -V 的 "built with OpenSSL ..." 才权威.
-# 输出形如 "3.5"; nginx 未安装 / 非 OpenSSL 构建 / 解析失败 -> 输出空串.
-# ------------------------------------------------------------
-_NginxOpensslMajorMinor() {
-    command -v nginx >/dev/null 2>&1 || return 0
-    nginx -V 2>&1 | grep -oP 'built with OpenSSL \K[0-9]+\.[0-9]+\.[0-9]+' \
-        | awk -F. '{print $1"."$2}' | head -1
-}
-
-# ============================================================
-# Step 5: 后置校验 — xhttp-pq 要求 nginx 链接 OpenSSL >= 3.5
-# X25519MLKEM768 后量子曲线支持始于 OpenSSL 3.5.0; nginx 链接更低版本时, ssl_ecdh_curve
-# X25519MLKEM768 会让 nginx -t 报 unknown curve 拒绝加载, 节点直接下线.
-# 全部安装步骤完成后, 在结尾强制拦截并报错 (以 nginx -V 的 OpenSSL 版本为准, 非 Debian 版本).
-# (xhttp-pq 模拟 vision-curvePreferences, 服务端曲线锁死在 nginx, 见面板 V2Presets.)
-# ============================================================
-Step5_PostInstallChecks() {
-    _check_v2="${v2_name:-}"
-    [ -n "$_check_v2" ] || _check_v2=$(jq -r '.v2_name // empty' ~/node.json 2>/dev/null || true)
-
-    [ "$_check_v2" = "xhttp-pq" ] || return 0
-
-    _ossl=$(_NginxOpensslMajorMinor 2>/dev/null || echo "")
-    log info "后置校验: v2_name=xhttp-pq 需要 nginx 链接 OpenSSL >= 3.5 (X25519MLKEM768 始于 3.5.0), 当前=${_ossl:-未知}"
-
-    _ok=no
-    if [ -n "$_ossl" ]; then
-        _ok=$(echo "$_ossl" | awk -F. '{if ($1>3 || ($1==3 && $2>=5)) print "yes"; else print "no"}')
-    fi
-
-    if [ "$_ok" != "yes" ]; then
-        # 明确的校验失败: 清除 EXIT trap, 避免误报 "命令失败".
-        trap - EXIT
-        log error "xhttp-pq 需要 nginx 链接的 OpenSSL >= 3.5 (X25519MLKEM768 后量子曲线支持始于 3.5.0)"
-        log error "当前 nginx-OpenSSL 版本=${_ossl:-未知}, 不满足; nginx -t 会因 unknown curve 拒绝加载, 节点会下线"
-        log error "请为节点换用 OpenSSL >= 3.5 的 nginx 构建 (如 Debian 13 自带 nginx 库) 后重跑本安装脚本"
-        log error "(若 nginx 使用 BoringSSL 等已支持该曲线的库, 请以 nginx -t 实测为准自行确认)"
-        exit 1
-    fi
-}
-
 # ============================================================
 # 主流程
 # ============================================================
@@ -1858,7 +1872,6 @@ Main() {
     Step4_DeployCrontab
     Step4_5_LaunchUnlockCheck
     Step4_6_LaunchProbeInstall
-    Step5_PostInstallChecks
 
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"
