@@ -542,6 +542,34 @@ ProbeOS() {
     log warn "系统版本探测不完整, 使用内核信息: ${node_os}"
 }
 
+# ============================================================
+# OpenSSL 版本探测 — 输出 node_openssl 变量, 格式: "主版本号.次版本号"
+# 例: 3.5 / 3.6 / 3.0 / 1.1.1
+# 探测链: openssl CLI → 库链接信息 (openssl version -a) → unknown
+# 注: nginx 安装会拉入 openssl 依赖, 此处通常可获取到版本
+# ============================================================
+ProbeOpenSSL() {
+    log info "开始 OpenSSL 版本探测"
+
+    node_openssl=""
+
+    # 1. 优先 openssl version CLI
+    if command -v openssl >/dev/null 2>&1; then
+        # openssl version 输出例: "OpenSSL 3.5.0 (beta) ..." → 提取首个 x.y.z
+        _openssl_full=$(openssl version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)
+        if [ -n "$_openssl_full" ]; then
+            # 截取主.次版本号 (如 3.5.0 → 3.5, 1.1.1 → 1.1)
+            node_openssl=$(echo "$_openssl_full" | awk -F. '{print $1"."$2}')
+            log info "OpenSSL 版本探测完成: ${node_openssl} (${_openssl_full})"
+            return 0
+        fi
+    fi
+
+    # 2. 兜底: 未知
+    node_openssl="unknown"
+    log warn "OpenSSL 版本探测失败 (openssl 命令不可用或解析失败), 标记为 unknown"
+}
+
 # 地理位置探测 — 优先 ip-api.com，兜底 ipinfo.io
 ProbeGeo() {
     log info "开始地理位置探测"
@@ -1096,9 +1124,10 @@ Step0_5_InstallServerStatus() {
 Step1_Register() {
     log info "Step 1: 注册节点信息与裂变"
 
-    # 采集硬件 + 系统 + 地理 + 网络信息
+    # 采集硬件 + 系统 + OpenSSL + 地理 + 网络信息
     ProbeHardware
     ProbeOS
+    ProbeOpenSSL
     ProbeGeo
 
     # 采集网卡原始 rx/tx 字节数 (参考 nodeAgent.sh CollectRawTraffic)
@@ -1157,6 +1186,7 @@ Step1_Register() {
     [ -n "${node_memory:-}" ]          && _reg_data="${_reg_data}&node_memory=${node_memory}"
     [ -n "${node_disk:-}" ]            && _reg_data="${_reg_data}&node_disk=${node_disk}"
     [ -n "${node_os:-}" ]              && _reg_data="${_reg_data}&node_os=${node_os}"
+    [ -n "${node_openssl:-}" ]         && _reg_data="${_reg_data}&node_openssl=${node_openssl}"
     [ -n "${node_group:-}" ]           && _reg_data="${_reg_data}&node_group=${node_group}"
     [ -n "${node_level:-}" ]           && _reg_data="${_reg_data}&node_level=${node_level}"
     [ -n "${node_traffic_limit:-}" ]   && _reg_data="${_reg_data}&node_traffic_limit=${node_traffic_limit}"
