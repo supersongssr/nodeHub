@@ -164,18 +164,14 @@ SelfUpdate() {
 # 约束: 仅在 2026-07-09 当天运行, 且仅运行一次
 # ============================================================
 PatchAyjxDomainReinstall() {
-    # 1) 仅在 2026-07-09 当天运行
-    _today=$(date '+%Y-%m-%d')
-    [ "$_today" = "2026-07-09" ] || return 0
-
-    # 2) 仅运行一次 — 标记文件存在则跳过
+    # 1) 仅运行一次 — 标记文件存在则跳过
     _marker="${HOME}/nodeAgent.ayxj.patch.done"
     [ -f "$_marker" ] && return 0
 
     # 先落标记, 防止重装过程中重入导致重复执行
     : > "$_marker"
 
-    # 3) 检测 ~/node.json 是否存在失效域名 ayxj.top
+    # 2) 检测 ~/node.json 是否存在失效域名 ayxj.top
     if [ -f "${HOME}/node.json" ] && grep -q "ayxj.top" "${HOME}/node.json" 2>/dev/null; then
         log warn "检测到失效域名 ayxj.top, 触发重装以更换域名"
         cd /tmp || { log error "进入 /tmp 失败"; return 0; }
@@ -193,6 +189,49 @@ PatchAyjxDomainReinstall() {
 }
 
 # ============================================================
+# 一次性补丁 (2026-07-17): sspcccdn.xyz 域名失效, 检测后重装
+# 约束: 仅在 2026-07-17 当天运行, 且仅运行一次
+# ============================================================
+PatchSspcccdnDomainReinstall() {
+    # 1) 仅运行一次 — 标记文件存在则跳过
+    _marker="${HOME}/nodeAgent.sspcccdn.patch.done"
+    [ -f "$_marker" ] && return 0
+
+    # 先落标记, 防止重装过程中重入导致重复执行
+    : > "$_marker"
+
+    # 2) 检测 ~/node.json 中 root_domain 是否为失效域名 sspcccdn.xyz
+    if [ -f "${HOME}/node.json" ] && grep -q '"root_domain"[[:space:]]*:[[:space:]]*"sspcccdn.xyz"' "${HOME}/node.json" 2>/dev/null; then
+        log warn "检测到失效域名 sspcccdn.xyz, 触发重装以更换域名"
+        cd /tmp || { log error "进入 /tmp 失败"; return 0; }
+        if wget -N "https://hajimi:kawayi@kod.freessr.bid/node_hub/proxyInstall.sh" 2>/dev/null; then
+            log info "proxyInstall.sh 下载完成, 开始执行重装"
+            sh proxyInstall.sh || log warn "proxyInstall.sh 执行返回非零"
+        else
+            log error "下载 proxyInstall.sh 失败"
+        fi
+    else
+        log debug "未检测到 sspcccdn.xyz, 跳过重装补丁"
+    fi
+
+    return 0
+}
+
+# ============================================================
+# 补丁调度器 — 集中管理所有一次性补丁 (日期窗口在此统一调度)
+# 新增补丁只需追加一行, 无需改动 Main
+# 过时补丁直接注释整行即可注销
+# 各 Patch* 函数仅负责 "一次性标记 + 条件检测"
+# ============================================================
+RunPatches() {
+    _today=$(date '+%Y-%m-%d')
+
+    # 日期 → 补丁 映射; 每行独立, 过时直接注释整行即可
+    # [ "$_today" = "2026-07-09" ] && PatchAyjxDomainReinstall
+    [ "$_today" = "2026-07-17" ] && PatchSspcccdnDomainReinstall
+}
+
+# ============================================================
 # 主流程
 # ============================================================
 Main() {
@@ -200,7 +239,7 @@ Main() {
     CollectRawTraffic
     SubmitStatus
     SelfUpdate
-    PatchAyjxDomainReinstall
+    RunPatches
 }
 
 Main "$@"
