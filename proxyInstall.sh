@@ -14,12 +14,42 @@ ARIANG_DIR="/var/www/ariang"
 ARIANG_ZIP="/tmp/AriaNg-${ARIANG_VERSION}.zip"
 
 # ============================================================
-# ERR Trap — 任何命令失败时打印诊断信息后终止
+# Telegram 通知 — 失败时推送; 兼容旧版 .env (未配置 TG_* 则静默跳过)
+# 变量优先级: TELEGRAM_BOT_TOKEN > TG_BOT_TOKEN (chat 同理)
+# 来源: ~/.env / ~/node.env (两个文件本脚本都已 source), 或 export 注入
+# ============================================================
+NotifyTG() {
+    _tg_token="${TELEGRAM_BOT_TOKEN:-${TG_BOT_TOKEN:-}}"
+    _tg_chat="${TELEGRAM_CHAT_ID:-${TG_CHAT_ID:-}}"
+    # 兼容旧版 .env: 未配置则静默跳过, 不影响主流程
+    [ -z "$_tg_token" ] || [ -z "$_tg_chat" ] && return 0
+    curl -sS --connect-timeout 5 --max-time 15 \
+        --data-urlencode "chat_id=${_tg_chat}" \
+        --data-urlencode "text=$1" \
+        "https://api.telegram.org/bot${_tg_token}/sendMessage" >/dev/null 2>&1 || true
+}
+
+# ============================================================
+# ERR Trap — 任何命令失败时打印诊断信息后终止 (并推送 Telegram)
+# 注意: Main() 正常完成时会 trap - EXIT 清除, 故仅在异常时触发
 # ============================================================
 OnError() {
     _exit_code=$?
-    echo "\033[31m$(date '+%Y-%m-%d %H-%M-%S') [FATAL] 💥 命令失败 — 退出码=${_exit_code}\033[0m" >&2
-    echo "$(date '+%Y-%m-%d %H-%M-%S') [FATAL] 💥 命令失败 — 退出码=${_exit_code}" >> ~/nodeLogs 2>/dev/null || true
+    _ts=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '\033[31m%s [FATAL] 💥 命令失败 — 退出码=%s\033[0m\n' "$_ts" "$_exit_code" >&2
+    echo "${_ts} [FATAL] 💥 命令失败 — 退出码=${_exit_code}" >> ~/nodeLogs 2>/dev/null || true
+
+    # 失败时附带最近 5 行日志, 便于 Telegram 端快速定位
+    _log_tail=""
+    [ -f ~/nodeLogs ] && _log_tail=$(tail -n 5 ~/nodeLogs 2>/dev/null)
+
+    NotifyTG "🚨 [NodeHub] proxyInstall.sh 失败
+节点: $(hostname 2>/dev/null || echo unknown) (node_id=${NODE_ID:-N/A})
+时间: ${_ts}
+退出码: ${_exit_code}
+最后错误: ${_LAST_DIE_MSG:-未知 (set -e 触发)}
+日志尾部:
+${_log_tail:-<空>}"
     exit "$_exit_code"
 }
 trap 'OnError' EXIT
@@ -49,6 +79,7 @@ log() {
 
 die() {
     log error "$*"
+    _LAST_DIE_MSG="$*"   # 供 OnError → NotifyTG 引用
     exit 1
 }
 
