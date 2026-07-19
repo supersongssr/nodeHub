@@ -160,6 +160,123 @@ SelfUpdate() {
 }
 
 # ============================================================
+# SSL 证书同步 — 每日一次, 从面板拉取最新 root_domain 证书到 /etc/ssl
+# 依赖: jq (proxyInstall.sh 安装基线), /etc/ssl 写权限 (root)
+# 调度: 仅在每天 03 点执行 (nodeAgent.sh 由 cron 每小时触发)
+# 生效: 检测到 .key / .pem 任一被实际更新 → reload nginx + 重启 xray
+# ============================================================
+SyncSSL() {
+    [ -z "${NODEHUB_URL:-}" ] && return 0
+
+    # 1) 每日只在 03 点执行一次 — nodeAgent.sh 由 cron 每小时触发
+    [ "$(date '+%H')" = "03" ] || return 0
+
+    # 2) 读取 root_domain — 与 proxyInstall.sh:1236 一致
+    if [ ! -f "${HOME}/node.json" ]; then
+        log warn "SyncSSL: ~/node.json 不存在, 跳过"
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        log warn "SyncSSL: jq 不可用, 跳过"
+        return 0
+    fi
+    # jq 解析失败 (如 node.json 临时损坏) 时 || true 防止 set -e 放大为脚本退出
+    # 解析失败 → _root_domain 为空 → 落入下方 -z 检查的 warn 分支
+    _root_domain=$(jq -r '.root_domain // empty' "${HOME}/node.json" 2>/dev/null || true)
+    [ -z "$_root_domain" ] && { log warn "SyncSSL: root_domain 为空或 node.json 解析失败, 跳过"; return 0; }
+
+    # 3) 准备目录与文件路径
+    mkdir -p /etc/ssl
+    _key_file="/etc/ssl/${_root_domain}.key"
+    _pem_file="/etc/ssl/${_root_domain}.pem"
+    _updated=0
+
+    log info "SyncSSL: 开始同步 ${_root_domain} 证书"
+
+    # 4) 下载 .key — wget -N 仅在远程更新时实际拉取; 对比前后 mtime 判断是否真有更新
+    _key_before=""
+    [ -f "$_key_file" ] && _key_before=$(stat -c %Y "$_key_file" 2>/dev/null || echo "")
+    if ! wget -N --timeout=30 --tries=1 -P /etc/ssl \
+            "${NODEHUB_URL}/ssl/${_root_domain}.key" 2>/dev/null; then
+        log warn "SyncSSL: ${_root_domain}.key 下载失败"
+        return 0
+    fi
+    _key_after=$(stat -c %Y "$_key_file" 2>/dev/null || echo "")
+    if [ -z "$_key_before" ] || [ "$_key_before" != "$_key_after" ]; then
+        _updated=1
+        log info "SyncSSL: ${_root_domain}.key 已更新"
+    fi
+
+    # 5) 下载 .pem — 同上 mtime 对比
+    _pem_before=""
+    [ -f "$_pem_file" ] && _pem_before=$(stat -c %Y "$_pem_file" 2>/dev/null || echo "")
+    if ! wget -N --timeout=30 --tries=1 -P /etc/ssl \
+            "${NODEHUB_URL}/ssl/${_root_domain}.pem" 2>/dev/null; then
+        log warn "SyncSSL: ${_root_domain}.pem 下载失败"
+        return 0
+    fi
+    _pem_after=$(stat -c %Y "$_pem_file" 2>/dev/null || echo "")
+    if [ -z "$_pem_before" ] || [ "$_pem_before" != "$_pem_after" ]; then
+        _updated=1
+        log info "SyncSSL: ${_root_domain}.pem 已更新"
+    fi
+
+    # 6) 权限收紧 — 私钥必须 600
+    chmod 600 "$_key_file" 2>/dev/null || true
+    chmod 644 "$_pem_file" 2>/dev/null || true
+
+    # 7) 格式校验 — 镜像 proxyInstall.sh Step1_5_DownloadSSL
+    if ! grep -q 'BEGIN CERTIFICATE' "$_pem_file" 2>/dev/null; then
+        log error "SyncSSL: ${_root_domain}.pem 不含 CERTIFICATE — 源文件可能损坏"
+        return 0
+    fi
+    if ! grep -q 'PRIVATE KEY' "$_key_file" 2>/dev/null; then
+        log error "SyncSSL: ${_root_domain}.key 不含 PRIVATE KEY — 源文件可能损坏"
+        return 0
+    fi
+
+    # 8) 全部通过
+    log info "SyncSSL: ${_root_domain} 证书同步完成 (updated=${_updated})"
+
+    # 9) 检测到更新 → reload nginx + 重启 xray, 让新证书生效
+    if [ "$_updated" = "1" ]; then
+        log info "SyncSSL: 检测到证书更新, 重载服务"
+
+        # nginx: 先 -t 校验配置, 再 -s reload (graceful, 不断连)
+        if command -v nginx >/dev/null 2>&1; then
+            if nginx -t 2>/dev/null; then
+                if nginx -s reload 2>/dev/null; then
+                    log info "SyncSSL: nginx 已 reload"
+                else
+                    log warn "SyncSSL: nginx reload 失败"
+                fi
+            else
+                log warn "SyncSSL: nginx -t 配置校验失败, 跳过 reload"
+            fi
+        else
+            log debug "SyncSSL: nginx 未安装, 跳过 reload"
+        fi
+
+        # xray: 优先 reload (SIGHUP 热重载, 不断连); 旧版 xray.service 未定义 ExecReload 时 reload 会失败, 回退 restart
+        if command -v systemctl >/dev/null 2>&1 \
+            && systemctl list-unit-files 2>/dev/null | grep -q '^xray\.service'; then
+            if systemctl reload xray 2>/dev/null; then
+                log info "SyncSSL: xray 已 reload"
+            else
+                log warn "SyncSSL: xray reload 失败 (旧版 xray.service 可能未定义 ExecReload), 回退 restart"
+                if systemctl restart xray 2>/dev/null; then
+                    log info "SyncSSL: xray 已 restart"
+                else
+                    log warn "SyncSSL: xray restart 也失败"
+                fi
+            fi
+        else
+            log debug "SyncSSL: xray.service 未发现, 跳过"
+        fi
+    fi
+}
+
+# ============================================================
 # 一次性补丁 (2026-07-09): ayjx.top 域名失效, 检测后重装
 # 约束: 仅在 2026-07-09 当天运行, 且仅运行一次
 # ============================================================
@@ -239,6 +356,7 @@ Main() {
     CollectRawTraffic
     SubmitStatus
     SelfUpdate
+    SyncSSL
     RunPatches
 }
 

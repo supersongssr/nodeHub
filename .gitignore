@@ -11,7 +11,7 @@ ssl/
 geodat/
 
 # Xray 二进制
-xray/
+/xray/
 
 .scripts/
 
