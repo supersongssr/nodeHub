@@ -14,15 +14,59 @@ ARIANG_DIR="/var/www/ariang"
 ARIANG_ZIP="/tmp/AriaNg-${ARIANG_VERSION}.zip"
 
 # ============================================================
-# Telegram 通知 — 失败时推送; 兼容旧版 .env (未配置 TG_* 则静默跳过)
-# 变量优先级: TELEGRAM_BOT_TOKEN > TG_BOT_TOKEN (chat 同理)
-# 来源: ~/.env / ~/node.env (两个文件本脚本都已 source), 或 export 注入
+# 脚本身份 (供 Telegram 通知标注来源: 脚本路径)
 # ============================================================
+_SCRIPT_PATH="$0"
+_SCRIPT_NAME="${0##*/}"
+
+# ============================================================
+# Telegram 通知 — 收敛到 log() 内统一触发
+#   * 默认仅 error 等级推送; 通过 .env 设置 TG_NOTIFY_LEVEL 调整
+#     可选: debug / info / warn / error (阈值越低越宽松)
+#   * 节流: _TG_THROTTLE_SEC 秒内只推送一次 (防短时刷屏), 设 0 关闭
+#   * 兼容旧版 .env: 未配置 TELEGRAM_BOT_TOKEN / TG_BOT_TOKEN 则静默跳过
+#   * 变量优先级: TELEGRAM_BOT_TOKEN > TG_BOT_TOKEN (chat 同理)
+# ============================================================
+TG_NOTIFY_LEVEL="${TG_NOTIFY_LEVEL:-error}"
+_TG_THROTTLE_SEC="${TG_NOTIFY_THROTTLE:-15}"
+
+# 日志等级 → 数值 (便于阈值比较)
+_LogLevelNum() {
+    case "$1" in
+        error) echo 4 ;;
+        warn)  echo 3 ;;
+        info)  echo 2 ;;
+        debug) echo 1 ;;
+        *)     echo 0 ;;
+    esac
+}
+
+# 解析节点 IP (供 Telegram 通知标注来源), 不发起网络请求
+_TgNodeIp() {
+    for _cand in "${node_ip:-}" "${_ip:-}" "${NODE_IP:-}"; do
+        [ -n "$_cand" ] && { echo "$_cand"; return 0; }
+    done
+    _cand=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [ -z "$_cand" ] && _cand=$(hostname 2>/dev/null || true)
+    [ -z "$_cand" ] && _cand="未知"
+    echo "$_cand"
+}
+
 NotifyTG() {
     _tg_token="${TELEGRAM_BOT_TOKEN:-${TG_BOT_TOKEN:-}}"
     _tg_chat="${TELEGRAM_CHAT_ID:-${TG_CHAT_ID:-}}"
-    # 兼容旧版 .env: 未配置则静默跳过, 不影响主流程
+    # 未配置则静默跳过, 不影响主流程
     [ -z "$_tg_token" ] || [ -z "$_tg_chat" ] && return 0
+
+    # 节流: 标记文件记录上次推送 epoch, 窗口内跳过
+    if [ "${_TG_THROTTLE_SEC:-0}" -gt 0 ] 2>/dev/null; then
+        _tg_marker="${TMPDIR:-/tmp}/${_SCRIPT_NAME}.tg.throttle"
+        _now=$(date +%s)
+        _last=$(cat "$_tg_marker" 2>/dev/null || echo 0)
+        [ $((_now - _last)) -lt "${_TG_THROTTLE_SEC}" ] && return 0
+        echo "$_now" > "$_tg_marker" 2>/dev/null || true
+    fi
+
     curl -sS --connect-timeout 5 --max-time 15 \
         --data-urlencode "chat_id=${_tg_chat}" \
         --data-urlencode "text=$1" \
@@ -30,32 +74,7 @@ NotifyTG() {
 }
 
 # ============================================================
-# ERR Trap — 任何命令失败时打印诊断信息后终止 (并推送 Telegram)
-# 注意: Main() 正常完成时会 trap - EXIT 清除, 故仅在异常时触发
-# ============================================================
-OnError() {
-    _exit_code=$?
-    _ts=$(date '+%Y-%m-%d %H:%M:%S')
-    printf '\033[31m%s [FATAL] 💥 命令失败 — 退出码=%s\033[0m\n' "$_ts" "$_exit_code" >&2
-    echo "${_ts} [FATAL] 💥 命令失败 — 退出码=${_exit_code}" >> ~/nodeLogs 2>/dev/null || true
-
-    # 失败时附带最近 5 行日志, 便于 Telegram 端快速定位
-    _log_tail=""
-    [ -f ~/nodeLogs ] && _log_tail=$(tail -n 5 ~/nodeLogs 2>/dev/null)
-
-    NotifyTG "🚨 [NodeHub] proxyInstall.sh 失败
-节点: $(hostname 2>/dev/null || echo unknown) (node_id=${NODE_ID:-N/A})
-时间: ${_ts}
-退出码: ${_exit_code}
-最后错误: ${_LAST_DIE_MSG:-未知 (set -e 触发)}
-日志尾部:
-${_log_tail:-<空>}"
-    exit "$_exit_code"
-}
-trap 'OnError' EXIT
-
-# ============================================================
-# 日志系统
+# 日志系统 — 等级 >= TG_NOTIFY_LEVEL (默认 error) 时自动推送 Telegram
 # ============================================================
 log() {
     _level="$1"
@@ -75,13 +94,39 @@ log() {
     _log_message="${_timestamp} [${_level}] ${_emoji} ${_message}"
     printf '%b%s%b\n' "$_color_code" "$_log_message" "\033[0m" >&2
     echo "$_log_message" >> ~/nodeLogs 2>/dev/null || true
+
+    # 收敛入口: 等级达标 → 推送 (含 IP / 脚本路径 / 节点ID / 消息)
+    if [ "$(_LogLevelNum "$_level")" -ge "$(_LogLevelNum "${TG_NOTIFY_LEVEL:-error}")" ]; then
+        NotifyTG "🚨 [NodeHub] ${_SCRIPT_NAME}
+节点ID: ${node_id:-${NODE_ID:-N/A}}
+IP: $(_TgNodeIp)
+脚本: ${_SCRIPT_PATH}
+等级: ${_level}
+时间: ${_timestamp}
+消息: ${_message}"
+    fi
 }
 
 die() {
     log error "$*"
-    _LAST_DIE_MSG="$*"   # 供 OnError → NotifyTG 引用
+    _LAST_DIE_MSG="$*"   # 标记: die 已通过 log 推送, OnError 据此跳过重复推送
     exit 1
 }
+
+# ============================================================
+# ERR Trap — set -e 未捕获失败时统一走 log error → NotifyTG
+# 注意: Main() 正常完成时会 trap - EXIT 清除, 故仅在异常时触发
+# ============================================================
+OnError() {
+    _exit_code=$?
+    # die() 已通过 log error 推送过通知, 这里只负责退出, 不重复推送
+    if [ -n "${_LAST_DIE_MSG:-}" ]; then
+        exit "$_exit_code"
+    fi
+    log error "命令失败 — 退出码=${_exit_code} (set -e 触发, 未捕获的错误)"
+    exit "$_exit_code"
+}
+trap 'OnError' EXIT
 
 # ============================================================
 # 数据清洗工具
