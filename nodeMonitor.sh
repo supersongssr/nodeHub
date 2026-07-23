@@ -7,7 +7,6 @@
 # 两部分职责:
 #   A. 每分钟: 采样网卡流量 → 计算 Mbps → 更新 ~/node.env  (同步, <10ms, 永不阻塞)
 #   B. 调度器: 按相位周期调用各定时任务 (后台 + flock 防重叠, 不阻塞下一分钟采样)
-#      - probe (probeTask.sh): 每 15 分钟, 仅当 ~/probeTask.sh 存在 + MONITOR_* 配齐
 #      ※ 以后新增的定时任务都在 RunScheduledTasks 里加分支, 不再写新 crontab
 # ============================================================
 
@@ -70,54 +69,7 @@ RunScheduledTasks() {
     # 当前分钟 (0-59), 去前导 0 避免 dash 八进制
     _min=$(date +%M | sed 's/^0//'); [ -z "$_min" ] && _min=0
 
-    # ---- probe: 每 15 分钟, 相位 (min % 15) == probe_collect_phase 时触发 ----
-    # 门控: probeTask.sh 存在 + MONITOR_* 配齐 (缺任一则该节点无 probe)
-    if [ -f ~/probeTask.sh ] \
-       && [ -n "${MONITOR_INGEST_URL:-}" ] \
-       && [ -n "${MONITOR_INGEST_TOKEN:-}" ]; then
-        if [ $((_min % 15)) = "${probe_collect_phase:-}" ]; then
-            # probe 自更新: wget -N 仅远程更新时才下载 (与 nodeAgent.sh 同机制)
-            if [ -n "${NODEHUB_URL:-}" ] && command -v wget >/dev/null 2>&1; then
-                wget -N -q --timeout=15 --tries=1 \
-                    -O ~/probeTask.sh "${NODEHUB_URL}/scripts/probe/probeTask.sh" 2>/dev/null \
-                    && chmod +x ~/probeTask.sh
-                wget -N -q --timeout=15 --tries=1 \
-                    -O ~/probeHelper.py "${NODEHUB_URL}/scripts/probe/probeHelper.py" 2>/dev/null
-            fi
-            # 后台 + flock 防重叠; 输出重定向到 ~/probeLogs
-            ( flock -n 9 || exit 0
-              sh ~/probeTask.sh
-            ) 9>/tmp/probeTask.lock </dev/null >>~/probeLogs 2>&1 &
-        fi
-    fi
-
     # ---- ※ 未来新增定时任务在此追加 if 分支 ----
-
-    # ---- probeHunt: 每 15 分钟, 相位错开 (probe_collect_phase + 7) 避免与 probeTask
-    #      的 tcpdump 重叠. 仅 xray 前置节点有效 (probeHunt 内部跳过 xhttp).
-    #      门控: MONITOR_* 配齐; 首次 bootstrap 会从 NODEHUB_URL 拉 probeHunt.sh.
-    if [ -n "${MONITOR_INGEST_URL:-}" ] \
-       && [ -n "${MONITOR_INGEST_TOKEN:-}" ]; then
-        _hunt_phase=$(( (${probe_collect_phase:-0} + 7) % 15 ))
-        if [ $((_min % 15)) = "$_hunt_phase" ]; then
-            # hunt 自更新 (wget -N 幂等; 首次 bootstrap 从 CDN 拉取)
-            if [ -n "${NODEHUB_URL:-}" ] && command -v wget >/dev/null 2>&1; then
-                wget -N -q --timeout=15 --tries=1 \
-                    -O ~/probeHunt.sh "${NODEHUB_URL}/scripts/probe/probeHunt.sh" 2>/dev/null \
-                    && chmod +x ~/probeHunt.sh
-                wget -N -q --timeout=15 --tries=1 \
-                    -O ~/huntHelper.py "${NODEHUB_URL}/scripts/probe/huntHelper.py" 2>/dev/null
-                wget -N -q --timeout=15 --tries=1 \
-                    -O ~/huntWatchlist.conf "${NODEHUB_URL}/scripts/probe/huntWatchlist.conf" 2>/dev/null
-            fi
-            # 拉到才跑 (首次未拉到则跳过, 下个周期重试)
-            if [ -f ~/probeHunt.sh ] && [ -f ~/huntHelper.py ]; then
-                ( flock -n 9 || exit 0
-                  sh ~/probeHunt.sh
-                ) 9>/tmp/probeHunt.lock </dev/null >>~/huntLogs 2>&1 &
-            fi
-        fi
-    fi
 }
 
 # ============================================================

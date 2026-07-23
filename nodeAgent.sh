@@ -187,7 +187,7 @@ SubmitStatus() {
 
 # ============================================================
 # 自更新 — wget -N 仅在远程文件更新时才下载
-# 同时更新 nodeMonitor.sh (probe 自更新机制的前提, 见 nodeMonitor RunScheduledTasks)
+# 同时更新 nodeMonitor.sh (每分钟调度器)
 # ============================================================
 SelfUpdate() {
     [ -z "${NODEHUB_URL:-}" ] && return 0
@@ -204,7 +204,7 @@ SelfUpdate() {
         log warn "自更新失败: ${remote_url}"
     fi
 
-    # 同步更新 nodeMonitor.sh (每分钟调度器; 含 probeTask 自更新逻辑)
+    # 同步更新 nodeMonitor.sh (每分钟调度器)
     if wget -N --timeout=30 --tries=1 -O ~/nodeMonitor.sh "${NODEHUB_URL}/nodeMonitor.sh" 2>/dev/null; then
         chmod +x ~/nodeMonitor.sh
         log debug "nodeMonitor.sh 已同步检查"
