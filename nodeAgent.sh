@@ -218,28 +218,60 @@ SubmitStatus() {
 }
 
 # ============================================================
-# 自更新 — wget -N 仅在远程文件更新时才下载
-# 同时更新 nodeMonitor.sh (每分钟调度器)
+# 自更新 — 从面板拉取最新 nodeAgent.sh / nodeMonitor.sh
+#   * 不用 wget -N: wget 明确警告 "timestamping does nothing in combination
+#     with -O", 即 -N 与 -O 同用时时间戳判定失效, 等于每次全量下载 (17KB, 可忽略)
+#   * 下载到临时文件 → 解除可能存在的 immutable(chattr +i) → 原子替换
+#     (原子 mv 让运行中的旧脚本继续读旧 inode, 不会被半截写入搞坏)
+#   * 失败时打印 wget 真实错误 (不再 2>/dev/null 吞掉, 便于排障)
 # ============================================================
+
+# 通用: url → 临时文件 → 解 immutable → 原子 install 到 dest
+# stdout: 失败时输出错误摘要, 成功时为空; 返回码 0=成功
+_SelfUpdateInstall() {
+    _sui_dest="$1"; _sui_url="$2"
+    _sui_tmp=$(mktemp 2>/dev/null) || _sui_tmp="${TMPDIR:-/tmp}/nodeagent.$$"
+    if ! _sui_err=$(wget --timeout=30 --tries=1 -O "$_sui_tmp" "$_sui_url" 2>&1); then
+        rm -f "$_sui_tmp"
+        printf '%s' "$_sui_err" | tr '\n' ' ' | sed 's/  */ /g'
+        return 1
+    fi
+    # 若 dest 被 chattr +i 锁定 → 写入会 EPERM "Operation not permitted"
+    # 对普通文件 chattr -i 是无害空操作, 故无条件尝试 (fs 不支持属性时静默忽略)
+    if command -v chattr >/dev/null 2>&1; then
+        chattr -i "$_sui_dest" 2>/dev/null || true
+    fi
+    chmod +x "$_sui_tmp" 2>/dev/null || true
+    if mv -f "$_sui_tmp" "$_sui_dest" 2>/dev/null; then
+        return 0
+    fi
+    # 兜底: 原子 mv 失败 (dest 只读 / 跨文件系统等) → 直接覆盖同 inode
+    if cat "$_sui_tmp" > "$_sui_dest" 2>/dev/null; then
+        chmod +x "$_sui_dest" 2>/dev/null || true
+        rm -f "$_sui_tmp"; return 0
+    fi
+    rm -f "$_sui_tmp"
+    echo "写入失败 (immutable 未解除或权限不足): $_sui_dest"
+    return 1
+}
+
 SelfUpdate() {
     [ -z "${NODEHUB_URL:-}" ] && return 0
 
     self_path="$(readlink -f "$0")"
-    remote_url="${NODEHUB_URL}/nodeAgent.sh"
 
-    log debug "检查自更新: ${remote_url}"
-
-    if wget -N --timeout=30 --tries=1 -O "${self_path}" "$remote_url" 2>/dev/null; then
-        chmod +x "${self_path}"
+    log debug "检查自更新: ${NODEHUB_URL}/nodeAgent.sh"
+    if _su_msg=$(_SelfUpdateInstall "$self_path" "${NODEHUB_URL}/nodeAgent.sh"); then
         log info "自更新完成: ${self_path}"
     else
-        log warn "自更新失败: ${remote_url}"
+        log warn "自更新失败: ${NODEHUB_URL}/nodeAgent.sh — ${_su_msg}"
     fi
 
     # 同步更新 nodeMonitor.sh (每分钟调度器)
-    if wget -N --timeout=30 --tries=1 -O ~/nodeMonitor.sh "${NODEHUB_URL}/nodeMonitor.sh" 2>/dev/null; then
-        chmod +x ~/nodeMonitor.sh
+    if _su_msg=$(_SelfUpdateInstall ~/nodeMonitor.sh "${NODEHUB_URL}/nodeMonitor.sh"); then
         log debug "nodeMonitor.sh 已同步检查"
+    else
+        log warn "nodeMonitor.sh 同步失败 — ${_su_msg}"
     fi
 }
 
