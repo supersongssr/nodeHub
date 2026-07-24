@@ -886,6 +886,14 @@ DetectPanel() {
     else
         log info "未检测到管理面板 (1Panel/宝塔/AA Panel)"
     fi
+
+    # ----------------------------------------------------------
+    # 冲突预检: 检测到面板但 node_port=443 → 直接报错终止
+    # 面板自身占用 443, 代理无法监听该端口 (走 die 会触发 Telegram 通知)
+    # ----------------------------------------------------------
+    if [ -n "${_PANEL_TYPE:-}" ] && [ "${node_port}" = "443" ]; then
+        die "检测到面板(${_PANEL_DETECTED})且 node_port=443: 面板自身占用 443, 代理无法监听该端口, 安装中止以避免冲突。请在 ~/.env 设置 NODE_PORT=<非443>(如 2053) 后重跑。"
+    fi
 }
 
 # ============================================================
@@ -1588,36 +1596,11 @@ Step3_InstallNginx_Panel() {
     _PANEL_TRANSPORT="${_TRANSPORT_MODE}"
     log info "面板传输模式: ${_PANEL_TRANSPORT} (由 v2_name 判定)"
 
-    # 2. vision 模式: 面板占用 443, vision 需独占 TLS 端口
+    # 2. vision 模式: xray 直接监听 node_port, 不需要 nginx
+    #    node_port=443 的冲突已在 DetectPanel() 预检中拦截, 走到这里 node_port 必为非 443
     if [ "${_PANEL_TRANSPORT}" = "vision" ]; then
-        if type Detect443Usage >/dev/null 2>&1; then
-            Detect443Usage
-        else
-            # 兜底: 用 ss 检测 443 端口占用
-            _PORT443_OWNER=""
-            _443_listener=$(ss -tlnp 2>/dev/null | grep ':443 ' | head -1 || true)
-            if [ -n "$_443_listener" ]; then
-                _PORT443_OWNER=$(echo "$_443_listener" | grep -oP 'users:\(\("\K[^"]+' || true)
-                [ -z "$_PORT443_OWNER" ] && _PORT443_OWNER="unknown"
-                log info "443 端口被占用: ${_PORT443_OWNER}"
-            else
-                log info "443 端口空闲"
-            fi
-        fi
-        if [ "${node_port}" = "443" ]; then
-            log error "============================================================"
-            log error "  ❌ vision 模式 + 面板: node_port=443 被面板占用"
-            log error "  面板 (${_PANEL_DETECTED}) 会优先占用 443 端口"
-            log error "  vision 模式 (vless tcp vision) 需要独占 TLS 端口"
-            log error "  解决方案: 修改 node_port 为非 443 端口 (如 2053)"
-            log error "  或在 ~/.env 中设置 NODE_PORT=2053"
-            log error "============================================================"
-            return 1
-        else
-            log info "vision 模式: node_port=${node_port} (非 443)，可以继续"
-            log info "vision 模式下不需要 nginx 配置，xray 直接监听 ${node_port}"
-            return 0
-        fi
+        log info "vision 模式: xray 直接监听 ${node_port}, 不需要 nginx 配置"
+        return 0
     fi
 
     # 3. xhttp 模式: 从面板 API 下载 proxy.conf
