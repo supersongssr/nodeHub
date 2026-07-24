@@ -430,6 +430,9 @@ RunPatches() {
     # 日期 → 补丁 映射; 每行独立, 过时直接注释整行即可
     # [ "$_today" = "2026-07-09" ] && PatchAyjxDomainReinstall
     [ "$_today" = "2026-07-17" ] && PatchSspcccdnDomainReinstall
+
+
+    return 0
 }
 
 # ============================================================
