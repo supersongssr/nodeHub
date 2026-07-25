@@ -1909,6 +1909,39 @@ Step4_5_LaunchUnlockCheck() {
     log info "unlockCheck.sh 已后台启动 (PID=${_pid})，输出: /tmp/unlockCheck.out"
 }
 
+# ============================================================
+# Step 4.6: 部署 manage.sh 到 ~/ (节点运维菜单)
+# 职责: 重新测试流媒体解锁 / 节点故障自检 / 手动重启服务 / 同步 SSL 等
+# 镜像 nodeAgent.sh 的下载完整性校验 (非空 + #! 开头), 失败时强制重下
+# 容错: 运维脚本非节点运行必需, 下载失败仅告警不中断安装
+# ============================================================
+Step4_6_DeployManageScript() {
+    log info "Step 4.6: 部署 manage.sh 到 ~/"
+
+    _manage_file=~/manage.sh
+
+    # 首次下载: wget -N 仅在远程更新时拉取
+    wget -N --timeout=60 --tries=3 -P ~ "${NODEHUB_URL}/manage.sh" \
+        || { log warn "manage.sh 下载失败: ${NODEHUB_URL}/manage.sh (节点可正常运行, 稍后可手动重试)"; return 0; }
+    chmod +x "$_manage_file"
+
+    # 完整性校验: 非空 且 以 #! 开头 (防脏文件/HTML 错误页)
+    # 校验失败 → 强制删除后重新下载一次
+    if [ ! -s "$_manage_file" ] || [ "$(head -c 2 "$_manage_file" 2>/dev/null)" != "#!" ]; then
+        log warn "manage.sh 校验失败 (空文件或非 #! 开头), 强制删除后重新下载"
+        rm -f "$_manage_file"
+        wget --timeout=60 --tries=3 -O "$_manage_file" "${NODEHUB_URL}/manage.sh" \
+            || { log warn "manage.sh 强制重新下载失败, 跳过 (节点可正常运行)"; return 0; }
+        chmod +x "$_manage_file"
+        if [ ! -s "$_manage_file" ] || [ "$(head -c 2 "$_manage_file" 2>/dev/null)" != "#!" ]; then
+            log warn "manage.sh 校验仍失败, 跳过部署 (节点可正常运行)"
+            return 0
+        fi
+    fi
+
+    log info "manage.sh 已部署到 ~/ ($(wc -c < "$_manage_file") bytes) — 用法: sh ~/manage.sh"
+}
+
 
 # ============================================================
 # 主流程
@@ -1929,6 +1962,7 @@ Main() {
     Step2_ResolveDns
     Step4_DeployCrontab
     Step4_5_LaunchUnlockCheck
+    Step4_6_DeployManageScript
 
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"
