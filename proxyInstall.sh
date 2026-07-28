@@ -1223,7 +1223,7 @@ Step1_Register() {
     raw_tx=$(cat "$_tx_file")
     log info "网卡流量采集 — raw_rx=${raw_rx} raw_tx=${raw_tx} (${NET_CARD})"
 
-    # 读取本地缓存 (node.json + status.json) — panel 以节点上报为第一优先级
+    # 读取本地缓存 (node.json + nodeAgent.json) — panel 以节点上报为第一优先级
     _cached_node_id="" _cached_node_ids="" _cached_root_domain="" _cached_v2_name=""
     _cached_traffic_used="" _cached_traffic_max_day=""
     if [ -f ~/node.json ]; then
@@ -1236,12 +1236,19 @@ Step1_Register() {
     else
         log debug "~/node.json 不存在，首次安装"
     fi
-    if [ -f ~/status.json ]; then
-        _cached_traffic_used=$(jq -r '.traffic_used // empty' ~/status.json 2>/dev/null || true)
-        _cached_traffic_max_day=$(jq -r '.traffic_max_day_value // empty' ~/status.json 2>/dev/null || true)
-        log info "status.json 缓存: traffic_used=${_cached_traffic_used:-无} traffic_max_day_value=${_cached_traffic_max_day:-无}"
+    # 流量缓存: 优先 nodeAgent.json (新版), 回退 status.json (旧版迁移期)
+    # 旧节点升级后 nodeAgent.json 要等 nodeAgent.sh 下次上报 (最长 1h) 才生成;
+    # 此窗口期内重装仍需读取磁盘上的 status.json, 否则 traffic_used 缓存丢失
+    _status_cache=""
+    for _f in ~/nodeAgent.json ~/status.json; do
+        [ -f "$_f" ] && { _status_cache="$_f"; break; }
+    done
+    if [ -n "$_status_cache" ]; then
+        _cached_traffic_used=$(jq -r '.traffic_used // empty' "$_status_cache" 2>/dev/null || true)
+        _cached_traffic_max_day=$(jq -r '.traffic_max_day_value // empty' "$_status_cache" 2>/dev/null || true)
+        log info "${_status_cache##*/} 缓存: traffic_used=${_cached_traffic_used:-无} traffic_max_day_value=${_cached_traffic_max_day:-无}"
     else
-        log debug "~/status.json 不存在，首次安装"
+        log debug "~/nodeAgent.json 与 ~/status.json 均不存在，首次安装"
     fi
 
     # 环境变量覆盖 — TRAFFIC_USED / TRAFFIC_USED_GB 为最高优先级

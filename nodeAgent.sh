@@ -115,6 +115,23 @@ OnError() {
 trap OnError EXIT
 
 # ============================================================
+# 读取流量采样结果 ~/nodeMonitor.json
+# 取 max_mbps 作为节点带宽峰值上报; 缺失/解析失败时回退为 0, 不阻断上报
+# (jq 为 proxyInstall 基线依赖; 字段缺失时 // 0 兴默认值)
+# ============================================================
+LoadNodeMonitor() {
+    _nm=~/nodeMonitor.json
+    monitor_max_mbps="${monitor_max_mbps:-0}"
+
+    [ -f "$_nm" ] && command -v jq >/dev/null 2>&1 || return 0
+
+    monitor_max_mbps=$(jq -r '.max_mbps // 0' "$_nm" 2>/dev/null) || monitor_max_mbps=0
+    [ -z "$monitor_max_mbps" ] && monitor_max_mbps=0
+
+    log debug "已加载 nodeMonitor.json — max_mbps=${monitor_max_mbps}"
+}
+
+# ============================================================
 # 环境加载
 # ============================================================
 LoadEnv() {
@@ -127,11 +144,14 @@ LoadEnv() {
         return 1
     fi
 
-    # ~/node.env — API 分配的可变配置
+    # ~/node.env — API 分配的可变配置 (注意: monitor_* 已迁移至 ~/nodeMonitor.json, 见 nodeMonitor.sh)
     if [ -f ~/node.env ]; then
         # shellcheck disable=SC1090
         . ~/node.env || { log error "加载 ~/node.env 失败"; return 1; }
     fi
+
+    # ~/nodeMonitor.json — 流量采样结果 (取 max_mbps 作为带宽峰值上报)
+    LoadNodeMonitor
 
     # 必需字段
     _missing=""
@@ -210,8 +230,14 @@ SubmitStatus() {
 
     if [ "$http_code" = "200" ]; then
         log debug "上报成功 — $(printf '%.200s' "$body")"
-        echo "$body" > ~/status.json
-        log debug "返回数据已保存到 ~/status.json"
+        # 原子写入 ~/nodeAgent.json (先写临时文件再 mv, 避免读到半截 JSON)
+        # nodeAgent.json = 面板 status 接口的返回体 (含 traffic_used / traffic_max_day_value 等)
+        _ja=~/nodeAgent.json
+        _ja_tmp="${_ja}.$$"
+        printf '%s\n' "$body" > "$_ja_tmp"
+        mv -f "$_ja_tmp" "$_ja" 2>/dev/null || cat "$_ja_tmp" > "$_ja" 2>/dev/null
+        rm -f "$_ja_tmp" 2>/dev/null || true
+        log debug "返回数据已保存到 ~/nodeAgent.json"
     else
         log warn "上报失败 — HTTP ${http_code} — $(printf '%.200s' "$body")"
     fi

@@ -347,9 +347,9 @@ Action_SelfCheck() {
     else
         _CkFail "/etc/crontab 不存在 → cron 未正确安装"
     fi
-    # nodeMonitor 最近采样活跃度
-    if [ -f ~/node.env ]; then
-        _mt=$(grep '^monitor_last_time=' ~/node.env 2>/dev/null | tail -1 | sed 's/^monitor_last_time="//;s/"$//')
+    # nodeMonitor 最近采样活跃度 (采样时间现持久化在 ~/nodeMonitor.json 的 last_time)
+    if [ -f ~/nodeMonitor.json ]; then
+        _mt=$(sed -n 's/.*"last_time":\([0-9][0-9]*\).*/\1/p' ~/nodeMonitor.json | head -1)
         if [ -n "$_mt" ]; then
             _now=$(date +%s)
             _diff=$((_now - _mt))
@@ -425,10 +425,12 @@ Action_Status() {
         info "node_level: $(jq -r '.node_level // "无"' ~/node.json 2>/dev/null)"
     fi
 
-    # 实时流量 (node.env)
-    if [ -f ~/node.env ]; then
-        section "流量统计 (node.env)"
-        info "当前速率: $(grep '^monitor_' ~/node.env 2>/dev/null | grep -v last | sed 's/^/    /')"
+    # 实时流量 (nodeMonitor.json) — 数字/字符串已分离, 用 jq -r 直取
+    if [ -f ~/nodeMonitor.json ] && command -v jq >/dev/null 2>&1; then
+        section "流量统计 (nodeMonitor.json)"
+        info "当前速率: $(jq -r '.mbps // 0' ~/nodeMonitor.json) Mbps"
+        info "峰值速率: $(jq -r '.max_mbps // 0' ~/nodeMonitor.json) Mbps"
+        info "采样时间: $(jq -r '.ts // "未知"' ~/nodeMonitor.json)"
     fi
 
     # 服务状态一览
