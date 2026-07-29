@@ -792,26 +792,23 @@ DetectPanel() {
     _PANEL_DETECTED=""
     _PANEL_TYPE=""
 
-    # 1Panel — 官方 CLI / 安装目录 / systemd 服务
+    # 1Panel — 官方 CLI / systemd 服务 (不依赖目录, 避免 /opt/1panel 残留/同名项目误报)
     if command -v 1pctl >/dev/null 2>&1 \
-       || [ -d /opt/1panel ] \
        || systemctl is-active 1panel >/dev/null 2>&1; then
         _PANEL_DETECTED="1Panel"
         _PANEL_TYPE="1panel"
     fi
 
-    # 宝塔面板 (btpanel) — bt CLI / 安装目录 / systemd 服务
+    # 宝塔面板 (btpanel) — bt CLI / systemd 服务
     if command -v bt >/dev/null 2>&1 \
-       || [ -d /www/server/panel ] \
        || systemctl is-active bt >/dev/null 2>&1; then
         [ -n "$_PANEL_DETECTED" ] && _PANEL_DETECTED="${_PANEL_DETECTED} + "
         _PANEL_DETECTED="${_PANEL_DETECTED}宝塔面板(btpanel)"
         [ -z "$_PANEL_TYPE" ] && _PANEL_TYPE="btpanel"
     fi
 
-    # AA Panel — 安装目录 / systemd 服务
-    if [ -d /www/server/aapanel ] \
-       || systemctl is-active aapanel >/dev/null 2>&1; then
+    # AA Panel — systemd 服务
+    if systemctl is-active aapanel >/dev/null 2>&1; then
         [ -n "$_PANEL_DETECTED" ] && _PANEL_DETECTED="${_PANEL_DETECTED} + "
         _PANEL_DETECTED="${_PANEL_DETECTED}AA Panel"
         _PANEL_TYPE="aapanel"
