@@ -1,7 +1,7 @@
 #!/bin/sh
 # ============================================================
 # nodeAgent.sh — V2 瘦节点状态上报脚本
-# 职责: 采集网卡原始 rx/tx 字节数 + 服务器运行时间，上报至面板
+# 职责: 采集网卡原始 rx/tx 字节数 + 服务器运行时间 + vnstat 7日流量历史，上报至面板
 # 约束: 严禁在节点端进行流量计算、单位换算或清零操作
 # ============================================================
 
@@ -203,17 +203,73 @@ CollectRawTraffic() {
 }
 
 # ============================================================
+# vnstat 7日流量历史采集 — 整合为字符串, 经 monitor= 参数上报
+# 格式: v1,v2,v3,v4,v5,v6,v7,M-D
+#   * v1..v7 = 近→远 7 天每日「下行接收 rx」, 单位 GiB(整数, 四舍五入); 今天(v1)在最前
+#   * M-D    = 第 7 个值(最早那天) 的日期, 不带年份 (如 7-11)
+#     前端据此反推: 第7个值=M-D, 第i个值 = M-D + (7-i) 天, 第1个值(今天) = M-D + 6 天
+#   * 数据不足 7 天 → 后置补 0 (对应更早的、无数据的天)
+#   * vnstat / jq 缺失 或 解析失败 → MONITOR_DATA 留空, 面板按"无历史"处理, 不阻断上报
+# 依赖: vnstat + jq (jq 为 proxyInstall 基线依赖; vnstat 非基线, 缺失则静默跳过)
+# ============================================================
+CollectVnstatTraffic() {
+    MONITOR_DATA=""
+
+    command -v vnstat >/dev/null 2>&1 || { log debug "vnstat 未安装, 跳过流量历史采集"; return 0; }
+    command -v jq    >/dev/null 2>&1 || { log warn  "jq 不可用, 跳过流量历史采集"; return 0; }
+
+    _vjson=$(vnstat --json d 2>/dev/null) || { log warn "vnstat --json d 执行失败"; return 0; }
+    [ -n "$_vjson" ] || { log warn "vnstat 返回空数据, 跳过"; return 0; }
+
+    # 第 1 行: 7 日 rx 流量(近→远, GiB 整数, 逗号分隔)
+    # 第 2 行: 窗口最早日期 (vnstat 满 7 天时由其给出; 否则为空, 下方用系统时间兜底)
+    # 单位: GiB (二进制, /1024/1024/1024); 仅取 rx; 四舍五入取整 (jq round)
+    _parsed=$(printf '%s' "$_vjson" | jq -r '
+        [.interfaces[0].traffic.day[]] as $days
+        | ($days | length) as $n
+        | ($days[-7:] | reverse) as $rev
+        | [
+            ($rev | map((.rx / 1073741824 | round | tostring)) | join(",")),
+            (if $n >= 7 then "\($rev[-1].date.month)-\($rev[-1].date.day)" else "" end)
+          ]
+        | .[0], .[1]
+    ' 2>/dev/null) || { log warn "vnstat JSON 解析失败"; return 0; }
+
+    _values=$(printf '%s\n' "$_parsed" | sed -n '1p')
+    _vdate=$(printf '%s\n' "$_parsed" | sed -n '2p')
+
+    # 空值兜底 + 不足 7 个 → 后置补 0
+    [ -n "$_values" ] || _values="0"
+    _count=$(printf '%s' "$_values" | awk -F',' '{print NF}')
+    while [ "${_count:-0}" -lt 7 ]; do
+        _values="${_values},0"
+        _count=$((_count + 1))
+    done
+
+    # 日期标签: vnstat 不足 7 天时为空 → 用系统时间 today-6 兜底, 保证 7 天窗口对齐
+    if [ -z "$_vdate" ]; then
+        _vdate=$(date -d '6 days ago' '+%-m-%-d' 2>/dev/null || true)
+    fi
+    # 仍为空 (BusyBox date 不支持 -d 偏移) → 退取今天, 避免末尾悬空逗号
+    [ -n "$_vdate" ] || _vdate=$(date '+%-m-%d' 2>/dev/null || echo "0-0")
+
+    MONITOR_DATA="${_values},${_vdate}"
+    log debug "vnstat 7日流量已采集 — ${MONITOR_DATA}"
+}
+
+# ============================================================
 # 数据上报 — application/x-www-form-urlencoded
 # ============================================================
 SubmitStatus() {
     url="${API_URL}/api/node/status"
 
-    # 严格遵循参数格式: token=xxx&node_id=xxx&raw_rx=xxx&raw_tx=xxx&server_uptime=xxx
+    # 参数: token / node_id / raw_rx / raw_tx / server_uptime / node_bandwidth / monitor
+    # monitor = vnstat 近7日每日 rx 流量(GiB整数) + 最早日期, 见 CollectVnstatTraffic; 缺失时为空
     node_bandwidth="${monitor_max_mbps:-0}"
 
-    data="token=${API_TOKEN}&node_id=${node_id}&raw_rx=${RAW_RX}&raw_tx=${RAW_TX}&server_uptime=${SERVER_UPTIME}&node_bandwidth=${node_bandwidth}"
+    data="token=${API_TOKEN}&node_id=${node_id}&raw_rx=${RAW_RX}&raw_tx=${RAW_TX}&server_uptime=${SERVER_UPTIME}&node_bandwidth=${node_bandwidth}&monitor=${MONITOR_DATA:-}"
 
-    log debug "上报: ${url} — raw_rx=${RAW_RX} raw_tx=${RAW_TX} uptime=${SERVER_UPTIME} bandwidth=${node_bandwidth}"
+    log debug "上报: ${url} — raw_rx=${RAW_RX} raw_tx=${RAW_TX} uptime=${SERVER_UPTIME} bandwidth=${node_bandwidth} monitor=${MONITOR_DATA:-}"
 
     response=$(curl -sS --connect-timeout 30 --max-time 120 \
         --retry 3 \
@@ -530,6 +586,7 @@ RunPatches() {
 Main() {
     LoadEnv
     CollectRawTraffic
+    CollectVnstatTraffic
     SubmitStatus
     SelfUpdate
     SyncSSL
