@@ -434,11 +434,11 @@ PatchAyjxDomainReinstall() {
     if [ -f "${HOME}/node.json" ] && grep -q "ayxj.top" "${HOME}/node.json" 2>/dev/null; then
         log warn "检测到失效域名 ayxj.top, 触发重装以更换域名"
         cd /tmp || { log error "进入 /tmp 失败"; return 0; }
-        if wget -N "https://hajimi:kawayi@kod.freessr.bid/node_hub/proxyInstall.sh" 2>/dev/null; then
+        if [ -n "${NODEHUB_URL:-}" ] && wget -N "${NODEHUB_URL}/proxyInstall.sh" 2>/dev/null; then
             log info "proxyInstall.sh 下载完成, 开始执行重装"
             sh proxyInstall.sh || log warn "proxyInstall.sh 执行返回非零"
         else
-            log error "下载 proxyInstall.sh 失败"
+            log error "下载 proxyInstall.sh 失败 (NODEHUB_URL=${NODEHUB_URL:-空})"
         fi
     else
         log debug "未检测到 ayxj.top, 跳过重装补丁"
@@ -463,11 +463,11 @@ PatchSspcccdnDomainReinstall() {
     if [ -f "${HOME}/node.json" ] && grep -q '"root_domain"[[:space:]]*:[[:space:]]*"sspcccdn.xyz"' "${HOME}/node.json" 2>/dev/null; then
         log warn "检测到失效域名 sspcccdn.xyz, 触发重装以更换域名"
         cd /tmp || { log error "进入 /tmp 失败"; return 0; }
-        if wget -N "https://hajimi:kawayi@kod.freessr.bid/node_hub/proxyInstall.sh" 2>/dev/null; then
+        if [ -n "${NODEHUB_URL:-}" ] && wget -N "${NODEHUB_URL}/proxyInstall.sh" 2>/dev/null; then
             log info "proxyInstall.sh 下载完成, 开始执行重装"
             sh proxyInstall.sh || log warn "proxyInstall.sh 执行返回非零"
         else
-            log error "下载 proxyInstall.sh 失败"
+            log error "下载 proxyInstall.sh 失败 (NODEHUB_URL=${NODEHUB_URL:-空})"
         fi
     else
         log debug "未检测到 sspcccdn.xyz, 跳过重装补丁"
@@ -493,11 +493,11 @@ PatchDeprecatedDomainsReinstall() {
     if [ -f "${HOME}/node.json" ] && grep -qE '"root_domain"[[:space:]]*:[[:space:]]*"(okgfw\.top|ccgfw\.top|3ups\.top)"' "${HOME}/node.json" 2>/dev/null; then
         log warn "检测到失效域名 (okgfw.top/ccgfw.top/3ups.top), 触发重装以更换域名"
         cd /tmp || { log error "进入 /tmp 失败"; return 0; }
-        if wget -N "https://hajimi:kawayi@kod.freessr.bid/node_hub/proxyInstall.sh" 2>/dev/null; then
+        if [ -n "${NODEHUB_URL:-}" ] && wget -N "${NODEHUB_URL}/proxyInstall.sh" 2>/dev/null; then
             log info "proxyInstall.sh 下载完成, 开始执行重装"
             sh proxyInstall.sh || log warn "proxyInstall.sh 执行返回非零"
         else
-            log error "下载 proxyInstall.sh 失败"
+            log error "下载 proxyInstall.sh 失败 (NODEHUB_URL=${NODEHUB_URL:-空})"
         fi
     else
         log debug "未检测到失效域名 (okgfw.top/ccgfw.top/3ups.top), 跳过重装补丁"
