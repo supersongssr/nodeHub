@@ -314,13 +314,27 @@ Action_SelfCheck() {
             if command -v openssl >/dev/null 2>&1; then
                 _end=$(openssl x509 -enddate -noout -in "$_pem" 2>/dev/null | cut -d= -f2)
                 if [ -n "$_end" ]; then
-                    _days=$(( ( $(date -d "$_end" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
-                    if [ "$_days" -le 0 ]; then
-                        _CkFail "证书已过期 (到期: ${_end}) → 手动同步: manage.sh ssl"
-                    elif [ "$_days" -le 7 ]; then
-                        _CkWarn "证书即将过期, 剩余 ${_days} 天 (到期: ${_end})"
+                    # 计算剩余天数; "date -d '<enddate>'" 仅 GNU date 支持
+                    # (busybox/BSD date 不支持, 旧实现解析失败 → _days 变负 → 误报已过期)
+                    # 解析失败时回退 openssl -checkend 做跨平台判定
+                    _days=""
+                    if _end_secs=$(date -d "$_end" +%s 2>/dev/null) && [ -n "$_end_secs" ]; then
+                        case "$_end_secs" in *[!0-9]*) ;; *) _days=$(( ( _end_secs - $(date +%s) ) / 86400 )) ;; esac
+                    fi
+                    if [ -n "$_days" ]; then
+                        if [ "$_days" -le 0 ]; then
+                            _CkFail "证书已过期 (到期: ${_end}) → 手动同步: manage.sh ssl"
+                        elif [ "$_days" -le 7 ]; then
+                            _CkWarn "证书即将过期, 剩余 ${_days} 天 (到期: ${_end})"
+                        else
+                            _CkOK "证书剩余 ${_days} 天 (到期: ${_end})"
+                        fi
+                    elif openssl x509 -checkend 604800 -noout -in "$_pem" 2>/dev/null; then
+                        _CkOK "证书剩余 >7 天 (到期: ${_end})"
+                    elif openssl x509 -checkend 0 -noout -in "$_pem" 2>/dev/null; then
+                        _CkWarn "证书即将过期, 剩余不足 7 天 (到期: ${_end}) → manage.sh ssl"
                     else
-                        _CkOK "证书剩余 ${_days} 天 (到期: ${_end})"
+                        _CkFail "证书已过期或校验失败 (到期: ${_end}) → 手动同步: manage.sh ssl"
                     fi
                 fi
             fi

@@ -1601,8 +1601,14 @@ Step3_InstallNginx_Panel() {
     log info "面板传输模式: ${_PANEL_TRANSPORT} (由 v2_name 判定)"
 
     # 2. vision 模式: xray 直接监听 node_port, 不需要 nginx
-    #    node_port=443 的冲突已在 DetectPanel() 预检中拦截, 走到这里 node_port 必为非 443
+    #    node_port=443 与面板冲突有两道防线:
+    #      (1) DetectPanel() 预检 — 拦截 LoadEnv 解析出的 node_port=443
+    #      (2) 此处补检 — Step1_Register 会用面板回传值覆盖 node_port
+    #          (重装场景: 面板侧仍存有旧 node_port=443), 此时 (1) 已放行, 必须在此拦截
     if [ "${_PANEL_TRANSPORT}" = "vision" ]; then
+        if [ "${node_port}" = "443" ]; then
+            die "vision+面板: node_port=443 与面板自身 443 冲突 (Step1_Register 回传了 node_port=443?)。请在 ~/.env 设置 NODE_PORT=<非443>(如 2053) 后重跑。"
+        fi
         log info "vision 模式: xray 直接监听 ${node_port}, 不需要 nginx 配置"
         return 0
     fi
