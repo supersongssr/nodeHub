@@ -82,17 +82,33 @@ Init() {
 SyncGeoData() {
     Log "=== 更新 GeoData ==="
     GEO_DIR="${NODEHUB_DIR}/geodat"
+    _ok=1
 
-    wget -N -q -T 120 -P "$GEO_DIR" \
-        "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat" \
-        && mv -f "${GEO_DIR}/dlc.dat" "${GEO_DIR}/geosite.dat" \
-        || Log "geosite 下载失败"
+    # geosite: 保留 dlc.dat 作为 wget -N 时间戳锚点。
+    #   旧实现 `wget ... && mv dlc.dat geosite.dat` 会让本地 dlc.dat 每次消失,
+    #   下次 wget -N 无本地文件可比对 → 每次全量重下。
+    #   改为下载后 cp 出 geosite.dat, dlc.dat 常驻, wget -N 时间戳判定才生效。
+    #   同时把 wget 与 cp 的失败分开记录, 不再把复制失败误报为“下载失败”。
+    if wget -N -q -T 120 -P "$GEO_DIR" \
+            "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat"; then
+        cp -f "${GEO_DIR}/dlc.dat" "${GEO_DIR}/geosite.dat" \
+            || { Log "geosite: 复制 dlc.dat → geosite.dat 失败"; _ok=0; }
+    else
+        Log "geosite 下载失败"; _ok=0
+    fi
 
-    wget -N -q -T 120 -P "$GEO_DIR" \
-        "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat" \
-        || Log "geoip 下载失败"
+    # geoip: 直接 -P 保存为 geoip.dat, 文件常驻 → wget -N 时间戳判定生效
+    if ! wget -N -q -T 120 -P "$GEO_DIR" \
+            "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"; then
+        Log "geoip 下载失败"; _ok=0
+    fi
 
-    Log "GeoData 更新完成"
+    # 按各子步骤成败汇总输出, 不再无脑打印“更新完成”
+    if [ "$_ok" -eq 1 ]; then
+        Log "GeoData 更新完成"
+    else
+        Log "GeoData 更新流程结束 (部分失败, 见上方日志)"
+    fi
 }
 
 # ============================================================
