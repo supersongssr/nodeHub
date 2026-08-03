@@ -206,9 +206,11 @@ CollectRawTraffic() {
 # vnstat 7日流量历史采集 — 整合为字符串, 经 monitor= 参数上报
 # 格式: v1,v2,v3,v4,v5,v6,v7,M-D
 #   * v1..v7 = 近→远 7 天每日「下行接收 rx」, 单位 GiB(整数, 四舍五入); 今天(v1)在最前
-#   * M-D    = 第 7 个值(最早那天) 的日期, 不带年份 (如 7-11)
-#     前端据此反推: 第7个值=M-D, 第i个值 = M-D + (7-i) 天, 第1个值(今天) = M-D + 6 天
-#   * 数据不足 7 天 → 后置补 0 (对应更早的、无数据的天)
+#   * 某日无 vnstat 数据 (停机/未采集/装机未满7天) → 该位置写 "-" (空符号, 不是 0)
+#   * M-D    = 今天 (第 1 个值) 的日期, 不带年份, 无前导零 (如 8-3)
+#     前端据此反推: 第1个值(今天)=M-D, 第i个值 = M-D - (i-1) 天, 第7个值 = M-D - 6 天
+#   * 窗口以「系统今天」为锚点 (jq now + localtime), 而非 vnstat 数组尾部:
+#     vnstat 滞后/停机时, 缺失的近期日子显示 "-", 不再被伪装成数值或错位日期
 #   * vnstat / jq 缺失 或 解析失败 → MONITOR_DATA 留空, 面板按"无历史"处理, 不阻断上报
 # 依赖: vnstat + jq (jq 为 proxyInstall 基线依赖; vnstat 非基线, 缺失则静默跳过)
 # ============================================================
@@ -221,37 +223,34 @@ CollectVnstatTraffic() {
     _vjson=$(vnstat --json d 2>/dev/null) || { log warn "vnstat --json d 执行失败"; return 0; }
     [ -n "$_vjson" ] || { log warn "vnstat 返回空数据, 跳过"; return 0; }
 
-    # 第 1 行: 7 日 rx 流量(近→远, GiB 整数, 逗号分隔)
-    # 第 2 行: 窗口最早日期 (vnstat 满 7 天时由其给出; 否则为空, 下方用系统时间兜底)
+    # 第 1 行: 近 7 日 rx 流量(近→远, GiB 整数, 逗号分隔); 某日无 vnstat 数据 → "-"
+    # 第 2 行: 今天日期 (M-D, 不带年份, 无前导零)
     # 单位: GiB (二进制, /1024/1024/1024); 仅取 rx; 四舍五入取整 (jq round)
+    # 窗口锚点 = 系统今天 (range + now + localtime), 不是 vnstat 数组尾部:
+    #   逐日把 vnstat 的 rx 映射到 [今天, -1, ..., -6] 这 7 个日历日, 缺失即 "-"。
+    #   这样 vnstat 滞后/停机时, 近期缺失日显示 "-", 不再错位成数值或假日期。
     _parsed=$(printf '%s' "$_vjson" | jq -r '
-        [.interfaces[0].traffic.day[]] as $days
-        | ($days | length) as $n
-        | ($days[-7:] | reverse) as $rev
+        ([range(0;7) | ((now|floor) - . * 86400) | localtime]) as $bdt
+        | ($bdt | map("\(.[0])-\(.[1]+1)-\(.[2])")) as $keys
+        | (reduce .interfaces[0].traffic.day[] as $d
+            ({}; .["\($d.date.year)-\($d.date.month)-\($d.date.day)"] = $d.rx)) as $lookup
         | [
-            ($rev | map((.rx / 1073741824 | round | tostring)) | join(",")),
-            (if $n >= 7 then "\($rev[-1].date.month)-\($rev[-1].date.day)" else "" end)
+            ($keys | map(($lookup[.] // null)
+                         | if . == null then "-" else ((. / 1073741824) | round | tostring) end)
+                   | join(",")),
+            "\($bdt[0][1]+1)-\($bdt[0][2])"
           ]
         | .[0], .[1]
-    ' 2>/dev/null) || { log warn "vnstat JSON 解析失败"; return 0; }
+    ' 2>/dev/null) || { log warn "vnstat 7日流量解析失败"; return 0; }
 
     _values=$(printf '%s\n' "$_parsed" | sed -n '1p')
     _vdate=$(printf '%s\n' "$_parsed" | sed -n '2p')
 
-    # 空值兜底 + 不足 7 个 → 后置补 0
-    [ -n "$_values" ] || _values="0"
-    _count=$(printf '%s' "$_values" | awk -F',' '{print NF}')
-    while [ "${_count:-0}" -lt 7 ]; do
-        _values="${_values},0"
-        _count=$((_count + 1))
-    done
-
-    # 日期标签: vnstat 不足 7 天时为空 → 用系统时间 today-6 兜底, 保证 7 天窗口对齐
-    if [ -z "$_vdate" ]; then
-        _vdate=$(date -d '6 days ago' '+%-m-%-d' 2>/dev/null || true)
+    # jq 成功即保证: 第1行恒为 7 项(数值或 "-"), 第2行恒为今天的 M-D
+    if [ -z "$_values" ] || [ -z "$_vdate" ]; then
+        log warn "vnstat 7日流量解析结果为空"
+        return 0
     fi
-    # 仍为空 (BusyBox date 不支持 -d 偏移) → 退取今天, 避免末尾悬空逗号
-    [ -n "$_vdate" ] || _vdate=$(date '+%-m-%d' 2>/dev/null || echo "0-0")
 
     MONITOR_DATA="${_values},${_vdate}"
     log debug "vnstat 7日流量已采集 — ${MONITOR_DATA}"
@@ -264,7 +263,7 @@ SubmitStatus() {
     url="${API_URL}/api/node/status"
 
     # 参数: token / node_id / raw_rx / raw_tx / server_uptime / node_bandwidth / monitor
-    # monitor = vnstat 近7日每日 rx 流量(GiB整数) + 最早日期, 见 CollectVnstatTraffic; 缺失时为空
+    # monitor = vnstat 近7日每日 rx 流量(GiB整数, 缺日为 "-") + 今天日期, 见 CollectVnstatTraffic; 缺失时为空
     node_bandwidth="${monitor_max_mbps:-0}"
 
     data="token=${API_TOKEN}&node_id=${node_id}&raw_rx=${RAW_RX}&raw_tx=${RAW_TX}&server_uptime=${SERVER_UPTIME}&node_bandwidth=${node_bandwidth}&monitor=${MONITOR_DATA:-}"
