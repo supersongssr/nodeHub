@@ -581,7 +581,7 @@ PatchDeprecatedDomainsReinstall() {
 # ============================================================
 PatchFixTrafficResetDayAndUsed() {
     # 1) 仅运行一次 — 标记文件存在则跳过; 先落标记防重入
-    _marker="${HOME}/nodeAgent.fix-traffic-reset-used2.patch.done"
+    _marker="${HOME}/nodeAgent.fix-traffic-reset-used3.patch.done"
     [ -f "$_marker" ] && return 0
     : > "$_marker"
 

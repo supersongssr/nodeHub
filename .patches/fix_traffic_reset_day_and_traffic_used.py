@@ -50,6 +50,15 @@ import sys
 import urllib.error
 import urllib.request
 
+# 最小化/容器环境 locale 常为 C/POSIX, Python stdout 默认 latin-1 会致
+# UnicodeEncodeError (中文/emoji 无法输出). 强制 stdout/stderr 用 UTF-8,
+# 不依赖系统 LANG. (reconfigure 仅 Python 3.7+ 可用)
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 HOME = os.path.expanduser("~")
 # ~/.env (全大写, 人工配置) + ~/node.env (全小写, 脚本生成); node.env 覆盖 .env 同名键
 ENV_FILES = [os.path.join(HOME, ".env"), os.path.join(HOME, "node.env")]
