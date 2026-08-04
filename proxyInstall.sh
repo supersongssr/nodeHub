@@ -27,7 +27,7 @@ _SCRIPT_NAME="${0##*/}"
 #   * 兼容旧版 .env: 未配置 TELEGRAM_BOT_TOKEN / TG_BOT_TOKEN 则静默跳过
 #   * 变量优先级: TELEGRAM_BOT_TOKEN > TG_BOT_TOKEN (chat 同理)
 # ============================================================
-TG_NOTIFY_LEVEL="${TG_NOTIFY_LEVEL:-error}"
+TG_NOTIFY_LEVEL="${TG_NOTIFY_LEVEL:-warn}"
 _TG_THROTTLE_SEC="${TG_NOTIFY_THROTTLE:-15}"
 
 # 日志等级 → 数值 (便于阈值比较)
@@ -52,15 +52,18 @@ _TgNodeIp() {
     echo "$_cand"
 }
 
+# 用法: NotifyTG <level> <message>   (level 用于按等级独立节流, 避免 warn 刷屏吞掉后续 error)
 NotifyTG() {
+    _tg_level="$1"
+    _tg_text="$2"
     _tg_token="${TELEGRAM_BOT_TOKEN:-${TG_BOT_TOKEN:-}}"
     _tg_chat="${TELEGRAM_CHAT_ID:-${TG_CHAT_ID:-}}"
     # 未配置则静默跳过, 不影响主流程
-    [ -z "$_tg_token" ] || [ -z "$_tg_chat" ] && return 0
+    { [ -z "$_tg_token" ] || [ -z "$_tg_chat" ]; } && return 0
 
-    # 节流: 标记文件记录上次推送 epoch, 窗口内跳过
+    # 节流: 按等级独立标记文件, 避免 warn 刷屏吞掉同窗口内的 error
     if [ "${_TG_THROTTLE_SEC:-0}" -gt 0 ] 2>/dev/null; then
-        _tg_marker="${TMPDIR:-/tmp}/${_SCRIPT_NAME}.tg.throttle"
+        _tg_marker="${TMPDIR:-/tmp}/${_SCRIPT_NAME}.tg.${_tg_level}.throttle"
         _now=$(date +%s)
         _last=$(cat "$_tg_marker" 2>/dev/null || echo 0)
         [ $((_now - _last)) -lt "${_TG_THROTTLE_SEC}" ] && return 0
@@ -69,7 +72,7 @@ NotifyTG() {
 
     curl -sS --connect-timeout 5 --max-time 15 \
         --data-urlencode "chat_id=${_tg_chat}" \
-        --data-urlencode "text=$1" \
+        --data-urlencode "text=${_tg_text}" \
         "https://api.telegram.org/bot${_tg_token}/sendMessage" >/dev/null 2>&1 || true
 }
 
@@ -97,7 +100,7 @@ log() {
 
     # 收敛入口: 等级达标 → 推送 (含 IP / 脚本路径 / 节点ID / 消息)
     if [ "$(_LogLevelNum "$_level")" -ge "$(_LogLevelNum "${TG_NOTIFY_LEVEL:-error}")" ]; then
-        NotifyTG "🚨 [NodeHub] ${_SCRIPT_NAME}
+        NotifyTG "${_level}" "🚨 [NodeHub] ${_SCRIPT_NAME}
 节点ID: ${node_id:-${NODE_ID:-N/A}}
 IP: $(_TgNodeIp)
 脚本: ${_SCRIPT_PATH}
@@ -300,7 +303,7 @@ LoadEnv() {
     [ -z "${NODE_COST:-}" ]             && _missing="${_missing}  NODE_COST             — 节点月成本\n"
     [ -z "${API_PANEL:-}" ]             && _missing="${_missing}  API_PANEL             — 面板类型 (ssp 或 srp)\n"
     if [ -n "$_missing" ]; then
-        die "以下必需环境变量未设置，请在 ~/.env 中配置:\n$_missing"
+        die "$(printf '%b' "以下必需环境变量未设置，请在 ~/.env 中配置:\n${_missing}")"
     fi
 
     # API_PANEL 校验
