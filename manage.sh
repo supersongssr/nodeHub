@@ -582,12 +582,27 @@ Action_SyncSSL() {
         info "nginx 未安装/未管理, 跳过"
     fi
 
+    # xray (Xray-core) 不支持 SIGHUP 热重载 —— 收到 SIGHUP 会直接退出 (与 nginx 不同)。
+    # 旧 xray.service 曾配置 ExecReload=/bin/kill -HUP, `systemctl reload xray` 会把 xray
+    # 杀死; 而 reload 退出码恒为 0 (systemd 只看 kill 命令是否执行成功), 旧 "reload 失败
+    # 回退 restart" 判断永不触发 (死代码) → 静默停机。新 service 已无 ExecReload, reload 会
+    # 直接报错。两种情况下 reload 都不可用, 统一改用 restart + is-active 健康校验。
+    # 秒级断连可接受 (证书每天才更新一次)。
     if SvcExists xray; then
-        if systemctl reload xray 2>/dev/null; then
-            ok "xray 已 reload (热重载)"
+        if systemctl restart xray 2>/dev/null; then
+            # restart 后轮询最多 5s 等 active (is-active 偶有滞后)
+            _ssl_xi=0
+            while [ "$_ssl_xi" -lt 5 ]; do
+                sleep 1; _ssl_xi=$((_ssl_xi + 1))
+                SvcActive xray && break
+            done
+            if SvcActive xray; then
+                ok "xray 已 restart 并通过健康校验 (active)"
+            else
+                fail "xray restart 后 is-active 非 active — 请检查 config.json / 证书"
+            fi
         else
-            warn "xray reload 失败, 回退 restart"
-            if systemctl restart xray 2>/dev/null; then ok "xray 已 restart"; else fail "xray restart 失败"; fi
+            fail "xray restart 失败 — 请检查 xray.service / config.json / 证书格式"
         fi
     fi
 

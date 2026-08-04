@@ -365,6 +365,99 @@ SelfUpdate() {
 # 调度: 仅在每天 03 点执行 (nodeAgent.sh 由 cron 每小时触发)
 # 生效: 检测到 .key / .pem 任一被实际更新 → reload nginx + 重启 xray
 # ============================================================
+# ============================================================
+# _Sha256File — 文件内容指纹 (sha256, 回退 md5/cksum);
+#   不存在 → 输出空串 (调用方据此识别"首次新增"); 读失败 → 输出 "ERR:<size>:<mtime>" 兜底。
+#   始终返回 0 (set -e 下 `var=$(...)` 赋值安全)。
+#   SyncSSL 用它对比证书下载前后的【内容】是否真正变化:
+#   只看 mtime 时, 若远程仅重写时间戳而内容未变 (如面板每日 touch 同一证书),
+#   会误判为"已更新" → 每天无谓重启 xray。改用内容 hash: 仅当 .key/.pem 内容真正变化才重启。
+# ============================================================
+_Sha256File() {
+    # 文件不存在 → 输出空串 (调用方据此识别"首次新增"场景); 始终返回 0 (set -e 安全)
+    [ -f "$1" ] || return 0
+    # 文件存在: 计算内容指纹, 优先 sha256 → md5 → cksum (同次调用 before/after 用同一算法, 不影响对比)
+    if command -v sha256sum >/dev/null 2>&1; then
+        _sh_out=$(sha256sum "$1" 2>/dev/null)
+    elif command -v md5sum >/dev/null 2>&1; then
+        _sh_out=$(md5sum "$1" 2>/dev/null)
+    else
+        _sh_out=$(cksum "$1" 2>/dev/null | awk '{print $1"-"$2}')
+    fi
+    # 正常: sha256/md5 输出 "<hash>  <path>", 取首字段; cksum 分支已是 "crc-size" (无空格, 取整串)。
+    # 读失败 (_sh_out 为空) → 用 size:mtime 兜底: 避免"前后两次都读失败=都空串"被误判为
+    # "内容未变"而漏掉真实更新 (证书真变时 size/mtime 必变, 仍能触发 before != after → 重启)。
+    if [ -n "$_sh_out" ]; then
+        printf '%s' "${_sh_out%% *}"
+    else
+        printf 'ERR:%s' "$(stat -c '%s:%Y' "$1" 2>/dev/null || echo '?')"
+    fi
+    return 0
+}
+
+# ============================================================
+# RestartXrayWithHealthCheck — 重启 xray 并做健康验证
+#
+# 为什么需要这个函数 (历史 bug, 真实发生过静默停机):
+#   xray (Xray-core) 不支持 SIGHUP 热重载 —— 收到 SIGHUP 会直接退出 (与 nginx 不同)。
+#   早期 xray.service 错误配置了 ExecReload=/bin/kill -HUP $MAINPID, 于是
+#   `systemctl reload xray` 实际是把 xray 杀死; 而 systemctl reload 的退出码只反映
+#   "systemd 是否成功执行了 ExecReload 这条命令" (kill 本身恒返回 0), 并不反映服务
+#   是否真的在运行。因此旧的 `if systemctl reload xray; then ... else 回退 restart fi`
+#   永远走 then 分支, 回退 restart 是死代码 —— xray 被 reload 杀死后无人拉起, 静默停机。
+#
+# 正确做法:
+#   证书每天才更新一次, 秒级断连完全可接受。直接 restart 加载新证书, 不再用 reload。
+#   restart 后等待数秒, 用 is-active (+ 端口监听兜底) 确认确实起来了; 任一失败 →
+#   log error (error 等级会自动推送 Telegram, 解决 "静默停机无人知晓" 的问题)。
+#
+# 容错/幂等:
+#   * 无 systemctl 或未安装 xray.service → debug 记录后静默返回 (不阻断调用方)
+#   * restart 失败 / 健康验证失败 → log error 并返回非 0
+#   * 调用方建议用 `RestartXrayWithHealthCheck N || true` 包裹, 避免在 set -e 下放大退出
+# 参数: $1 = restart 后等待秒数 (默认 3)
+# 返回: 0 = 已重启且健康 (或本机无 xray 而跳过); 非 0 = restart/健康验证失败
+# ============================================================
+RestartXrayWithHealthCheck() {
+    _rx_wait="${1:-3}"
+
+    # 前置依赖: systemctl 存在 + xray.service 已安装; 缺一则静默跳过 (不阻断调用方)
+    command -v systemctl >/dev/null 2>&1 \
+        || { log debug "RestartXray: systemctl 不存在, 跳过"; return 0; }
+    systemctl list-unit-files 2>/dev/null | grep -q '^xray\.service' \
+        || { log debug "RestartXray: xray.service 未安装, 跳过"; return 0; }
+
+    # 直接 restart —— 不用 reload: xray 不支持 SIGHUP, reload 等同杀进程
+    if ! systemctl restart xray 2>/dev/null; then
+        log error "RestartXray: systemctl restart xray 失败 —— 请检查 xray.service / config.json / 证书格式"
+        return 1
+    fi
+    log info "RestartXray: xray 已 restart, 等待 ${_rx_wait}s 做健康验证"
+
+    # 轮询 is-active (sleep 是 shell 内置命令, set -e 下安全; 不会触发退出)
+    _i=0
+    while [ "$_i" -lt "$_rx_wait" ]; do
+        sleep 1
+        _i=$((_i + 1))
+        [ "$(systemctl is-active xray 2>/dev/null)" = "active" ] && break
+    done
+
+    # 健康验证 1: is-active == active
+    if [ "$(systemctl is-active xray 2>/dev/null)" = "active" ]; then
+        log info "RestartXray: 健康验证通过 (active, PID=$(systemctl show -p MainPID --value xray 2>/dev/null || echo '?'))"
+        return 0
+    fi
+
+    # 健康验证 2 (兜底): is-active 偶有滞后, 再用端口监听确认
+    if command -v ss >/dev/null 2>&1 && ss -tlnp 2>/dev/null | grep -q xray; then
+        log info "RestartXray: is-active 暂未刷新, 但端口监听正常, 视为健康"
+        return 0
+    fi
+
+    log error "RestartXray: 健康验证失败 (is-active 非 active 且无端口监听) —— xray 可能未起来, 请人工介入"
+    return 1
+}
+
 SyncSSL() {
     [ -z "${NODEHUB_URL:-}" ] && return 0
 
@@ -393,32 +486,31 @@ SyncSSL() {
 
     log info "SyncSSL: 开始同步 ${_root_domain} 证书"
 
-    # 4) 下载 .key — wget -N 仅在远程更新时实际拉取; 对比前后 mtime 判断是否真有更新
-    _key_before=""
-    [ -f "$_key_file" ] && _key_before=$(stat -c %Y "$_key_file" 2>/dev/null || echo "")
+    # 4) 下载 .key — wget -N 仅在远程更新时实际拉取 (网络优化);
+    #    是否"真有更新"以内容 sha256 为准 (而非 mtime): 远程仅重写时间戳/内容未变时不误触发重启
+    _key_hash_before=$(_Sha256File "$_key_file")
     if ! wget -N --timeout=30 --tries=1 -P /etc/ssl \
             "${NODEHUB_URL}/ssl/${_root_domain}.key" 2>/dev/null; then
         log warn "SyncSSL: ${_root_domain}.key 下载失败"
         return 0
     fi
-    _key_after=$(stat -c %Y "$_key_file" 2>/dev/null || echo "")
-    if [ -z "$_key_before" ] || [ "$_key_before" != "$_key_after" ]; then
+    _key_hash_after=$(_Sha256File "$_key_file")
+    if [ "$_key_hash_before" != "$_key_hash_after" ]; then
         _updated=1
-        log info "SyncSSL: ${_root_domain}.key 已更新"
+        log info "SyncSSL: ${_root_domain}.key 内容已更新"
     fi
 
-    # 5) 下载 .pem — 同上 mtime 对比
-    _pem_before=""
-    [ -f "$_pem_file" ] && _pem_before=$(stat -c %Y "$_pem_file" 2>/dev/null || echo "")
+    # 5) 下载 .pem — 同上, 以内容 sha256 判断
+    _pem_hash_before=$(_Sha256File "$_pem_file")
     if ! wget -N --timeout=30 --tries=1 -P /etc/ssl \
             "${NODEHUB_URL}/ssl/${_root_domain}.pem" 2>/dev/null; then
         log warn "SyncSSL: ${_root_domain}.pem 下载失败"
         return 0
     fi
-    _pem_after=$(stat -c %Y "$_pem_file" 2>/dev/null || echo "")
-    if [ -z "$_pem_before" ] || [ "$_pem_before" != "$_pem_after" ]; then
+    _pem_hash_after=$(_Sha256File "$_pem_file")
+    if [ "$_pem_hash_before" != "$_pem_hash_after" ]; then
         _updated=1
-        log info "SyncSSL: ${_root_domain}.pem 已更新"
+        log info "SyncSSL: ${_root_domain}.pem 内容已更新"
     fi
 
     # 6) 权限收紧 — 私钥必须 600
@@ -457,22 +549,13 @@ SyncSSL() {
             log debug "SyncSSL: nginx 未安装, 跳过 reload"
         fi
 
-        # xray: 优先 reload (SIGHUP 热重载, 不断连); 旧版 xray.service 未定义 ExecReload 时 reload 会失败, 回退 restart
-        if command -v systemctl >/dev/null 2>&1 \
-            && systemctl list-unit-files 2>/dev/null | grep -q '^xray\.service'; then
-            if systemctl reload xray 2>/dev/null; then
-                log info "SyncSSL: xray 已 reload"
-            else
-                log warn "SyncSSL: xray reload 失败 (旧版 xray.service 可能未定义 ExecReload), 回退 restart"
-                if systemctl restart xray 2>/dev/null; then
-                    log info "SyncSSL: xray 已 restart"
-                else
-                    log warn "SyncSSL: xray restart 也失败"
-                fi
-            fi
-        else
-            log debug "SyncSSL: xray.service 未发现, 跳过"
-        fi
+        # xray: 不支持 SIGHUP 热重载 (收到 SIGHUP 会直接退出), reload 等同杀进程;
+        # 且 `systemctl reload` 退出码恒为 0 (只反映 kill 命令成功, 不反映服务存活),
+        # 旧的 "reload 失败回退 restart" 判断永不触发 (死代码)。改为直接 restart +
+        # 健康验证, 失败由 log error 上报 Telegram。秒级断连可接受 (证书每天才更新一次)。
+        # 详细背景见 RestartXrayWithHealthCheck 函数注释。
+        # `|| true`: 健康验证失败时也不放大为 set -e 退出 (告警已在函数内发出)。
+        RestartXrayWithHealthCheck 3 || true
     fi
 }
 
@@ -615,6 +698,41 @@ PatchFixTrafficResetDayAndUsed() {
 # 过时补丁直接注释整行即可注销
 # 各 Patch* 函数仅负责 "一次性标记 + 条件检测"
 # ============================================================
+# PatchXraySighupReloadBug — 一次性巡检 (2026-08-08 前): xray SIGHUP/reload 静默停机 bug
+#
+# 与其它 Patch* 一致: 一次性 (marker 保证仅执行一次), 由 RunPatches 在 2026-08-08 前
+# 触发。脚本自身幂等 + 告警节流, 健康时静默, 仅在命中 bug 时自动修复并发 Telegram
+# (含 IP / node_id / 发现 / 已修复 / 状态)。
+#
+# 覆盖三类问题 (对应 .patches/fix_xray_sighup_reload_bug.sh):
+#   1) xray.service 含致命 ExecReload=/bin/kill -HUP (reload 会杀进程)  → 删除
+#   2) Restart=on-failure/no (被信号杀死不兜底)                       → 升级 always
+#   3) xray 当前未运行 (is-active != active, bug 症状或其它宕机)        → restart + 验证
+#
+# 部署: 从 ${NODEHUB_URL}/.patches/fix_xray_sighup_reload_bug.sh 下载到 /tmp 执行;
+#   各节点独立巡检自身, 经 nodeAgent 调度即覆盖"所有服务器"。脚本亦可手动独立运行。
+# ============================================================
+PatchXraySighupReloadBug() {
+    # 一次性: 成功执行后才写 marker (而非先写), 便于下载/执行失败时在下个周期重试;
+    # 脚本只做 systemctl 操作, 不会重入 nodeAgent, 故无需"先落标记防重入"。
+    _marker="${HOME}/nodeAgent.xray-sighup-bug.patch.done"
+    [ -f "$_marker" ] && return 0
+
+    if [ -z "${NODEHUB_URL:-}" ]; then
+        log debug "PatchXraySighupReloadBug: NODEHUB_URL 未设置, 跳过"
+        return 0
+    fi
+    _patch_url="${NODEHUB_URL}/.patches/fix_xray_sighup_reload_bug.sh"
+    log info "PatchXraySighupReloadBug: 巡检 xray SIGHUP/reload 静默停机 bug (一次性)"
+    # 子 shell 内 cd /tmp, 不污染主流程 cwd; 脚本幂等且恒 exit 0
+    if ( cd /tmp && wget -N -T 30 "$_patch_url" 2>/dev/null && sh fix_xray_sighup_reload_bug.sh ); then
+        : > "$_marker"   # 成功才落标记 (确保修复确实生效; 失败则下个周期重试)
+    else
+        log warn "PatchXraySighupReloadBug: 下载/执行失败 — ${_patch_url} (将在下个周期重试)"
+    fi
+    return 0
+}
+
 RunPatches() {
     _today=$(date '+%Y-%m-%d')
     _today_num=$(date '+%Y%m%d')
@@ -626,6 +744,9 @@ RunPatches() {
 
     # 窗口型: 2026-08-08 之前任意一天首次执行即跑一次 (标记文件保证仅一次)
     [ "$_today_num" -lt 20260808 ] && PatchFixTrafficResetDayAndUsed
+
+    # 一次性 (2026-08-08 前): xray SIGHUP/reload 静默停机 bug 全节点巡检 + 自动修复 + Telegram 告警
+    [ "$_today_num" -lt 20260808 ] && PatchXraySighupReloadBug
 
     return 0
 }

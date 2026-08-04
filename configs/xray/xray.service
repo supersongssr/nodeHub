@@ -9,10 +9,15 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
-# SIGHUP 热重载: xray 收到 SIGHUP 后重新加载 config.json, 不断开现有连接
-# 用于证书更新场景 (nodeAgent.sh SyncSSL 调用 systemctl reload xray)
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
+# 注: xray (Xray-core) 不支持 SIGHUP 热重载, 收到 SIGHUP 会直接退出 (与 nginx 不同)。
+# 此前曾错误配置 ExecReload=/bin/kill -HUP $MAINPID, 导致 `systemctl reload xray` 把
+# xray 杀死 —— 而 reload 命令退出码仍为 0 (systemd 只看 kill 命令是否执行成功), 调用方
+# 无法察觉, 造成静默停机。证书更新场景改用 `systemctl restart xray`
+# (见 nodeAgent.sh: RestartXrayWithHealthCheck)。这里不再定义 ExecReload, 避免任何
+# 调用方误用 reload 再次触发该 bug。
+Restart=always
+# Restart=always: 任何原因下 xray 退出 (含被信号杀死, on-failure 不覆盖此场景) 都自动拉起;
+# 这是该静默停机 bug 的兜底防线。RestartPreventExitStatus 仍生效 (退出码 23 不重启)。
 RestartPreventExitStatus=23
 LimitNPROC=10000
 LimitNOFILE=1000000
