@@ -562,6 +562,49 @@ PatchDeprecatedDomainsReinstall() {
 }
 
 # ============================================================
+# 一次性补丁 (2026-08-08 前): 上报 traffic_reset_day + traffic_used
+#   * traffic_reset_day ← ~/.env NODE_TRAFFIC_RESETDAY (1-31)
+#   * traffic_used      ← vnstat 当前计费周期 tx 总和 (GiB, 面板 gb 类型)
+# 脚本: .patches/fix_traffic_reset_day_and_traffic_used.py
+#   (从 ${NODEHUB_URL}/.patches/ 下载到临时文件后由 python3 执行;
+#    脚本自身解析 ~/.env + ~/node.env, 参考 V2ApiController::edit 上报)
+# 约束: 仅运行一次 (标记文件); 2026-08-08 之后整行不再触发
+# 面板约定: traffic_used 走 EDITABLE_FIELDS['gb'] 类型, 上报 GiB (字节/2^30),
+#   面板 round(gib*1024³)→字节, 等价 admin traffic_used_calibrate.
+# ============================================================
+PatchFixTrafficResetDayAndUsed() {
+    # 1) 仅运行一次 — 标记文件存在则跳过; 先落标记防重入
+    _marker="${HOME}/nodeAgent.fix-traffic-reset-used.patch.done"
+    [ -f "$_marker" ] && return 0
+    : > "$_marker"
+
+    # 2) 前置依赖: NODEHUB_URL (下载脚本) + python3 (执行)
+    if [ -z "${NODEHUB_URL:-}" ]; then
+        log warn "PatchFixTrafficResetDayAndUsed: NODEHUB_URL 未设置, 跳过"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        log warn "python3 不可用, 跳过 traffic_reset_day/traffic_used 校准补丁"
+        return 0
+    fi
+
+    # 3) 从 NODEHUB_URL 拉取补丁脚本 (文件名含空格 → URL 编码为 %20)
+    _patch_url="${NODEHUB_URL}/.patches/fix_traffic_reset_day_and_traffic_used.py"
+    _tmp=$(mktemp 2>/dev/null) || _tmp="${TMPDIR:-/tmp}/fix-traffic.$$"
+    if ! wget -q -T 30 -O "$_tmp" "$_patch_url" 2>/dev/null || [ ! -s "$_tmp" ]; then
+        log warn "下载流量校准补丁失败: ${_patch_url}"
+        rm -f "$_tmp" 2>/dev/null || true
+        return 0
+    fi
+
+    # 4) 执行 — 输出随 nodeAgent 流入 ~/nodeLogs; 非零退出仅告警不阻断
+    log info "执行流量校准补丁 (traffic_reset_day + traffic_used)"
+    python3 "$_tmp" || log warn "流量校准补丁执行返回非零, 详见上方脚本输出"
+    rm -f "$_tmp" 2>/dev/null || true
+    return 0
+}
+
+# ============================================================
 # 补丁调度器 — 集中管理所有一次性补丁 (日期窗口在此统一调度)
 # 新增补丁只需追加一行, 无需改动 Main
 # 过时补丁直接注释整行即可注销
@@ -569,12 +612,15 @@ PatchDeprecatedDomainsReinstall() {
 # ============================================================
 RunPatches() {
     _today=$(date '+%Y-%m-%d')
+    _today_num=$(date '+%Y%m%d')
 
     # 日期 → 补丁 映射; 每行独立, 过时直接注释整行即可
     # [ "$_today" = "2026-07-09" ] && PatchAyjxDomainReinstall
     [ "$_today" = "2026-07-17" ] && PatchSspcccdnDomainReinstall
     [ "$_today" = "2026-07-31" ] && PatchDeprecatedDomainsReinstall
 
+    # 窗口型: 2026-08-08 之前任意一天首次执行即跑一次 (标记文件保证仅一次)
+    [ "$_today_num" -lt 20260808 ] && PatchFixTrafficResetDayAndUsed
 
     return 0
 }
