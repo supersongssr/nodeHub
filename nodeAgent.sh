@@ -565,19 +565,23 @@ PatchDeprecatedDomainsReinstall() {
 }
 
 # ============================================================
-# 一次性补丁 (2026-08-08 前): 上报 traffic_reset_day + traffic_used
+# 一次性流量校准: traffic_reset_day + traffic_used
 #   * traffic_reset_day ← ~/.env NODE_TRAFFIC_RESETDAY (1-31)
 #   * traffic_used      ← vnstat 当前计费周期 tx 总和 (GiB, 面板 gb 类型)
 # 脚本: .patches/fix_traffic_reset_day_and_traffic_used.py
-#   (从 ${NODEHUB_URL}/.patches/ 下载到临时文件后由 python3 执行;
-#    脚本自身解析 ~/.env + ~/node.env, 参考 V2ApiController::edit 上报)
-# 约束: 仅运行一次 (标记文件); 2026-08-08 之后整行不再触发
+#   * 从 ${NODEHUB_URL}/.patches/ 用 wget -N 下载到 /tmp, 由 python3 执行
+#   * wget -N 仅在远程更新时实际拉取; 文件保留在 /tmp 不删除, 供下次 -N 比对
+#     (单文件 wget 按 basename 保存, 不创建 .patches/ 子目录)
+#   * -N 不可与 -O 同用 (时间戳判定失效), 故用 cd /tmp 让其按原名保存
+#   * 脚本自身解析 ~/.env + ~/node.env, 参考 V2ApiController::edit 上报
+# 约束: 仅运行一次 (标记文件 nodeAgent.fix-traffic-reset-used.patch.done);
+#       RunPatches 仍按日期窗口 (< 2026-08-08) 决定是否调用本函数
 # 面板约定: traffic_used 走 EDITABLE_FIELDS['gb'] 类型, 上报 GiB (字节/2^30),
 #   面板 round(gib*1024³)→字节, 等价 admin traffic_used_calibrate.
 # ============================================================
 PatchFixTrafficResetDayAndUsed() {
     # 1) 仅运行一次 — 标记文件存在则跳过; 先落标记防重入
-    _marker="${HOME}/nodeAgent.fix-traffic-reset-used.patch.done"
+    _marker="${HOME}/nodeAgent.fix-traffic-reset-used2.patch.done"
     [ -f "$_marker" ] && return 0
     : > "$_marker"
 
@@ -591,19 +595,17 @@ PatchFixTrafficResetDayAndUsed() {
         return 0
     fi
 
-    # 3) 从 NODEHUB_URL 拉取补丁脚本 (文件名含空格 → URL 编码为 %20)
+    # 3) wget -N 下载到 /tmp (按 basename 保存; 文件保留不删除)
     _patch_url="${NODEHUB_URL}/.patches/fix_traffic_reset_day_and_traffic_used.py"
-    _tmp=$(mktemp 2>/dev/null) || _tmp="${TMPDIR:-/tmp}/fix-traffic.$$"
-    if ! wget -q -T 30 -O "$_tmp" "$_patch_url" 2>/dev/null || [ ! -s "$_tmp" ]; then
+    cd /tmp || { log error "进入 /tmp 失败"; return 0; }
+    if wget -N -T 30 "$_patch_url" 2>/dev/null; then
+        # 4) 执行 — 脚本自带 Telegram 通知 (直接读 ~/.env), 失败不阻断 nodeAgent
+        #    vnstat 缺失 / 上报失败 均由脚本自身发 Telegram, 此处不再转发信号
+        log info "执行流量校准补丁 (仅 traffic_used)"
+        python3 fix_traffic_reset_day_and_traffic_used.py || true
+    else
         log warn "下载流量校准补丁失败: ${_patch_url}"
-        rm -f "$_tmp" 2>/dev/null || true
-        return 0
     fi
-
-    # 4) 执行 — 输出随 nodeAgent 流入 ~/nodeLogs; 非零退出仅告警不阻断
-    log info "执行流量校准补丁 (traffic_reset_day + traffic_used)"
-    python3 "$_tmp" || log warn "流量校准补丁执行返回非零, 详见上方脚本输出"
-    rm -f "$_tmp" 2>/dev/null || true
     return 0
 }
 

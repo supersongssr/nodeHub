@@ -7,8 +7,8 @@ fix_traffic_reset_day_and_traffic_used — 一次性流量校准补丁
 职责:
   读取节点 ~/.env 的 NODE_TRAFFIC_RESETDAY, 通过 vnstat 计算当前计费周期内
   (从 reset_day 到今天) 累计的 tx 流量, 经面板 /api/node/edit 接口上报:
-    * traffic_reset_day ← NODE_TRAFFIC_RESETDAY   (1-31)
     * traffic_used      ← vnstat 周期内 tx 总和    (GiB, 二进制 GB)
+  注: traffic_reset_day 上报已注释 (reset_day 仅用于确定计费周期起点, 不再上报)
 
 计费周期定义 (与面板 traffic_reset_day 语义一致):
   reset_day 为每月流量重置日. 以「今天」为锚点向前找最近的 reset_day:
@@ -18,7 +18,8 @@ fix_traffic_reset_day_and_traffic_used — 一次性流量校准补丁
 
 调用方:
   nodeAgent.sh RunPatches → PatchFixTrafficResetDayAndUsed
-  本脚本由 nodeAgent.sh 从 ${NODEHUB_URL}/.patches/ 下载到临时文件后执行.
+  本脚本由 nodeAgent.sh 从 ${NODEHUB_URL}/.patches/ 用 wget -N 下载到 /tmp 后执行;
+  亦可独立运行 (自带 Telegram 通知: 直接读 ~/.env 的 TG 配置, 不依赖 shell 转发).
 
 参考:
   /var/www/SPanel/app/Controllers/V2ApiController.php :: edit()
@@ -35,8 +36,8 @@ fix_traffic_reset_day_and_traffic_used — 一次性流量校准补丁
    不动 NIC 基线 traffic_raw_total, 下次 status 按真实增量继续累加.)
 
 退出码:
-  0  成功上报 / 安全跳过 (vnstat 缺失等非致命情况仍会单报 traffic_reset_day)
-  1  致命错误 (必需配置缺失/非法, 或 HTTP 调用失败)
+  0   成功上报 traffic_used / vnstat 缺失已发 Telegram warn 并跳过
+  1   致命错误 (必需配置缺失/非法, 或 HTTP 调用失败, 同时发 Telegram error)
 ================================================================================
 """
 
@@ -64,7 +65,41 @@ def log(level, msg):
 
 def die(msg, code=1):
     log("error", msg)
+    notify_tg("error", msg)
     sys.exit(code)
+
+
+# ============================================================
+# Telegram 通知 — 直接读 ~/.env 配置, 不依赖 nodeAgent.sh (脚本可独立运行)
+# 与 nodeAgent.sh NotifyTG 一致:
+#   token 优先级 TELEGRAM_BOT_TOKEN > TG_BOT_TOKEN, chat 同理; 任一缺失则静默跳过
+# ============================================================
+def notify_tg(level, message):
+    cfg = load_config()
+    token = (cfg.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_BOT_TOKEN")
+             or cfg.get("TG_BOT_TOKEN") or os.environ.get("TG_BOT_TOKEN"))
+    chat = (cfg.get("TELEGRAM_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID")
+            or cfg.get("TG_CHAT_ID") or os.environ.get("TG_CHAT_ID"))
+    if not token or not chat:
+        return  # 未配置 Telegram, 静默跳过 (不影响主流程)
+
+    emoji = {"error": "❌", "warn": "⚠️", "info": "ℹ️"}.get(level, "📝")
+    text = "%s [NodeHub] fix_traffic_reset_day_and_traffic_used.py\n等级: %s\n节点: %s\n时间: %s\n%s" % (
+        emoji, level,
+        cfg.get("node_id") or cfg.get("NODE_ID") or os.environ.get("node_id") or "N/A",
+        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        message,
+    )
+    payload = json.dumps({"chat_id": chat, "text": text}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.telegram.org/bot%s/sendMessage" % token,
+        data=payload, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception:
+        pass  # best-effort: Telegram 故障不阻断主流程
 
 
 # ============================================================
@@ -133,7 +168,7 @@ def compute_traffic_used_tx(net_card, since):
             capture_output=True, text=True, timeout=20,
         )
     except FileNotFoundError:
-        log("warn", "vnstat 未安装, 无法计算 traffic_used (将仅上报 traffic_reset_day)")
+        log("warn", "vnstat 未安装, 无法计算 traffic_used")
         return None, None
     except subprocess.TimeoutExpired:
         log("warn", "vnstat --json d 超时, 跳过 traffic_used 计算")
@@ -254,12 +289,18 @@ def main():
     # 计算 traffic_used (vnstat 缺失时为 None); 内部以字节计
     traffic_used_bytes, used_iface = compute_traffic_used_tx(net_card, since)
 
-    # 组装 params: traffic_reset_day 必上; traffic_used 仅在有值时上
+    # vnstat 缺失/无数据 → 直接发 Telegram warn, 并跳过本次上报 (脚本独立处理, 不靠 shell)
+    if traffic_used_bytes is None:
+        log("warn", "vnstat 缺失/无数据, 无法计算 traffic_used, 跳过本次上报")
+        notify_tg("warn", "vnstat 缺失/无数据, 无法计算 traffic_used, 已跳过 traffic_used 上报")
+        return 0
+
+    # 组装 params: 仅上报 traffic_used (traffic_reset_day 上报已注释)
     # 面板 EDITABLE_FIELDS['traffic_used'] 类型 = 'gb' (round(gib*1024³)→字节),
     # 故上报 GiB (字节/2^30). float64 下整数字节 <9PB 往返无损.
-    params = {"traffic_reset_day": reset_day}
-    if traffic_used_bytes is not None:
-        params["traffic_used"] = traffic_used_bytes / 1073741824.0
+    params = {}
+    # params["traffic_reset_day"] = reset_day   # 已注释: 不再上报 traffic_reset_day
+    params["traffic_used"] = traffic_used_bytes / 1073741824.0
 
     log("info", "上报 edit — params=%s" % json.dumps(params, ensure_ascii=False))
 
@@ -280,7 +321,7 @@ def main():
     ignored = resp.get("ignored") or []
 
     if status == "success":
-        log("info", "✅ traffic_reset_day 已更新: %s" % updated)
+        log("info", "✅ edit 成功 (updated=%s)" % updated)
     else:
         log("warn", "面板返回非 success: status=%s message=%s" % (status, resp.get("message")))
 
