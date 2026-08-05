@@ -831,7 +831,9 @@ DetectPanel() {
         # 查找路径: 1) 脚本同目录/panels  2) /tmp/panels  3) ~/panels  4) 从 NODEHUB_URL 下载到 ~/panels
         _panel_dir=""
         for _d in "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/panels" "/tmp/panels" "$HOME/panels"; do
-            if [ -f "${_d}/panel-common.sh" ]; then
+            # 用 -s (非空) 而非 -f: 历史失败下载会留下 0 字节空文件, [ -f ] 会误判为"已存在"并跳过重下,
+            # 导致 source 空文件后函数未定义 → set -u 触发 "_TRANSPORT_MODE: parameter not set" 退出。
+            if [ -s "${_d}/panel-common.sh" ]; then
                 _panel_dir="$_d"
                 break
             fi
@@ -844,14 +846,14 @@ DetectPanel() {
             for _f in panel-common.sh panel-1panel.sh panel-btpanel.sh; do
                 wget -q --timeout=30 --tries=2 -O "${_dl_dir}/${_f}" "${NODEHUB_URL}/panels/${_f}" 2>/dev/null || true
             done
-            if [ -f "${_dl_dir}/panel-common.sh" ]; then
+            if [ -s "${_dl_dir}/panel-common.sh" ]; then
                 _panel_dir="$_dl_dir"
                 log info "面板脚本已从 ${NODEHUB_URL}/panels/ 下载到 ${_dl_dir}"
             fi
         fi
 
         # 加载 panel-common.sh (共享函数, 必需)
-        if [ -n "$_panel_dir" ] && [ -f "${_panel_dir}/panel-common.sh" ]; then
+        if [ -n "$_panel_dir" ] && [ -s "${_panel_dir}/panel-common.sh" ]; then
             # shellcheck disable=SC1090
             . "${_panel_dir}/panel-common.sh"
             log info "已加载 panel-common.sh"
@@ -1554,7 +1556,8 @@ Step3_InstallNginx_Panel() {
         log warn "DetectTransportMode 未定义，尝试重新加载 panel-common.sh"
         _panel_dir=""
         for _d in "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/panels" "/tmp/panels" "$HOME/panels"; do
-            if [ -f "${_d}/panel-common.sh" ]; then
+            # 用 -s (非空) 而非 -f: 避免空文件被误判为"已存在" (见 DetectPanel 处说明)
+            if [ -s "${_d}/panel-common.sh" ]; then
                 _panel_dir="$_d"
                 break
             fi
@@ -1566,12 +1569,12 @@ Step3_InstallNginx_Panel() {
             for _f in panel-common.sh panel-1panel.sh panel-btpanel.sh; do
                 wget -q --timeout=30 --tries=2 -O "${_dl_dir}/${_f}" "${NODEHUB_URL}/panels/${_f}" 2>/dev/null || true
             done
-            if [ -f "${_dl_dir}/panel-common.sh" ]; then
+            if [ -s "${_dl_dir}/panel-common.sh" ]; then
                 _panel_dir="$_dl_dir"
                 log info "面板脚本已从 ${NODEHUB_URL}/panels/ 下载到 ${_dl_dir}"
             fi
         fi
-        if [ -n "$_panel_dir" ] && [ -f "${_panel_dir}/panel-common.sh" ]; then
+        if [ -n "$_panel_dir" ] && [ -s "${_panel_dir}/panel-common.sh" ]; then
             # shellcheck disable=SC1090
             . "${_panel_dir}/panel-common.sh"
             log info "已加载 ${_panel_dir}/panel-common.sh"
@@ -1600,7 +1603,8 @@ Step3_InstallNginx_Panel() {
 
     # 1. 从 ~/node.json 的 v2_name 判断传输模式
     DetectTransportMode 2>/dev/null || true
-    _PANEL_TRANSPORT="${_TRANSPORT_MODE}"
+    # 防御: DetectTransportMode 因故未赋值时给默认值, 避免 set -u 直接退出
+    _PANEL_TRANSPORT="${_TRANSPORT_MODE:-other}"
     log info "面板传输模式: ${_PANEL_TRANSPORT} (由 v2_name 判定)"
 
     # 2. vision 模式: xray 直接监听 node_port, 不需要 nginx
