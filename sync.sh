@@ -108,6 +108,7 @@ SyncGeoData() {
         Log "GeoData 更新完成"
     else
         Log "GeoData 更新流程结束 (部分失败, 见上方日志)"
+        _sync_ok=0
     fi
 }
 
@@ -118,24 +119,37 @@ SyncGeoData() {
 SyncXray() {
     Log "=== 下载 Xray 插件 ==="
     XRAY_DIR="${NODEHUB_DIR}/xray"
+    _ok=1
 
     wget -N -q -T 120 -P "$XRAY_DIR" \
         "https://github.com/supersongssr/xray-plugin-srp/releases/download/v0.0.9/xray-plugin-srp-v26.6.27" \
-        || Log "Xray: srp 下载失败"
+        || { Log "Xray: srp 下载失败"; _ok=0; }
 
     wget -N -q -T 120 -P "$XRAY_DIR" \
         "https://github.com/supersongssr/xray-plugin-ssp/releases/download/v0.0.9/xray-plugin-ssp-v26.6.27" \
-        || Log "Xray: ssp 下载失败"
+        || { Log "Xray: ssp 下载失败"; _ok=0; }
 
-    Log "Xray 插件下载完成"
+    # 按子步骤成败汇总输出, 与 SyncGeoData 风格一致
+    if [ "$_ok" -eq 1 ]; then
+        Log "Xray 插件下载完成"
+    else
+        Log "Xray 插件下载流程结束 (部分失败, 见上方日志)"
+        _sync_ok=0
+    fi
 }
 
 # ============================================================
 # 主流程
 # ============================================================
+# _sync_ok: 跨步骤成败汇总标志 (1=全部成功), SyncGeoData / SyncXray 任一失败置 0
 Log "===== sync.sh 开始 ====="
+_sync_ok=1
 Init
 SyncGeoData
 SyncXray
-NotifyTG "sync 完成"
+if [ "$_sync_ok" -eq 1 ]; then
+    NotifyTG "sync 完成"
+else
+    NotifyTG "sync 完成 (部分失败, 见日志)"
+fi
 Log "===== sync.sh 完成 ====="
