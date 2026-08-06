@@ -43,12 +43,11 @@ fi
 # 前置检查: 必须在 main 分支
 # ============================================================
 BRANCH=$(git -C "$SCRIPT_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "")
-echo "⚠️ 当前分支: ${BRANCH:-detached}"
-# if [ "$BRANCH" != "main" ]; then
-#     echo "❌ 当前分支: ${BRANCH:-detached}"
-#     echo "   prod.deploy 仅允许在 main 分支执行"
-#     exit 1
-# fi
+if [ "$BRANCH" != "main" ]; then
+    echo "❌ 当前分支: ${BRANCH:-detached}"
+    echo "   prod.deploy 仅允许在 main 分支执行"
+    exit 1
+fi
 
 if [ ! -f "$GITIGNORE" ]; then
     echo "❌ .gitignore 不存在: $GITIGNORE"

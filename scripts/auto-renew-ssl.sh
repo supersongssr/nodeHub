@@ -158,7 +158,11 @@ RenewDomain() {
 }
 
 # ============================================================
-# 重载服务 (仅重载已运行的服务; reload 失败则回退 restart)
+# 重载服务 (仅处理已运行的服务)
+# 注意: xray (Xray-core) 不支持 SIGHUP 热重载, `systemctl reload xray` 在旧 service
+#   (ExecReload=/bin/kill -HUP) 上会把进程杀死且退出码仍为 0 → 静默停机 (见
+#   nodeAgent.sh: RestartXrayWithHealthCheck 注释)。故 xray 一律走 restart +
+#   is-active 健康校验; 其余服务 (如 nginx) 用 reload, 失败再回退 restart。
 # ============================================================
 ReloadServices() {
     for _svc in $RELOAD_SERVICES; do
@@ -167,6 +171,27 @@ ReloadServices() {
         fi
         systemctl list-unit-files 2>/dev/null | grep -q "^${_svc}\.service" || continue
         systemctl is-active "$_svc" >/dev/null 2>&1 || { Log "ℹ️  ${_svc} 未运行, 跳过"; continue; }
+
+        # xray: 禁止 reload (会触发 SIGHUP 静默停机 bug), 直接 restart + 健康校验
+        if [ "$_svc" = "xray" ]; then
+            if systemctl restart "$_svc" 2>/dev/null; then
+                _i=0
+                while [ "$_i" -lt 5 ]; do
+                    sleep 1; _i=$((_i + 1))
+                    [ "$(systemctl is-active "$_svc" 2>/dev/null)" = "active" ] && break
+                done
+                if [ "$(systemctl is-active "$_svc" 2>/dev/null)" = "active" ]; then
+                    Log "🔄 restart ${_svc} 完成 (健康校验通过)"
+                else
+                    Log "⚠️  ${_svc} restart 后 is-active 非 active — 请检查 config.json / 证书"
+                fi
+            else
+                Log "⚠️  ${_svc} restart 失败"
+            fi
+            continue
+        fi
+
+        # 其它服务 (如 nginx): reload, 失败回退 restart
         if systemctl reload "$_svc" 2>/dev/null; then
             Log "🔄 reload ${_svc} 完成"
         elif systemctl restart "$_svc" 2>/dev/null; then

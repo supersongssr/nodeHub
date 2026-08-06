@@ -1,7 +1,7 @@
 #!/bin/sh
 # ============================================================
 # sync.sh — 节点数据同步 (兼首次初始化)
-# 任务: 确保目录结构 + GeoData更新 + Xray插件下载
+# 任务: 确保目录结构 + GeoData更新 + Xray插件下载 + 每晚 03:00 自注册 crontab
 # 说明: 所有下载均使用 wget -N, 由时间戳决定是否真正拉取
 # ============================================================
 
@@ -72,7 +72,13 @@ Init() {
     mkdir -p "${NODEHUB_DIR}/geodat"
     mkdir -p "${NODEHUB_DIR}/xray"
     mkdir -p "${NODEHUB_DIR}/logs"
-    Log "目录就绪"
+
+    # 安装 crontab: 每晚 03:00 运行自身 (SSL 同步已交由 nodeAgent.sh:SyncSSL,
+    # 此处仅保证 GeoData / Xray 插件定期更新, 否则二者无任何自动触发源)
+    sed -i '/sync\.sh/d' /etc/crontab
+    echo "0 3 * * * root /bin/sh ${NODEHUB_DIR}/sync.sh" >> /etc/crontab
+
+    Log "目录就绪, crontab 已配置 (03:00)"
 }
 
 # ============================================================

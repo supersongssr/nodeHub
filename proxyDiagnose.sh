@@ -75,10 +75,8 @@ done
 # 远程主机必须有 bash/sh + 基础工具; 无需预装本脚本
 # ============================================================
 if [ -n "$REMOTE_HOST" ]; then
-    # 通过 ssh 执行自身 (stdin 传入脚本内容, 远程用 sh 跑, 剥离 --host 避免递归)
-    _filtered_args=""
-    for _a in "$@"; do [ "$_a" != "$REMOTE_HOST" ] && _filtered_args="$_filtered_args '$_a'"; done
-    # shellcheck disable=SC2086
+    # 通过 ssh 执行自身 (stdin 传入脚本内容, 远程用 sh 跑; 剥离 --host 避免递归)
+    # 远程为非 TTY, 颜色由 [ -t 1 ] 自动关闭, 无需转发 --no-color
     ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$REMOTE_HOST" \
         "sh -s -- --target $TARGET $( [ "$JSON_OUTPUT" = 1 ] && echo --json ) $( [ "$QUIET" = 1 ] && echo --quiet )" \
         < "$0"
