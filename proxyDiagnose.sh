@@ -23,6 +23,10 @@
 #            本次 38.45.72.223 故障根因, 详见 check_outbound)
 #         · NODE_PORT 只 bind 127.0.0.1 → 端口本地"在监听"但外部无法访问
 #           (详见 _check_node_port_external)
+#         · conntrack 连接跟踪表打满 → 海量丢包 → 内存耗尽【硬死锁】
+#           (nf_conntrack_max 默认 8192 在多用户代理下秒级打满; 常因 /etc/sysctl.conf
+#            写了 conntrack 调优键但【值为空】→ sysctl -p 静默失败回退默认; 无 swap 的小
+#            VPS 尤甚, 内存尖峰直接硬挂。本次 103.173.155.212 死机根因, 详见 check_net NW7/NW8/NW9)
 #
 # 设计原则:
 #   1. 只读诊断, 默认绝不修改系统 (只查询 + 报告), 修复动作需显式 --fix (预留)
@@ -314,6 +318,30 @@ check_env() {
                 "空文件让安装脚本 source 静默成功但【不定义任何函数】(如 DetectTransportMode), 后续 set -u 访问未赋值变量直接退出 (典型报错 '_TRANSPORT_MODE: parameter not set' 退出码 2)。成因: 历史失败下载 wget -O 残留 0 字节文件, install 用 [ -f ] 只判存在误判'已存在'而跳过重下。修复: rm -f$_empty_p 后重跑安装 (会从 NODEHUB_URL 重新下载真实文件)"
         elif [ -n "$_ok_p" ]; then
             result PASS "ENV_PANEL_SCRIPT_OK" "面板辅助脚本完整 ($_panel_found):$_ok_p"
+        fi
+    fi
+
+    # E9. 小内存代理节点无 swap — 把"可恢复的 OOM"恶化为"整机硬死锁"
+    #   真实故障 (2026-08-08, 103.173.155.212): 1核1GB 无 swap 的节点, conntrack 打满引发
+    #   内存耗尽时, 内核来不及触发 OOM Killer、也来不及写任何日志 → 整机硬挂 (宕机 10h 才
+    #   人工重启)。有 swap 兜底则多数情况能 OOM-kill 掉元凶进程后自愈, 而非死锁。
+    #   判定: 本机部署了 xray(代理) + 内存<2GB + 无 swap → 风险。
+    _has_xray=0
+    if [ -x "${_XRAY_BIN:-/usr/local/bin/xray}" ] \
+       || [ -f /etc/systemd/system/xray.service ] \
+       || [ -f /lib/systemd/system/xray.service ]; then
+        _has_xray=1
+    fi
+    if [ "$_has_xray" = 1 ]; then
+        _tot_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+        _tot_mb=$(_num "$_tot_mb" 0)
+        _swap_tot=$(free -m 2>/dev/null | awk '/^Swap:/{print $2}')   # swap 总量(MB)
+        _swap_tot=$(_num "$_swap_tot" 0)
+        if [ "$_tot_mb" -gt 0 ] && [ "$_tot_mb" -lt 2048 ] && [ "$_swap_tot" -eq 0 ]; then
+            result WARN "ENV_NO_SWAP_PROXY" "代理节点内存 ${_tot_mb}MB 且【无 swap】" \
+                "小内存代理节点无 swap 时, 内存尖峰(conntrack 打满/连接暴增)会从 'OOM-kill 自愈' 恶化为 '整机硬死锁'(本次 103.173.155.212 死机的放大器: 宕机 10h)。修复: fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile, 并写入 /etc/fstab (proxyInstall.sh 的 TuneKernelForProxy 已对小节点自动处理)"
+        else
+            result PASS "ENV_SWAP_OK" "内存 ${_tot_mb}MB / swap ${_swap_tot}MB"
         fi
     fi
 }
@@ -811,7 +839,7 @@ _check_oom_for() {
 # 网络与防火墙 (net)
 # ============================================================
 check_net() {
-    say "网络与防火墙 (iptables / ufw / firewalld / SELinux)"
+    say "网络与防火墙 (iptables / ufw / firewalld / SELinux / conntrack / sysctl)"
 
     # NW1. iptables DROP/REJECT 规则 (可能拦截代理端口)
     if has iptables; then
@@ -856,7 +884,70 @@ check_net() {
     result WARN "NET_SG_REMINDER" "云厂商安全组 (AWS SG / 阿里云安全组 / GCP 防火墙) 需在控制台单独放行端口" \
         "若本地端口监听正常但外部连不上, 99% 是云安全组未放行"
 
-    # NW6. NODE_PORT 对外可达性 (端口监听 ≠ 外部可访问; 详见 _check_node_port_external)
+    # NW6. conntrack 连接跟踪表 — 代理高并发的生命线 (本次死机根因)
+    #   真实故障 (2026-08-08, 103.173.155.212): 1核1GB 跑多用户 xray, nf_conntrack_max
+    #   仅默认 8192 → 开机 3 秒打满 → 海量 'table full, dropping packet' → 内存耗尽 →
+    #   整机硬死锁 (日志在 xray 正常处理连接的瞬间戛然而止, 无 OOM/panic 记录, 宕机 10h)。
+    #   教训: 代理节点 nf_conntrack_max 必须 ≥ 65536; 默认 8192 秒级打满。
+    if [ -r /proc/sys/net/netfilter/nf_conntrack_max ]; then
+        _ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)
+        _ct_max=$(_num "$_ct_max" 8192)
+        _ct_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
+        _ct_count=$(_num "$_ct_count" 0)
+        _ct_pct=0
+        [ "$_ct_max" -gt 0 ] && _ct_pct=$(( _ct_count * 100 / _ct_max ))
+        if [ "$_ct_max" -lt 65536 ]; then
+            result FAIL "NET_CONNTRACK_TOO_SMALL" \
+                "nf_conntrack_max=${_ct_max} 过小 (<代理建议 65536), 当前占用 ${_ct_count} (${_ct_pct}%)" \
+                "代理多用户高并发下默认 8192 秒级打满 → 海量丢包 → 内存耗尽硬死锁 (本次 103.173.155.212 死机根因)。修复: /etc/sysctl.d/99-nodehub-proxy.conf 写 net.netfilter.nf_conntrack_max=262144 (proxyInstall.sh 的 TuneKernelForProxy 已自动处理)"
+        elif [ "$_ct_pct" -ge 85 ]; then
+            result WARN "NET_CONNTRACK_HIGH" "conntrack 占用 ${_ct_pct}% (${_ct_count}/${_ct_max})" "逼近上限, 检查是否有异常连接暴增; 必要时再抬高 nf_conntrack_max"
+        else
+            result PASS "NET_CONNTRACK_OK" "nf_conntrack_max=${_ct_max}, 占用 ${_ct_pct}% (${_ct_count})"
+        fi
+    fi
+
+    # NW7. 历史打满痕迹 — 本次/上次启动的内核日志是否记录过 'table full'
+    #   (-k 只看内核消息, 避免代理 access 日志撑爆管道; 'table full' 是 kernel 打印)
+    if has journalctl; then
+        _ctf_cur=$(journalctl -b 0 -k --no-pager 2>/dev/null | grep -c 'table full')
+        _ctf_cur=$(_num "$_ctf_cur" 0)
+        _ctf_prev=$(journalctl -b -1 -k --no-pager 2>/dev/null | grep -c 'table full')
+        _ctf_prev=$(_num "$_ctf_prev" 0)
+        if [ "$_ctf_cur" -gt 0 ]; then
+            result FAIL "NET_CONNTRACK_FULL_NOW" "本次启动已记录 ${_ctf_cur} 次 'nf_conntrack: table full, dropping packet'" "连接跟踪表【正在】打满丢包, 立即抬高 nf_conntrack_max 否则随时硬死锁"
+        elif [ "$_ctf_prev" -gt 50 ]; then
+            result WARN "NET_CONNTRACK_FULL_LASTBOOT" "上次启动记录 ${_ctf_prev} 次 'table full' (疑似上次宕机根因)" "已重启但根因未除, 建议立即抬高 nf_conntrack_max 防止复发"
+        fi
+    fi
+
+    # NW8. sysctl 配置完整性 — key= 空值坏行会让 sysctl -p 静默失败 (本次死机根因之一)
+    #   真实故障 (2026-08-08, 103.173.155.212): /etc/sysctl.conf 有 6 行形如
+    #   'net.netfilter.nf_conntrack_max=' (等号后为空) → sysctl -p 对空值报错, 但被
+    #   install 脚本的 '2>/dev/null || true' 吞掉 → conntrack 调优静默失效 → 回退默认 8192。
+    #   教训: 调优写到独立 sysctl.d 文件并用 sysctl -p 单独加载; 判空值坏行。
+    _sysctl_bad=""
+    for _sc in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
+        [ -f "$_sc" ] || continue
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            case "$_line" in ''|\#*) continue ;; esac
+            case "$_line" in *=*) ;; *) continue ;; esac   # 无等号跳过
+            _val=${_line#*=}
+            _val=${_val%%#*}                                # 去行尾注释
+            if [ -z "$(printf '%s' "$_val" | tr -d ' \t')" ]; then
+                _k=$(printf '%s' "${_line%%=*}" | tr -d ' \t')
+                _sysctl_bad="${_sysctl_bad} ${_k}"
+            fi
+        done < "$_sc"
+    done
+    if [ -n "$_sysctl_bad" ]; then
+        result FAIL "NET_SYSCTL_EMPTY_VALUE" "sysctl 配置存在【空值坏行】(key= 后无值):${_sysctl_bad}" \
+            "空值使 sysctl -p 对该行报错而被忽略 → 调优静默失效回退默认值 (本次死机: 6 行 conntrack 空值 → 回退 8192 → 打满死锁)。修复: 删除这些空行, 或补上正确数值"
+    else
+        result PASS "NET_SYSCTL_OK" "sysctl 配置无空值坏行"
+    fi
+
+    # NW9. NODE_PORT 对外可达性 (端口监听 ≠ 外部可访问; 详见 _check_node_port_external)
     _check_node_port_external
 }
 
