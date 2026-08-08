@@ -20,5 +20,3 @@ geodat/
 probe.env
 
 __pycache__
-
-.patches/
