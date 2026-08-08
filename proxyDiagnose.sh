@@ -4,7 +4,9 @@
 #
 # 职责: 一键检查 xray / nginx / 代理无法【安装】或【运行】的各种可能原因。
 #       覆盖真实生产故障场景, 包括但不限于:
-#         · 端口冲突 (nginx 与 xray 抢 443/80 — 本次 179.61.138.177 故障)
+#         · 端口冲突 (nginx 与 xray 【同协议同端口】抢占 443/80; 注意 TCP/UDP 是两个
+#           独立命名空间, xray UDP:443 + nginx TCP:443 属正常共存非冲突 —
+#           本次 179.61.138.177 故障根因, 详见 _PortOverlapCheck)
 #         · 配置文件 JSON 语法错误 / 缺失
 #         · 二进制缺失 / 无执行权限 / 架构不匹配 (ARM vs x86)
 #         · systemd 服务文件缺失 / 被 mask / 重启风暴放弃
@@ -16,6 +18,11 @@
 #         · DNS 解析失败 / 关键依赖缺失
 #         · 面板辅助脚本 0 字节空文件 (source 静默成功但函数未定义 → set -u 崩溃,
 #           本次 198.12.124.74 "_TRANSPORT_MODE: parameter not set" 故障根因)
+#         · 出站 IPv4 web 端口被上游封锁, 但 xray freedom 强制 IPv4 → 代理"假活"
+#           (服务/端口/TLS握手/认证全 PASS、唯独收不到数据; curl 默认走 IPv6 极具迷惑性,
+#            本次 38.45.72.223 故障根因, 详见 check_outbound)
+#         · NODE_PORT 只 bind 127.0.0.1 → 端口本地"在监听"但外部无法访问
+#           (详见 _check_node_port_external)
 #
 # 设计原则:
 #   1. 只读诊断, 默认绝不修改系统 (只查询 + 报告), 修复动作需显式 --fix (预留)
@@ -28,8 +35,9 @@
 #   ./proxyDiagnose.sh --target xray        # 只查 xray
 #   ./proxyDiagnose.sh --target nginx       # 只查 nginx
 #   ./proxyDiagnose.sh --target env         # 只查安装环境 (磁盘/内存/DNS/依赖/锁)
-#   ./proxyDiagnose.sh --target net         # 只查网络与防火墙
+#   ./proxyDiagnose.sh --target net         # 只查网络与防火墙 (含 NODE_PORT 对外可达性)
 #   ./proxyDiagnose.sh --target cert        # 只查 TLS 证书
+#   ./proxyDiagnose.sh --target outbound    # 只查出站连通性 (IPv4/IPv6 web + domainStrategy)
 #   ./proxyDiagnose.sh --json               # 输出 JSON (供程序解析)
 #   ./proxyDiagnose.sh --quiet              # 只输出 FAIL/WARN, 不输出 PASS
 #   ./proxyDiagnose.sh --no-color           # 关闭颜色
@@ -46,6 +54,22 @@ _SCRIPT_NAME="${0##*/}"
 [ -f ~/.env ] && . ~/.env
 [ -f ~/node.env ] && . ~/node.env 2>/dev/null || true
 [ -f ./.env ] && . ./.env 2>/dev/null || true
+
+# ---- 解析 NODE_PORT (代理对外端口, 默认 443; 与 proxyInstall.sh 同源) ----
+#   优先级: 环境变量 NODE_PORT > ~/.env(已 source) > ~/node.json > ~/node.env > 默认 443
+#   运行时调用 _resolve_node_port, 结果写入全局 _NODE_PORT
+_NODE_PORT="443"
+_resolve_node_port() {
+    [ -n "${NODE_PORT:-}" ] && { _NODE_PORT="$NODE_PORT"; return; }
+    if [ -f "$HOME/node.json" ] && has jq; then
+        _jp=$(jq -r '.node_port // empty' "$HOME/node.json" 2>/dev/null)
+        [ -n "$_jp" ] && { _NODE_PORT="$_jp"; return; }
+    fi
+    if [ -f "$HOME/node.env" ]; then
+        _ep=$(grep -E '^[[:space:]]*node_port[[:space:]]*=' "$HOME/node.env" 2>/dev/null | tail -1 | sed -E "s/^[^=]*=//; s/[\"' ]//g")
+        [ -n "$_ep" ] && { _NODE_PORT="$_ep"; return; }
+    fi
+}
 
 # ============================================================
 # 命令行参数解析
@@ -388,7 +412,7 @@ check_xray() {
         fi
     fi
 
-    # X9. 端口冲突 — nginx↔xray 双重声明抢占 + xray 端口运行时占用
+    # X9. 端口冲突 — nginx↔xray 同协议同端口抢占 (协议感知) + xray 端口运行时占用
     _PortOverlapCheck
     _XrayPortRuntimeCheck
 
@@ -403,122 +427,217 @@ check_xray() {
 }
 
 # ============================================================
-# 端口声明与冲突检测 (核心: nginx ↔ xray 双重声明抢占)
+# 端口声明与冲突检测 (核心: nginx ↔ xray 抢占; 协议感知)
+#
+# 关键认知 (本机实测修正旧逻辑的假阳性):
+#   · "端口号" 不是端口的唯一身份 —— (协议, 端口) 才是。
+#     TCP 与 UDP 是【两个独立命名空间】: TCP:443 与 UDP:443 可同时被不同进程监听,
+#     互不冲突。典型: nginx listen 443 ssl (TCP) + xray hysteria (UDP) 同处 443,
+#     这是【正常共存】而非抢占 (本机正是此态)。
+#   · 旧逻辑只比端口号 → 把 "xray UDP:443 + nginx TCP:443" 误报为冲突 (假阳性)。
+#     新逻辑按 (proto, port) 元组判定, 才能真正区分下列 4 类抢占实况。
 #
 # 设计:
-#   · 允许 xray 占用其自身声明的端口 (xray 是代理主服务, 占用合法, 不报错)
-#   · 允许 nginx 占用其自身声明的端口
-#   · 真正的故障 = nginx 与 xray 【同时声明】同一端口 (典型如 443),
-#     二者无法共存: 谁先启动谁抢到, 后者 'bind: address already in use'
-#     退出 (exit 255/EXCEPTION)。这是 179.61.138.177 故障的根因。
-#   · 次要风险 = 某服务声明的端口被【无关第三方进程】占用
+#   · 允许 xray 占用其自身声明的 (proto, port)
+#   · 允许 nginx 占用其自身声明的 (proto, port)
+#   · 真冲突 = 双方【同协议同端口】声明 → 只能存活一个, 抢失败者
+#     'bind: address already in use' 退出。再按【当前谁实际占用】细分 4 类根因。
+#   · 次要风险 = 某服务声明的 (proto, port) 被【无关第三方进程】占用
 #
-# 三类检查 (重叠端口只报告一次, 不重复):
-#   1) _PortOverlapCheck   : nginx ∩ xray 双重声明 → FAIL (抢占冲突根因)
-#   2) _XrayPortRuntime    : xray 独占端口的运行时占用 (跳过重叠项)
-#   3) _NginxPortRuntime   : nginx 独占端口的运行时占用 (跳过重叠项)
+# 三类检查 (每个 (proto,port) 只报告一次):
+#   1) _PortOverlapCheck     : 同协议同端口双重声明 → FAIL, 并按运行时占用者细分根因
+#   2) _XrayPortRuntimeCheck : xray 独占 (proto,port) 的运行时占用 (跳过已报告的重叠项)
+#   3) _NginxPortRuntimeCheck: nginx 独占 (proto,port) 的运行时占用 (跳过已报告的重叠项)
+# 另: 同端口号不同协议 (跨协议共存) → PASS, 显式标注 (回答 "到底有没有冲突")
 # ============================================================
 
-# ---- 返回 xray 配置声明的监听端口 (空格分隔, 去重纯数字) ----
-# inbound.port 可能是数字或 "1000-2000" 范围; 仅取纯数字端口
-_XrayDeclaredPorts() {
+# ---- 返回 xray 声明的 (协议, 端口): 每行 "proto port", 去重 ----
+# 协议判定:
+#   protocol ∈ {hysteria, hysteria2, tuic}        → UDP
+#   streamSettings.network ∈ {kcp, quic}          → UDP  (mKCP / QUIC 走 UDP)
+#   其余 (vless/vmess/trojan/shadowsocks/dokodemo) → TCP
+# inbound.port 仅取纯数字 (丢弃 "1000-2000" 范围)
+_XrayDeclaredProtoPorts() {
     [ -f "$_XRAY_CONF" ] && has jq || return 0
-    jq -r '.inbounds[]?.port // empty' "$_XRAY_CONF" 2>/dev/null \
-        | grep -oE '^[0-9]+$' | sort -un | tr '\n' ' '
+    jq -r '
+      .inbounds[]?
+      | (.protocol // "") as $pr
+      | (.streamSettings.network // "") as $nw
+      | ((.port // "") | tostring) as $p
+      | select($p | test("^[0-9]+$"))
+      | (if ($pr=="hysteria" or $pr=="hysteria2" or $pr=="tuic"
+             or $nw=="kcp" or $nw=="quic")
+          then "udp" else "tcp" end) + " " + $p
+    ' "$_XRAY_CONF" 2>/dev/null | sort -u
 }
 
-# ---- 返回 nginx 声明的监听端口 (空格分隔, 去重纯数字) ----
-# listen 形态: `80` / `443 ssl` / `127.0.0.1:8088` / `[::]:80` / `[::1]:443` / `unix:/x`
-# → 取 listen 后第一个 token, 再取最后冒号后部分 (剥离 IP 前缀), 仅留纯数字
-_NginxDeclaredPorts() {
+# ---- 返回 nginx 声明的 (协议, 端口): 每行 "proto port", 去重 ----
+# listen 形态: `80` / `443 ssl` / `[::]:443 ssl` / `1234 udp` / `127.0.0.1:8088`
+# → listen 后第一个 token 取最后冒号后部分 (剥离 IP 前缀) = port;
+#   同行含 ` udp ` 关键字 → UDP, 否则 TCP (nginx 默认 TCP)。
+# 先剥离 # 注释, 否则 `# listen 443 ssl;` 会被误判为真实声明。
+_NginxDeclaredProtoPorts() {
     has nginx || return 0
     if nginx -T >/dev/null 2>&1; then
-        _src=$(nginx -T 2>/dev/null)
+        nginx -T 2>/dev/null
     else
-        # 降级: 读取 conf 目录原始行 (含注释, 后续统一剥离)
-        _src=$(grep -rhE '.' "$_NGINX_CONF_DIR" 2>/dev/null)
-    fi
-    # 先剥离 # 注释 (否则 `# listen 443 ssl;` 这类注释会被误判为真实声明),
-    # 再取 listen 后第一个 token, 再取最后冒号后部分 (剥离 IP 前缀), 仅留纯数字
-    printf '%s\n' "$_src" | sed 's/#.*//' \
-        | sed -n 's/.*listen[[:space:]][[:space:]]*\([^ ;]*\).*/\1/p' \
-        | sed -E 's/.*://' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' '
+        grep -rhE '.' "$_NGINX_CONF_DIR" 2>/dev/null
+    fi | sed 's/#.*//' | awk '
+        /[[:space:]]listen[[:space:]]/ || /^listen[[:space:]]/ {
+            line=$0
+            proto = (line ~ /[[:space:]]udp([[:space:];]|$)/) ? "udp" : "tcp"
+            sub(/.*listen[[:space:]]+/, "", line)
+            token=line; sub(/[[:space:];].*/, "", token); sub(/.*:/, "", token)
+            if (token ~ /^[0-9]+$/) print proto" "token
+        }
+    ' | sort -u
 }
 
-# ---- 某端口的运行时占用进程名 (换行分隔, 去重) ----
-_RuntimeHolders() {  # $1 = port
-    ss -H -tulnp 2>/dev/null | grep -E "[:.]$1\b" \
-        | sed -n 's/.*users:(("//;s/".*//p' | sort -u
+# ---- 某 (协议, 端口) 的运行时占用进程名 (换行分隔, 去重) ----
+# 精确匹配: netid 前缀 = proto (tcp 匹配 tcp/tcp6), 本地地址【最后冒号后】= port。
+# 避免旧 `grep "[:.]$port\b"" 把 :443 误匹到 :8443 / IPv6 地址段等子串。
+_RuntimeHoldersProto() {  # $1 = tcp|udp , $2 = port
+    ss -H -tulnp 2>/dev/null | awk -v p="$1" -v port="$2" '
+        $1 ~ "^"p {
+            la=$5; sub(/.*:/, "", la)        # port = 最后冒号后部分
+            if (la == port) {
+                l=$0; sub(/.*users:\(\("/, "", l); sub(/".*/, "", l); print l
+            }
+        }
+    ' | sort -u
 }
 
-# ---- 端口是否在空格分隔列表中 ----
-_PortIn() {  # _PortIn <port> <"p1 p2 p3">
-    case " $2 " in *" $1 "*) return 0 ;; esac
+# ---- (proto,port) 是否在 "proto:port proto:port ..." 列表中 ----
+_ProtoPortIn() {  # _ProtoPortIn <proto> <port> <"tcp:443 udp:443 ...">
+    case " $3 " in *" $1:$2 "*) return 0 ;; esac
     return 1
 }
 
-# ---- 缓存声明端口 (避免重复解析 nginx -T) ----
-_EnsurePorts() {
-    [ -n "${_XP+set}" ] || _XP=$(_XrayDeclaredPorts)
-    [ -n "${_NP+set}" ] || _NP=$(_NginxDeclaredPorts)
+# ---- 缓存声明 (proto,port) (避免重复解析 nginx -T / jq) ----
+# _XPP / _NPP = 空格分隔的 "proto:port" token 串
+_EnsureProtoPorts() {
+    [ -n "${_XPP+set}" ] || _XPP=$(_XrayDeclaredProtoPorts  | awk '{print $1":"$2}' | tr '\n' ' ')
+    [ -n "${_NPP+set}" ] || _NPP=$(_NginxDeclaredProtoPorts | awk '{print $1":"$2}' | tr '\n' ' ')
 }
 
-# ---- 核心: nginx ∩ xray 双重声明抢占检查 (幂等, 全程仅报告一次) ----
-# 检测 nginx 与 xray 是否同时声明了同一端口 (如 443) —— 这是抢占冲突的根因
+# ---- 核心: 同协议同端口双重声明抢占检查 (幂等, 全程仅报告一次) ----
+# 命中后按【当前谁实际占用】细分 4 类根因, 给出针对性修复建议。
 _PORT_OVERLAP_DONE=0
 _PortOverlapCheck() {
     [ "$_PORT_OVERLAP_DONE" = 1 ] && return 0
     _PORT_OVERLAP_DONE=1
-    has nginx && has jq && [ -f "$_XRAY_CONF" ] || return 0
-    _EnsurePorts
-    [ -n "$_XP" ] && [ -n "$_NP" ] || return 0
+    has nginx && has jq && [ -f "$_XRAY_CONF" ] || { _ReportCrossProtoCoexist; return 0; }
+    _EnsureProtoPorts
+    [ -n "$_XPP" ] && [ -n "$_NPP" ] || { _ReportCrossProtoCoexist; return 0; }
 
-    for _port in $_XP; do
-        if _PortIn "$_port" "$_NP"; then
-            _win=$(_RuntimeHolders "$_port" | grep -v '^$')
-            _win=$(printf '%s' "$_win" | tr '\n' ',' | sed 's/,$//')
-            [ -n "$_win" ] && _win_detail="当前实际占用者: [${_win}]" || _win_detail="当前无进程占用 (二者均未成功启动)"
-            result FAIL "PORT_DUAL_DECL_${_port}" \
-                "端口 ${_port} 同时被 nginx 与 xray 声明监听 → 抢占冲突" \
-                "二者无法共存: systemd 启动顺序决定谁先抢到端口, 后者必然 'bind: address already in use' 退出 (exit 255/EXCEPTION)。${_win_detail}。解决: 让其中一方让出 ${_port} (如 nginx 改 8443, 或 xray 走 nginx 反代 / SNI 分流)"
+    for _tok in $_XPP; do
+        _proto=${_tok%%:*}; _port=${_tok#*:}
+        # 只看 nginx 也【同协议同端口】声明的项
+        _ProtoPortIn "$_proto" "$_port" "$_NPP" || continue
+        _h=$(_RuntimeHoldersProto "$_proto" "$_port")
+        # 统计占用者类别 (xray / nginx / 第三方)
+        _hx=0; _hn=0; _ho=""
+        while IFS= read -r _pn; do
+            [ -n "$_pn" ] || continue
+            case "$_pn" in
+                xray|xray-core) _hx=1 ;;
+                nginx)          _hn=1 ;;
+                *)              _ho="${_ho:+$_ho,}$_pn" ;;
+            esac
+        done <<__H
+$_h
+__H
+        _tag="$_proto/$_port"
+        if [ "$_hx" = 1 ]; then
+            # xray 抢到了 → nginx 是 bind 失败方
+            result FAIL "PORT_DUAL_DECL_XRAY_WON_${_port}" \
+                "${_tag} 同时被 xray 与 nginx 声明 → 抢占冲突 (当前 xray 占用, nginx bind 失败)" \
+                "根因: 同协议同端口只能有一个监听者; xray 先启动已抢到, nginx 启动必然 'address already in use' 失败。修复: 让 nginx 让出 ${_tag} (改 listen 端口如 8443; 或 xray 走 nginx 反代 / SNI 分流, 二者只留一个对外)"
+        elif [ "$_hn" = 1 ]; then
+            # nginx 抢到了 → xray 是 bind 失败方
+            result FAIL "PORT_DUAL_DECL_NGINX_WON_${_port}" \
+                "${_tag} 同时被 xray 与 nginx 声明 → 抢占冲突 (当前 nginx 占用, xray bind 失败)" \
+                "根因: nginx 先启动已抢到 ${_tag}, xray 启动必然 'address already in use' 失败退出。修复: 让 xray 让出 ${_tag} (改 inbound.port; 或 nginx 反代到 xray, xray 改 listen 127.0.0.1)"
+        elif [ -n "$_ho" ]; then
+            # 第三方占用 → xray 和 nginx 都会失败
+            result FAIL "PORT_DUAL_DECL_3RD_${_port}" \
+                "${_tag} 同时被 xray 与 nginx 声明, 但已被无关进程 [${_ho}] 占用 → 两边都会 bind 失败" \
+                "根因: 真正占住端口的是第三方 [${_ho}], xray 与 nginx 谁也抢不到。修复: 先查清 [${_ho}] 是什么 (ss -tulnp / lsof -i :${_port}), 停掉或迁移它, 再重启 xray/nginx; 切勿盲目重启 xray/nginx"
+        else
+            # 没人占用 → 两边都没起来 (服务 down / 配置错 / 反复 bind 失败被 systemd 放弃)
+            result FAIL "PORT_DUAL_DECL_NONE_${_port}" \
+                "${_tag} 同时被 xray 与 nginx 声明, 但当前无任何进程占用 → 二者均未成功监听" \
+                "根因: 端口本身空闲, 说明 xray 和 nginx 都没跑起来 (而非互相抢占)。看 X6/X7 服务状态项与 journalctl: 可能服务 down、配置语法错、证书缺失、或反复 bind 失败被 systemd 'start-limit hit' 放弃。先 systemctl reset-failed 再 start"
         fi
+    done
+
+    _ReportCrossProtoCoexist
+}
+
+# ---- 同端口号不同协议 = 跨协议共存 (非冲突), 显式 PASS ----
+# 回答疑问: "xray 和 nginx 都用 443, 到底有没有冲突? 叫什么?"
+#   → 若二者协议不同 (一 TCP 一 UDP), 这是【跨协议共存】, 完全正常。
+#     每个 (proto,port) 只报一次, 以 xray 侧为准。
+_ReportCrossProtoCoexist() {
+    [ -n "$_XPP" ] && [ -n "$_NPP" ] || return 0
+    _reported=""
+    for _tok in $_XPP; do
+        _xp=${_tok%%:*}; _xport=${_tok#*:}
+        # 跳过同协议同端口 (已在 _PortOverlapCheck 处理)
+        _ProtoPortIn "$_xp" "$_xport" "$_NPP" && continue
+        # 该端口号是否已报告过 (避免 xray 多 inbound 重复)
+        case " $_reported " in *" $_xport "*) continue ;; esac
+        # nginx 是否声明了同端口号 (但不同协议)?
+        for _ntok in $_NPP; do
+            _nport=${_ntok#*:}
+            [ "$_nport" = "$_xport" ] || continue
+            _np=${_ntok%%:*}
+            [ "$_np" = "$_xp" ] && continue
+            _reported="$_reported $_xport"
+            result PASS "PORT_CROSS_PROTO_${_xport}" \
+                "端口 ${_xport} 跨协议共存: xray=${_xp}/${_xport} + nginx=${_np}/${_xport} → 非冲突" \
+                "TCP 与 UDP 是独立命名空间, 同端口号可分别被监听, 互不影响 (典型: nginx TCP:443 ssl + xray UDP:443 hysteria)。这是健康状态, 无需处理"
+        done
     done
 }
 
-# ---- xray 独占端口的运行时占用检查 (允许 xray 自身占用, 不报错) ----
+# ---- xray 独占 (proto,port) 的运行时占用检查 (允许 xray 自身占用) ----
 _XrayPortRuntimeCheck() {
     [ -f "$_XRAY_CONF" ] && has jq || return 0
-    _EnsurePorts
-    for _port in $_XP; do
-        _PortIn "$_port" "$_NP" && continue   # 跳过重叠项 (已由 _PortOverlapCheck 报告)
-        _h=$(_RuntimeHolders "$_port")
+    _EnsureProtoPorts
+    for _tok in $_XPP; do
+        _proto=${_tok%%:*}; _port=${_tok#*:}
+        # 跳过与 nginx 同协议同端口 (已由 _PortOverlapCheck 报告)
+        _ProtoPortIn "$_proto" "$_port" "$_NPP" && continue
+        _h=$(_RuntimeHoldersProto "$_proto" "$_port")
         if printf '%s\n' "$_h" | grep -qx 'xray'; then
-            result PASS "PORT_XRAY_LISTEN_${_port}" "xray 正在监听端口 ${_port} (允许占用)"
+            result PASS "PORT_XRAY_LISTEN_${_proto}_${_port}" "${_proto}/${_port}: xray 正在监听 (允许占用)"
         elif [ -z "$_h" ]; then
-            result PASS "PORT_FREE_${_port}" "端口 ${_port} 空闲, 可供 xray 使用"
+            result PASS "PORT_FREE_${_proto}_${_port}" "${_proto}/${_port}: 空闲, 可供 xray 使用"
         else
             _how=$(printf '%s' "$_h" | tr '\n' ',' | sed 's/,$//')
-            result FAIL "PORT_OCCUPIED_${_port}" "xray 需要端口 ${_port}, 但被无关进程 [$_how] 占用" \
-                "停止占用进程, 或让 xray 改用空闲端口"
+            result FAIL "PORT_OCCUPIED_${_proto}_${_port}" "${_proto}/${_port}: xray 需要该端口, 但被无关进程 [$_how] 占用" \
+                "停止 [$_how] 或让 xray 改用空闲端口 (注意: 仅【同协议同端口】才算占用; 若仅另一协议占用同端口号则不冲突)"
         fi
     done
 }
 
-# ---- nginx 独占端口的运行时占用检查 (允许 nginx 自身占用, 不报错) ----
+# ---- nginx 独占 (proto,port) 的运行时占用检查 (允许 nginx 自身占用) ----
 _NginxPortRuntimeCheck() {
     has nginx || return 0
-    _EnsurePorts
-    for _port in $_NP; do
-        _PortIn "$_port" "$_XP" && continue   # 跳过重叠项
-        _h=$(_RuntimeHolders "$_port")
+    _EnsureProtoPorts
+    for _tok in $_NPP; do
+        _proto=${_tok%%:*}; _port=${_tok#*:}
+        _ProtoPortIn "$_proto" "$_port" "$_XPP" && continue   # 跳过重叠项
+        _h=$(_RuntimeHoldersProto "$_proto" "$_port")
         if printf '%s\n' "$_h" | grep -qx 'nginx'; then
-            result PASS "PORT_NGINX_LISTEN_${_port}" "nginx 正在监听端口 ${_port}"
+            result PASS "PORT_NGINX_LISTEN_${_proto}_${_port}" "${_proto}/${_port}: nginx 正在监听"
         elif [ -z "$_h" ]; then
-            result PASS "PORT_NGINX_FREE_${_port}" "端口 ${_port} 空闲, 可供 nginx 使用"
+            result PASS "PORT_NGINX_FREE_${_proto}_${_port}" "${_proto}/${_port}: 空闲, 可供 nginx 使用"
         else
             _how=$(printf '%s' "$_h" | tr '\n' ',' | sed 's/,$//')
-            result FAIL "NGINX_PORT_OCCUPIED_${_port}" "nginx 需要端口 ${_port}, 但被无关进程 [$_how] 占用" \
-                "停止占用进程, 或修改 nginx listen 端口"
+            result FAIL "NGINX_PORT_OCCUPIED_${_proto}_${_port}" "${_proto}/${_port}: nginx 需要该端口, 但被无关进程 [$_how] 占用" \
+                "停止 [$_how] 或修改 nginx listen 端口"
         fi
     done
 }
@@ -619,8 +738,8 @@ check_nginx() {
     fi
 }
 
-# ---- nginx 端口冲突 (委托给统一检测: 双重声明 + 运行时占用) ----
-# 解析逻辑已收敛到 _NginxDeclaredPorts, 由 _PortOverlapCheck / _NginxPortRuntimeCheck 复用
+# ---- nginx 端口冲突 (委托给统一检测: 同协议同端口双重声明 + 运行时占用) ----
+# 解析逻辑已收敛到 _NginxDeclaredProtoPorts, 由 _PortOverlapCheck / _NginxPortRuntimeCheck 复用
 _check_nginx_port_conflict() {
     _PortOverlapCheck
     _NginxPortRuntimeCheck
@@ -736,6 +855,104 @@ check_net() {
     # NW5. 提示云安全组 (本地无法检测)
     result WARN "NET_SG_REMINDER" "云厂商安全组 (AWS SG / 阿里云安全组 / GCP 防火墙) 需在控制台单独放行端口" \
         "若本地端口监听正常但外部连不上, 99% 是云安全组未放行"
+
+    # NW6. NODE_PORT 对外可达性 (端口监听 ≠ 外部可访问; 详见 _check_node_port_external)
+    _check_node_port_external
+}
+
+# ============================================================
+# NODE_PORT 对外可达性 — 端口监听 ≠ 外部可访问
+#   端口若只 bind 127.0.0.1/::1, 本地 ss 显示"在监听"但外部客户端永远连不上。
+#   NODE_PORT 取自 ~/.env 的 NODE_PORT (默认 443)。
+# ============================================================
+_check_node_port_external() {
+    _resolve_node_port
+    # 端口锚定用 ([^0-9]|$) 而非 \b: \b 是 GNU grep 扩展, busybox/BSD grep 不识别会静默无输出 → _listen 恒空 → 误报 NODE_PORT 无监听。
+    # ([^0-9]|$) 跨实现一致, 且避免 :443 误匹到 :4430 / IPv6 地址段等子串。
+    _listen=$(ss -H -tlnp 2>/dev/null | grep -E "[:.]$_NODE_PORT([^0-9]|$)")
+    if [ -z "$_listen" ]; then
+        # 提示实际对外监听端口 —— 常见: ~/.env 的 NODE_PORT 已过期, 实际端口在别处
+        _actual=$(ss -H -tlnp 2>/dev/null | grep -E 'users:.+"(xray|nginx)"' \
+                 | grep -vE '127\.0\.0\.1|::1' | awk '{print $4}' | tr '\n' ',' | sed 's/,$//')
+        if [ -n "$_actual" ]; then
+            _hint="实际对外监听端口: [$_actual] —— ~/.env 的 NODE_PORT=$_NODE_PORT 疑似过期, 与实际不符 (重跑安装脚本会读到错误端口搞坏代理)"
+        else
+            _hint="xray/nginx 均未监听任何对外端口, 检查服务是否启动"
+        fi
+        result FAIL "NODE_PORT_NOT_LISTENING" "NODE_PORT=$_NODE_PORT 无进程监听 → 外部无法连接" \
+            "$_hint。核对 ~/.env / node.json / node.env 的 NODE_PORT 与实际配置一致"
+        return
+    fi
+    _binds=$(printf '%s\n' "$_listen" | awk '{print $4}')
+    # 外部可达 = 存在非环回监听地址 (* / 0.0.0.0 / [::] / 公网IP)
+    _external=$(printf '%s\n' "$_binds" | grep -vE '^(127\.|\[?::1\])' | head -1)
+    if [ -n "$_external" ]; then
+        _b=$(printf '%s\n' "$_binds" | tr '\n' ',' | sed 's/,$//')
+        result PASS "NODE_PORT_EXTERNAL" "NODE_PORT=$_NODE_PORT 监听在对外地址 [$_b] → 外部可达"
+    else
+        result FAIL "NODE_PORT_LOCALHOST_ONLY" "NODE_PORT=$_NODE_PORT 仅监听 127.0.0.1/::1 → 外部无法访问" \
+            "xray inbound 的 listen 留空或设 0.0.0.0; nginx listen 行去掉 127.0.0.1: 前缀"
+    fi
+}
+
+# ============================================================
+# 出站连通性 (outbound) — 本次 (2026-08-05, 38.45.72.223) 核心经验
+#
+# 真实故障: 代理"完全无法使用", 但常规检查【全部 PASS】:
+#   服务 active / 端口 443 监听 / 客户端能完成 TLS 握手 + VLESS 认证(日志 accepted) /
+#   证书有效 / nginx·MySQL·geoip 全正常 / ping·traceroute(ICMP)·curl(默认IPv6)·DNS(53) 全正常
+#
+# 根因: 服务器【出站 IPv4 TCP 的 80/443】被上游/运营商精准封锁 (IPv6·ICMP·DNS:53 全正常 →
+#   极度隐蔽, 常规巡检全部漏报), 而 xray freedom 出站 domainStrategy=UseIPv4v6【强制优先 IPv4】→
+#   所有网页拨号超时 (i/o timeout) → 代理 accept 连接但无法回传任何数据。
+#
+# 教训: "端口在监听 + TLS 握手成功" ≠ "代理可用"。真正可用 = 端到端数据转发。
+#   必须主动测【出站 IPv4 web 端口】, 且 curl 必须加 -4 强制 IPv4
+#   (否则 Happy Eyeballs 自动走 IPv6, 把故障完全掩盖 —— 这正是本次被忽略的原因)。
+# ============================================================
+check_outbound() {
+    say "出站连通性 (IPv4/IPv6 web 端口 + freedom domainStrategy)"
+
+    has curl || { result WARN "OUTBOUND_NO_CURL" "无 curl, 跳过出站连通性测试"; return 0; }
+
+    # OB1. IPv4 出站 web(443) — 必须 -4 强制, 否则 curl 走 IPv6 掩盖故障
+    #   1.1.1.1 anycast 极稳定; connect-timeout 测纯 TCP 连通, http_code=000 = 连不上
+    _v4=$(curl -4 -k --connect-timeout 6 --max-time 10 -s -o /dev/null -w '%{http_code}' https://1.1.1.1 2>/dev/null)
+    _v4=${_v4:-000}
+    # OB2. IPv6 出站 web(443)
+    _v6=$(curl -6 -k --connect-timeout 6 --max-time 10 -s -o /dev/null -w '%{http_code}' "https://[2606:4700:4700::1111]" 2>/dev/null)
+    _v6=${_v6:-000}
+
+    # 读 freedom 出站 domainStrategy
+    _ds=""
+    if [ -f "$_XRAY_CONF" ] && has jq; then
+        _ds=$(jq -r '.outbounds[]? | select(.protocol=="freedom") | .settings.domainStrategy // empty' "$_XRAY_CONF" 2>/dev/null | head -1)
+    fi
+
+    [ "$_v4" != "000" ] && result PASS "OUTBOUND_V4_OK" "IPv4 出站 web(443) 可达 (http_code=$_v4)"
+    [ "$_v6" != "000" ] && result PASS "OUTBOUND_V6_OK" "IPv6 出站 web(443) 可达 (http_code=$_v6)"
+
+    # 核心判定
+    if [ "$_v4" = "000" ] && [ "$_v6" != "000" ]; then
+        # IPv4 web 被封但 IPv6 正常 (本次精确症状)
+        case "$_ds" in
+            UseIPv4|UseIPv4v6)
+                result FAIL "OUTBOUND_V4_BLOCKED_XRAY_FORCES_V4" \
+                    "出站 IPv4 web(80/443) 被封锁, 但 freedom domainStrategy=$_ds 强制用 IPv4 → 代理无法转发任何数据" \
+                    "现象: 服务/端口/TLS握手/认证全 PASS, 唯独客户端收不到响应数据; curl 默认走 IPv6 故巡检看似正常(极具迷惑性)。修复: domainStrategy 改 UseIPv6 (本次已验证可恢复), 并联系机房查 IPv4 出站 80/443 为何被封"
+                ;;
+            *)
+                result WARN "OUTBOUND_V4_BLOCKED" \
+                    "出站 IPv4 web(80/443) 被封锁, IPv6 正常 (domainStrategy=${_ds:-未知})" \
+                    "若代理异常, 把 freedom domainStrategy 改 UseIPv6 可绕过; 联系机房查 IPv4 出站封禁"
+                ;;
+        esac
+    elif [ "$_v4" = "000" ] && [ "$_v6" = "000" ]; then
+        result FAIL "OUTBOUND_ALL_BLOCKED" "IPv4 与 IPv6 出站 web 端口均不通" \
+            "代理完全无法转发数据。检查本机网络/上游路由/机房封禁/iptables OUTPUT"
+    fi
+
+    [ -n "$_ds" ] && result PASS "OUTBOUND_DS_READ" "freedom domainStrategy = $_ds"
 }
 
 # ============================================================
@@ -793,6 +1010,7 @@ summary() {
 # 主流程 — 按目标分发
 # ============================================================
 Main() {
+    _resolve_node_port
     case "$TARGET" in
         all)
             check_env
@@ -800,13 +1018,15 @@ Main() {
             check_nginx
             check_cert
             check_net
+            check_outbound
             ;;
-        xray)  check_xray ;;
-        nginx) check_nginx ;;
-        env)   check_env ;;
-        net)   check_net ;;
-        cert)  check_cert ;;
-        *) echo "未知 --target: $TARGET (可选: all|xray|nginx|env|net|cert)" >&2; exit 2 ;;
+        xray)     check_xray ;;
+        nginx)    check_nginx ;;
+        env)      check_env ;;
+        net)      check_net ;;
+        cert)     check_cert ;;
+        outbound) check_outbound ;;
+        *) echo "未知 --target: $TARGET (可选: all|xray|nginx|env|net|cert|outbound)" >&2; exit 2 ;;
     esac
 
     summary
