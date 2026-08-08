@@ -730,6 +730,103 @@ EnsureSshKeyLogin() {
     log info "SSH key 登录未设置，已写入 ${_authorized_keys}"
 }
 
+# ============================================================
+# 代理节点内核网络调优 — 修复高并发场景下 conntrack 打满导致死锁
+#   * nf_conntrack_max 抬高到 262144 (默认 8192 在多用户代理下秒级打满
+#     → 海量丢包 → 内存耗尽 → 硬死锁, 这正是历史宕机的根因)
+#   * 缩短 conntrack 各状态超时, 加速表项回收
+#   * somaxconn / syn_backlog 提升握手队列
+#   * 小内存节点 (<2GB) 自动创建 swap 兜底, 防内存尖峰硬挂
+# 写入独立文件 /etc/sysctl.d/99-nodehub-proxy.conf, 不污染 sysctl.conf
+# ============================================================
+TuneKernelForProxy() {
+    log info "开始代理节点内核网络调优"
+
+    _tune_file=/etc/sysctl.d/99-nodehub-proxy.conf
+    mkdir -p /etc/sysctl.d /etc/modprobe.d
+
+    # ---- 1) conntrack + 网络栈调优 (覆盖式写入, 幂等) ----
+    cat > "$_tune_file" <<'SYSCTL_EOF'
+# ---- NodeHub 代理节点内核调优 (由 proxyInstall.sh 维护, 勿手动编辑) ----
+# 连接跟踪表 — 默认 8192 在多用户代理下秒级打满 → 海量丢包 → 死锁
+net.netfilter.nf_conntrack_max=262144
+net.netfilter.nf_conntrack_tcp_timeout_established=7200
+net.netfilter.nf_conntrack_tcp_timeout_time_wait=30
+net.netfilter.nf_conntrack_tcp_timeout_close_wait=30
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait=30
+net.netfilter.nf_conntrack_tcp_timeout_syn_sent=30
+# 高并发握手队列
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+# TIME_WAIT 复用 (代理转发场景, 大量短连接)
+net.ipv4.tcp_tw_reuse=1
+SYSCTL_EOF
+
+    # nf_conntrack_buckets 仅在模块加载时可设 (运行时只读), 写 modprobe.d 供下次加载生效
+    cat > /etc/modprobe.d/nodehub-nf_conntrack.conf <<'MODPROBE_EOF'
+# NodeHub: nf_conntrack hash buckets = max/4 (仅在模块加载时生效, 改后需重启)
+options nf_conntrack hashsize=65536
+MODPROBE_EOF
+
+    # 应用 sysctl — 单独加载本文件 (不碰 sysctl.conf, 避免被其中的空值/坏行影响)
+    if ! sysctl -p "$_tune_file" >/dev/null 2>&1; then
+        log warn "sysctl -p $_tune_file 失败, 逐条应用"
+        grep -vE '^\s*#|^\s*$' "$_tune_file" 2>/dev/null | while IFS= read -r _line; do
+            sysctl -w "$_line" >/dev/null 2>&1 || log warn "sysctl 应用失败: $_line"
+        done
+    fi
+    log info "内核网络调优已写入 $_tune_file 并应用 (nf_conntrack_max=262144)"
+
+    # ---- 2) 小内存节点自动创建 swap (防内存尖峰直接硬挂) ----
+    _mem_mb=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    _has_swap=$(swapon --show 2>/dev/null | wc -l)
+    if [ "${_has_swap}" -ge 1 ]; then
+        log debug "已存在 swap, 跳过创建"
+        return 0
+    fi
+
+    # 仅在根分区为 ext4/xfs 时创建 (btrfs/zfs 需特殊处理)
+    _root_fs=$(findmnt -no FSTYPE / 2>/dev/null || echo "")
+    case "$_root_fs" in
+        ext4|xfs) ;;
+        *)
+            log info "根文件系统 ${_root_fs:-(未知)} 不适合直接建 swapfile, 跳过 swap 创建"
+            return 0
+            ;;
+    esac
+
+    if [ "${_mem_mb}" -gt 0 ] && [ "${_mem_mb}" -lt 2048 ]; then
+        _swap_file=/swapfile
+        _swap_size_mb=2048   # 小节点统一 2GB 兜底
+        _disk_free_mb=$(df -BM --output=avail / 2>/dev/null | tail -1 | tr -dc '0-9')
+        if [ -n "${_disk_free_mb}" ] && [ "${_disk_free_mb}" -lt 3072 ]; then
+            log warn "磁盘剩余 ${_disk_free_mb}MB < 3GB, 跳过 swap 创建 (避免写满磁盘)"
+            return 0
+        fi
+
+        log info "创建 swap (${_swap_file}, ${_swap_size_mb}MB) — 内存 ${_mem_mb}MB 无 swap, 加兜底"
+        if dd if=/dev/zero of="${_swap_file}" bs=1M count="${_swap_size_mb}" status=none 2>/dev/null \
+           || fallocate -l "${_swap_size_mb}M" "${_swap_file}" 2>/dev/null; then
+            chmod 600 "${_swap_file}" 2>/dev/null || true
+            if mkswap "${_swap_file}" >/dev/null 2>&1 && swapon "${_swap_file}" 2>/dev/null; then
+                grep -q "^${_swap_file} " /etc/fstab 2>/dev/null || \
+                    echo "${_swap_file} none swap sw 0 0" >> /etc/fstab
+                # 低 swappiness — 仅作兜底, 不影响正常转发性能
+                sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+                echo "vm.swappiness=10" >> "$_tune_file"
+                log info "swap 已创建并启用 (${_swap_size_mb}MB), swappiness=10, 已写入 /etc/fstab"
+            else
+                log warn "swap 启用失败, 清理残留文件"
+                rm -f "${_swap_file}" 2>/dev/null || true
+            fi
+        else
+            log warn "swap 文件创建失败, 跳过"
+        fi
+    else
+        log debug "内存 ${_mem_mb}MB >= 2GB, 跳过 swap 创建"
+    fi
+}
+
 InitSystem() {
     log info "开始系统基础调优"
     log debug "系统信息: $(uname -a)"
@@ -761,6 +858,9 @@ InitSystem() {
         } > /etc/security/limits.d/nofile.conf
         log info "ulimit 已调整为 65535"
     fi
+
+    # 代理节点专用内核调优 (conntrack / swap) — 修复高并发下 conntrack 打满死锁
+    TuneKernelForProxy
 
     id www-data >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin www-data
     log info "www-data 用户就绪"
