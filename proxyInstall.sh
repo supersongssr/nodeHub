@@ -1785,6 +1785,20 @@ Step3_InstallNginx_Panel() {
 # 自动检测 nftables / iptables 后端，无需手动开关
 # ============================================================
 Step3_5_SetupHy2PortHop() {
+    # ---- 守卫: 仅当 v2_name 含 hy2 时才需要 UDP 端口跳跃映射 ----
+    # 背景: hy2 已不再是默认协议; 非 hy2 节点 (vision/xhttp/reality 等) 无需把
+    #       30000-32000/UDP 聚合到 node_port, 故不再无条件写入 NAT 重定向规则。
+    #       v2_name 在 LoadEnv 解析、Step1_Register 由面板回传覆盖后, 此处已是最终值。
+    case "${v2_name:-}" in
+        *hy2*)
+            log info "Step 3.5: v2_name='${v2_name}' 含 hy2 → 配置端口跳跃映射"
+            ;;
+        *)
+            log info "Step 3.5: v2_name='${v2_name:-空}' 不含 hy2 → 跳过 UDP 端口转发到 ${node_port}"
+            return 0
+            ;;
+    esac
+
     _hop_start="${HY2_PORT_HOP_START:-30000}"
     _hop_end="${HY2_PORT_HOP_END:-32000}"
     _hop_target="${HY2_PORT_HOP_TARGET:-${node_port}}"
