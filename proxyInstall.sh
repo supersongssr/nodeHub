@@ -760,6 +760,8 @@ net.core.somaxconn=65535
 net.ipv4.tcp_max_syn_backlog=65535
 # TIME_WAIT 复用 (代理转发场景, 大量短连接)
 net.ipv4.tcp_tw_reuse=1
+# 低 swappiness — 小内存节点有 swap 时仅作兜底; 无 swap 时为 no-op, 不影响转发
+vm.swappiness=10
 SYSCTL_EOF
 
     # nf_conntrack_buckets 仅在模块加载时可设 (运行时只读), 写 modprobe.d 供下次加载生效
@@ -811,10 +813,9 @@ MODPROBE_EOF
             if mkswap "${_swap_file}" >/dev/null 2>&1 && swapon "${_swap_file}" 2>/dev/null; then
                 grep -q "^${_swap_file} " /etc/fstab 2>/dev/null || \
                     echo "${_swap_file} none swap sw 0 0" >> /etc/fstab
-                # 低 swappiness — 仅作兜底, 不影响正常转发性能
-                sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
-                echo "vm.swappiness=10" >> "$_tune_file"
-                log info "swap 已创建并启用 (${_swap_size_mb}MB), swappiness=10, 已写入 /etc/fstab"
+                # swappiness=10 已随 $_tune_file 的 heredoc 持久化, 并由上方 sysctl -p 应用;
+                # 此处不再单独 sysctl -w / echo (重装覆盖 heredoc 后仍保留, 不再丢失)。
+                log info "swap 已创建并启用 (${_swap_size_mb}MB), 已写入 /etc/fstab (swappiness=10 见 $_tune_file)"
             else
                 log warn "swap 启用失败, 清理残留文件"
                 rm -f "${_swap_file}" 2>/dev/null || true

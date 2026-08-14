@@ -180,6 +180,17 @@ $(grep '^FAIL' "$_RESULTS_FILE" | head -8 | cut -f3 | sed 's/^/• /')"
         "https://api.telegram.org/bot${_token}/sendMessage" >/dev/null 2>&1 || true
 }
 
+# 直接发送一条 Telegram (不依赖 _FAIL 计数, 供单项检查中途即时告警)
+# 用法: _TgSend <message>
+_TgSend() {
+    _token="${TELEGRAM_BOT_TOKEN:-${TG_BOT_TOKEN:-}}"
+    _chat="${TELEGRAM_CHAT_ID:-${TG_CHAT_ID:-}}"
+    { [ -z "$_token" ] || [ -z "$_chat" ]; } && return 0
+    curl -sS --connect-timeout 5 --max-time 15 \
+        --data-urlencode "chat_id=${_chat}" --data-urlencode "text=$1" \
+        "https://api.telegram.org/bot${_token}/sendMessage" >/dev/null 2>&1 || true
+}
+
 # ============================================================
 # 通用检测小工具
 # ============================================================
@@ -802,7 +813,23 @@ _check_cert_expiry() {
     grep -q 'BEGIN CERTIFICATE' "$_f" 2>/dev/null || return 0
     _end=$(openssl x509 -in "$_f" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
     [ -n "$_end" ] || return 0
-    _end_epoch=$(date -d "$_end" +%s 2>/dev/null) || return 0
+    # date -d 仅 GNU date 支持 (busybox/BSD date 解析失败 → 无法算剩余天数)。
+    # 失败时不再静默跳过 (否则过期证书漏报无人知晓): 整次诊断只发一次 Telegram 告警,
+    # 提示人工核对 (多证书扫描用 _CERT_DATE_FAIL_SENT 去重, 避免刷屏)。
+    if ! _end_epoch=$(date -d "$_end" +%s 2>/dev/null) || [ -z "$_end_epoch" ]; then
+        if [ -z "${_CERT_DATE_FAIL_SENT:-}" ]; then
+            _CERT_DATE_FAIL_SENT=1
+            result WARN "CERT_EXPIRY_CHECK_FAILED" \
+                "证书过期检查无法执行 (date -d 解析失败, 非 GNU date?): $_f (到期 $_end)" \
+                "本机 date 不支持 -d (busybox/BSD date), 无法计算证书剩余天数 → 过期证书可能漏报。安装 coreutils (GNU date) 或人工核对: openssl x509 -checkend 0 -noout -in <cert>"
+            _TgSend "⚠️ [NodeHub] ${_SCRIPT_NAME}: 证书过期检查无法执行
+主机: $(hostname -I 2>/dev/null | awk '{print $1}')
+原因: date -d 解析失败 (非 GNU date), 过期证书可能漏报
+首个证书: $_f (到期 $_end)
+建议: 安装 coreutils 或人工 openssl x509 -checkend 0 -noout -in <cert>"
+        fi
+        return 0
+    fi
     _now=$(date +%s)
     _days=$(( (_end_epoch - _now) / 86400 ))
     _cn=$(openssl x509 -in "$_f" -noout -subject 2>/dev/null | sed 's/.*CN=//' | sed 's#/.*##')

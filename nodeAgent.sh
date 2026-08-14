@@ -663,7 +663,10 @@ PatchDeprecatedDomainsReinstall() {
 #   面板 round(gib*1024³)→字节, 等价 admin traffic_used_calibrate.
 # ============================================================
 PatchFixTrafficResetDayAndUsed() {
-    # 1) 仅运行一次 — 标记文件存在则跳过; 先落标记防重入
+    # 1) 仅运行一次 — 标记文件存在则跳过。
+    #    有意「先落标记再执行」: 即便本次因 NODEHUB_URL 缺失 / python3 缺失 / 下载或执行失败
+    #    而未真正校准, 也绝不重复运行 (校准补丁非幂等, 重复上报会污染计费数据)。
+    #    若事后发现某节点未跑成, 由人工另写一次性脚本单独处理, 而非靠本函数重试。
     _marker="${HOME}/nodeAgent.fix-traffic-reset-used3.patch.done"
     [ -f "$_marker" ] && return 0
     : > "$_marker"
