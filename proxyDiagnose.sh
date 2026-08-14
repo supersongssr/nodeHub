@@ -40,7 +40,7 @@
 #   ./proxyDiagnose.sh --target nginx       # 只查 nginx
 #   ./proxyDiagnose.sh --target env         # 只查安装环境 (磁盘/内存/DNS/依赖/锁)
 #   ./proxyDiagnose.sh --target net         # 只查网络与防火墙 (含 NODE_PORT 对外可达性)
-#   ./proxyDiagnose.sh --target cert        # 只查 TLS 证书
+#   ./proxyDiagnose.sh --target cert        # 只查 TLS 证书 (root_domain + nginx .conf 引用证书)
 #   ./proxyDiagnose.sh --target outbound    # 只查出站连通性 (IPv4/IPv6 web + domainStrategy)
 #   ./proxyDiagnose.sh --json               # 输出 JSON (供程序解析)
 #   ./proxyDiagnose.sh --quiet              # 只输出 FAIL/WARN, 不输出 PASS
@@ -686,18 +686,19 @@ _check_cert_refs_in_xray() {
     _cfg="$1"; [ -f "$_cfg" ] || return 0; has jq || return 0
     _certs=$(jq -r '.. | .certificateFile? // empty' "$_cfg" 2>/dev/null | sort -u)
     _keys=$(jq -r '.. | .keyFile? // empty' "$_cfg" 2>/dev/null | sort -u)
-    for _f in $_certs $_keys; do
+    for _f in $_certs; do
         [ -n "$_f" ] || continue
         case "$_f" in /*) : ;; *) continue ;; esac   # 只查绝对路径
+        _check_cert_file "$_f" XRAY_CERT
+    done
+    # 密钥文件不做过期检查, 只查存在/可读
+    for _f in $_keys; do
+        [ -n "$_f" ] || continue
+        case "$_f" in /*) : ;; *) continue ;; esac
         if [ ! -e "$_f" ]; then
-            result FAIL "XRAY_CERT_MISSING" "配置引用的证书/密钥不存在: $_f" "xray 启动会因找不到证书而失败; 补齐证书或修正路径"
+            result FAIL "XRAY_CERT_MISSING" "配置引用的密钥不存在: $_f" "xray 启动会因找不到密钥而失败; 补齐证书或修正路径"
         elif [ ! -r "$_f" ]; then
-            result FAIL "XRAY_CERT_NOREAD" "证书/密钥不可读: $_f" "检查文件权限与运行用户 (systemd User=)"
-        else
-            result PASS "XRAY_CERT_OK" "证书文件就绪: $_f"
-            # 过期检查 (仅对证书 cert, 非 key)
-            case "$_f" in *.key|*key*) continue ;; esac
-            _check_cert_expiry "$_f"
+            result FAIL "XRAY_CERT_NOREAD" "密钥不可读: $_f" "检查文件权限与运行用户 (systemd User=)"
         fi
     done
 }
@@ -784,28 +785,43 @@ _check_nginx_port_conflict() {
     _NginxPortRuntimeCheck
 }
 
-# ---- nginx 证书引用 ----
+# ---- nginx 证书引用: 只查 /etc/nginx 下 *.conf 声明的 ssl_certificate ----
+#   直接扫 .conf 文件 (不依赖 nginx -T), nginx -t 失败/服务未起也能查出引用;
+#   未被任何 .conf 引用的散落证书 (如 /etc/ssl 历史遗留) 不在检查范围。
 _check_nginx_certs() {
-    nginx -T >/dev/null 2>&1 || return 0
-    _certs=$(nginx -T 2>/dev/null | grep -oE 'ssl_certificate\s+[^;]*;' | sed -E 's/ssl_certificate\s+//;s/;$//' | sort -u)
+    [ -d "$_NGINX_CONF_DIR" ] || return 0
+    # 剥注释后取 ssl_certificate 路径 (不含 ssl_certificate_key)
+    _certs=$(find "$_NGINX_CONF_DIR" -maxdepth 3 -type f -name '*.conf' -exec sed 's/#.*//' {} + 2>/dev/null \
+             | grep -E '[[:space:]]ssl_certificate[[:space:]]' \
+             | sed -E 's/.*ssl_certificate[[:space:]]+//; s/[;[:space:]].*//' | sort -u)
     for _f in $_certs; do
-        case "$_f" in
-            /etc/ssl/certs/*|/etc/letsencrypt/*) : ;;
-        esac
-        if [ ! -e "$_f" ]; then
-            result FAIL "NGINX_CERT_MISSING" "nginx 引用证书不存在: $_f" "nginx -t 会报 emerg; 补齐证书或注释该 server 块"
-        elif [ ! -r "$_f" ]; then
-            result FAIL "NGINX_CERT_NOREAD" "nginx 证书不可读: $_f"
-        else
-            result PASS "NGINX_CERT_OK" "nginx 证书就绪: $_f"
-            _check_cert_expiry "$_f"
-        fi
+        case "$_f" in /*) : ;; *) continue ;; esac   # 只查绝对路径
+        _check_cert_file "$_f" NGINX_CERT
     done
 }
 
 # ============================================================
-# TLS 证书通用检查 (过期) — 被 xray/nginx 共用
+# TLS 证书通用检查 — 被 xray/nginx/cert 三个入口共用
 # ============================================================
+# ---- 证书文件综合检查 (存在/可读/过期), 按文件路径全局去重 ----
+#   同一证书可能同时被 xray 配置 / nginx .conf / root_domain 扫描命中,
+#   整次诊断只报告一次, 避免重复条目刷屏。
+_CERT_FILES_CHECKED=""
+_check_cert_file() {  # $1 = 证书路径, $2 = code 前缀 (XRAY_CERT / NGINX_CERT / CERT_ROOT_DOMAIN)
+    _cf="$1"; _pfx="$2"
+    case " ${_CERT_FILES_CHECKED} " in *" $_cf "*) return 0 ;; esac
+    _CERT_FILES_CHECKED="${_CERT_FILES_CHECKED} $_cf"
+    if [ ! -e "$_cf" ]; then
+        result FAIL "${_pfx}_MISSING" "引用的证书不存在: $_cf" "启动会因找不到证书而失败; 补齐证书或修正路径"
+    elif [ ! -r "$_cf" ]; then
+        result FAIL "${_pfx}_NOREAD" "证书不可读: $_cf" "检查文件权限与运行用户"
+    else
+        result PASS "${_pfx}_OK" "证书文件就绪: $_cf"
+        _check_cert_expiry "$_cf"
+    fi
+}
+
+# ---- 过期检查 (仅对 PEM 文本证书) ----
 _check_cert_expiry() {
     _f="$1"
     has openssl || return 0
@@ -832,7 +848,7 @@ _check_cert_expiry() {
     fi
     _now=$(date +%s)
     _days=$(( (_end_epoch - _now) / 86400 ))
-    _cn=$(openssl x509 -in "$_f" -noout -subject 2>/dev/null | sed 's/.*CN=//' | sed 's#/.*##')
+    _cn=$(openssl x509 -in "$_f" -noout -subject 2>/dev/null | sed 's/^subject[= ]*//; s/.*CN *= *//; s#/.*##')
     if [ "$_days" -lt 0 ]; then
         result FAIL "CERT_EXPIRED" "证书已过期 ${_days#-} 天: $_f (CN=${_cn}, 到期 $_end)" \
             "已过期证书: xray/nginx 仍能启动但客户端 TLS 握手会失败/告警。续期: acme.sh / certbot"
@@ -1074,21 +1090,45 @@ check_outbound() {
 }
 
 # ============================================================
-# TLS 证书专项 (cert) — 扫描常见证书目录
+# TLS 证书专项 (cert) — 只检查【在用】证书, 不做全盘扫描:
+#   1. ~/node.json 中 root_domain 对应的证书 (按 CN/SAN 匹配定位)
+#   2. /etc/nginx 中 *.conf 声明 ssl_certificate 引用的证书
+#   未被使用的散落证书 (如 /etc/ssl 里的历史遗留) 过期不影响服务, 不检查。
 # ============================================================
 check_cert() {
-    say "TLS 证书专项扫描"
-    _found=0
-    for _d in /etc/letsencrypt/live /root/.acme.sh /etc/nginx/ssl /etc/ssl /usr/local/etc/xray "$_XRAY_DIR"; do
-        [ -d "$_d" ] || continue
-        # 找 fullchain.pem / .crt / .cer
-        for _c in $(find "$_d" -maxdepth 3 -type f \( -name '*.pem' -o -name '*.crt' -o -name '*.cer' \) 2>/dev/null | head -30); do
-            grep -q 'BEGIN CERTIFICATE' "$_c" 2>/dev/null || continue
-            _found=1
-            _check_cert_expiry "$_c"
+    say "TLS 证书专项 (root_domain + nginx .conf 引用证书)"
+
+    # C1. ~/node.json 的 root_domain 对应证书
+    _rd=""
+    if [ -f "$HOME/node.json" ] && has jq; then
+        _rd=$(jq -r '.root_domain // empty' "$HOME/node.json" 2>/dev/null)
+    fi
+    if [ -z "$_rd" ]; then
+        result WARN "CERT_NO_ROOT_DOMAIN" "$HOME/node.json 无 root_domain, 跳过主域证书检查" \
+            "确认 $HOME/node.json 是否存在且含 root_domain 字段; 或手动 openssl x509 -checkend 0 -noout -in <cert>"
+    else
+        _hit=0
+        for _d in /etc/letsencrypt/live /root/.acme.sh /etc/nginx/ssl /etc/ssl /usr/local/etc/xray "$_XRAY_DIR"; do
+            [ -d "$_d" ] || continue
+            for _c in $(find "$_d" -maxdepth 3 -type f \( -name '*.pem' -o -name '*.crt' -o -name '*.cer' \) 2>/dev/null); do
+                case "$_c" in /etc/ssl/certs/*) continue ;; esac   # CA 信任库, 非本站证书
+                grep -q 'BEGIN CERTIFICATE' "$_c" 2>/dev/null || continue
+                # CN / SAN 匹配 root_domain (含泛子域) 才是主域证书
+                _id="$(openssl x509 -in "$_c" -noout -subject 2>/dev/null)"
+                _id="$_id $(openssl x509 -in "$_c" -noout -text 2>/dev/null | grep -A1 'Subject Alternative Name' | tr '\n' ' ')"
+                case "$_id" in
+                    *"CN=$_rd"*|*"CN = $_rd"*|*"DNS:$_rd"*|*"DNS:*.$_rd"*|*"CN=*.$_rd"*|*"CN = *.$_rd"*)
+                        _hit=1
+                        _check_cert_file "$_c" CERT_ROOT_DOMAIN ;;
+                esac
+            done
         done
-    done
-    [ "$_found" = 0 ] && result WARN "CERT_NONE_FOUND" "常见目录未扫描到证书文件" "若无 TLS 入站可忽略; 否则检查证书路径"
+        [ "$_hit" = 0 ] && result WARN "CERT_ROOT_DOMAIN_NOT_FOUND" "未找到 root_domain=$_rd 的本地证书" \
+            "若证书在其它路径, 手动 openssl x509 -checkend 0 -noout -in <cert>; 若节点未用本地证书 (如 reality/自签) 可忽略"
+    fi
+
+    # C2. /etc/nginx *.conf 引用的证书 (与 N5 共用 _check_nginx_certs, 按路径去重)
+    _check_nginx_certs
 }
 
 # ============================================================
