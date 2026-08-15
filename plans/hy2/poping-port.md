@@ -82,6 +82,11 @@ systemctl enable hy2-port-hop
 
 ## 集成到 proxyInstall.sh
 
+> **实现状态（2026-08 同步）**：hy2 已不再是默认协议。实际落地（`proxyInstall.sh::Step3_5_SetupHy2PortHop`）
+> 与本方案 snippet 的差异：没有 `HY2_PORT_HOP` 开关，改为按 `v2_name` 条件触发 — 仅当
+> `v2_name` 含 `hy2` 时才写入 `30000-32000/UDP → node_port` 的 NAT 重定向（后端 nftables/iptables
+> 自动检测）；非 hy2 节点（vision / xhttp / reality 等）直接跳过，不再无条件写入重定向规则。
+
 在 `Main()` 流程中，于 `Step3_InstallXray()`（hy2/Xray 启动之后）插入新步骤：
 
 ### 新增函数 `Step3_5_SetupHy2PortHop()`
