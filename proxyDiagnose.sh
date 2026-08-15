@@ -98,9 +98,18 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# ---- --target 白名单前置校验 ----
+# 必须在远程分支之前: 远程分支会把 $TARGET 拼入远程命令串, 若不在入口处校验,
+# 未校验值既是注入面 (脚本声明可供面板/nodeAgent 程序化调用), 也会把非法值
+# 原样透传到远端。Main() 里的同款 case 仅作本地分发的双保险。
+case "$TARGET" in
+    all|xray|nginx|env|net|cert|outbound) ;;
+    *) echo "未知 --target: $TARGET (可选: all|xray|nginx|env|net|cert|outbound)" >&2; exit 2 ;;
+esac
 # ============================================================
 # 远程模式: 把自身推送到远程主机执行 (保证远程环境一致)
 # 远程主机必须有 bash/sh + 基础工具; 无需预装本脚本
+# ($TARGET 已在入口白名单校验, 拼接安全)
 # ============================================================
 if [ -n "$REMOTE_HOST" ]; then
     # 通过 ssh 执行自身 (stdin 传入脚本内容, 远程用 sh 跑; 剥离 --host 避免递归)
@@ -514,6 +523,8 @@ _XrayDeclaredProtoPorts() {
 # listen 形态: `80` / `443 ssl` / `[::]:443 ssl` / `1234 udp` / `127.0.0.1:8088`
 # → listen 后第一个 token 取最后冒号后部分 (剥离 IP 前缀) = port;
 #   同行含 ` udp ` 关键字 → UDP, 否则 TCP (nginx 默认 TCP)。
+#   HTTP/3 的 `listen ... quic` 同样监听 UDP (仅写法不带 udp 字样), 必须一并判为 UDP,
+#   否则 nginx QUIC 的 UDP:443 会被误判为 TCP → 与 xray UDP:443 的真实抢占漏报。
 # 先剥离 # 注释, 否则 `# listen 443 ssl;` 会被误判为真实声明。
 _NginxDeclaredProtoPorts() {
     has nginx || return 0
@@ -524,7 +535,7 @@ _NginxDeclaredProtoPorts() {
     fi | sed 's/#.*//' | awk '
         /[[:space:]]listen[[:space:]]/ || /^listen[[:space:]]/ {
             line=$0
-            proto = (line ~ /[[:space:]]udp([[:space:];]|$)/) ? "udp" : "tcp"
+            proto = (line ~ /[[:space:]](udp|quic)([[:space:];]|$)/) ? "udp" : "tcp"
             sub(/.*listen[[:space:]]+/, "", line)
             token=line; sub(/[[:space:];].*/, "", token); sub(/.*:/, "", token)
             if (token ~ /^[0-9]+$/) print proto" "token

@@ -73,12 +73,19 @@ Init() {
     mkdir -p "${NODEHUB_DIR}/xray"
     mkdir -p "${NODEHUB_DIR}/logs"
 
-    # 安装 crontab: 每晚 03:00 运行自身 (SSL 同步已交由 nodeAgent.sh:SyncSSL,
-    # 此处仅保证 GeoData / Xray 插件定期更新, 否则二者无任何自动触发源)
-    sed -i '/sync\.sh/d' /etc/crontab
-    echo "0 3 * * * root /bin/sh ${NODEHUB_DIR}/sync.sh" >> /etc/crontab
-
-    Log "目录就绪, crontab 已配置 (03:00)"
+    # 安装 crontab: 每晚 03:00 运行自身 (幂等: 先删旧条目再追加)。
+    # 写失败仅告警不中断 — 本脚本 set -eu, 裸写 /etc/crontab (仅 root 可写) 在非 root
+    # 排障运行时会直接中止整个 sync, 连 GeoData/Xray 插件更新都做不了。
+    # (SSL 同步已交由 nodeAgent.sh:SyncSSL, 此处仅保证 GeoData / Xray 插件
+    #   定期更新, 否则二者无任何自动触发源)
+    if [ "$(id -u)" = "0" ]; then
+        sed -i '/sync\.sh/d' /etc/crontab 2>/dev/null || true
+        echo "0 3 * * * root /bin/sh ${NODEHUB_DIR}/sync.sh" >> /etc/crontab 2>/dev/null \
+            || Log "crontab 写入失败 — 请检查 /etc/crontab 权限"
+        Log "目录就绪, crontab 已配置 (03:00)"
+    else
+        Log "非 root 运行, 跳过 crontab 自注册 (GeoData/Xray 更新照常)"
+    fi
 }
 
 # ============================================================

@@ -486,51 +486,73 @@ SyncSSL() {
 
     log info "SyncSSL: 开始同步 ${_root_domain} 证书"
 
-    # 4) 下载 .key — wget -N 仅在远程更新时实际拉取 (网络优化);
-    #    是否"真有更新"以内容 sha256 为准 (而非 mtime): 远程仅重写时间戳/内容未变时不误触发重启
-    _key_hash_before=$(_Sha256File "$_key_file")
-    if ! wget -N --timeout=30 --tries=1 -P /etc/ssl \
+    # 4) 原子同步 — 下载到临时目录, 全部校验通过后才一次性落盘 /etc/ssl。
+    #    不能分两次直接 wget -P /etc/ssl 覆盖: 若 .key 成功而 .pem 下载失败(节点网络
+    #    不稳并非小概率), 会留下 "新 key + 旧 pem" 的不一致中间态 — 本次 return 0
+    #    不 reload, 但磁盘状态已脏; 在下次 03:00 自愈前(最长约 24h), 任何重启
+    #    (Restart=always 崩溃拉起 / 内核升级 reboot / 人工运维)都会加载到配对错误的
+    #    证书 → TLS 握手失败。范式镜像 scripts/auto-renew-ssl.sh::RenewDomain。
+    _ssl_tmp=$(mktemp -d 2>/dev/null) || { log warn "SyncSSL: 创建临时目录失败, 跳过"; return 0; }
+    if ! wget --timeout=30 --tries=1 -O "${_ssl_tmp}/${_root_domain}.key" \
             "${NODEHUB_URL}/ssl/${_root_domain}.key" 2>/dev/null; then
         log warn "SyncSSL: ${_root_domain}.key 下载失败"
-        return 0
+        rm -rf "$_ssl_tmp"; return 0
     fi
-    _key_hash_after=$(_Sha256File "$_key_file")
-    if [ "$_key_hash_before" != "$_key_hash_after" ]; then
-        _updated=1
-        log info "SyncSSL: ${_root_domain}.key 内容已更新"
-    fi
-
-    # 5) 下载 .pem — 同上, 以内容 sha256 判断
-    _pem_hash_before=$(_Sha256File "$_pem_file")
-    if ! wget -N --timeout=30 --tries=1 -P /etc/ssl \
+    if ! wget --timeout=30 --tries=1 -O "${_ssl_tmp}/${_root_domain}.pem" \
             "${NODEHUB_URL}/ssl/${_root_domain}.pem" 2>/dev/null; then
         log warn "SyncSSL: ${_root_domain}.pem 下载失败"
-        return 0
-    fi
-    _pem_hash_after=$(_Sha256File "$_pem_file")
-    if [ "$_pem_hash_before" != "$_pem_hash_after" ]; then
-        _updated=1
-        log info "SyncSSL: ${_root_domain}.pem 内容已更新"
+        rm -rf "$_ssl_tmp"; return 0
     fi
 
-    # 6) 权限收紧 — 私钥必须 600
-    chmod 600 "$_key_file" 2>/dev/null || true
-    chmod 644 "$_pem_file" 2>/dev/null || true
-
-    # 7) 格式校验 — 镜像 proxyInstall.sh Step1_5_DownloadSSL
-    if ! grep -q 'BEGIN CERTIFICATE' "$_pem_file" 2>/dev/null; then
-        log error "SyncSSL: ${_root_domain}.pem 不含 CERTIFICATE — 源文件可能损坏"
-        return 0
+    # 5) 格式校验 — 镜像 proxyInstall.sh Step1_5_DownloadSSL
+    if ! grep -q 'BEGIN CERTIFICATE' "${_ssl_tmp}/${_root_domain}.pem" 2>/dev/null; then
+        log error "SyncSSL: ${_root_domain}.pem 不含 CERTIFICATE — 源文件可能损坏, 保持旧证书"
+        rm -rf "$_ssl_tmp"; return 0
     fi
-    if ! grep -q 'PRIVATE KEY' "$_key_file" 2>/dev/null; then
-        log error "SyncSSL: ${_root_domain}.key 不含 PRIVATE KEY — 源文件可能损坏"
-        return 0
+    if ! grep -q 'PRIVATE KEY' "${_ssl_tmp}/${_root_domain}.key" 2>/dev/null; then
+        log error "SyncSSL: ${_root_domain}.key 不含 PRIVATE KEY — 源文件可能损坏, 保持旧证书"
+        rm -rf "$_ssl_tmp"; return 0
     fi
 
-    # 8) 全部通过
+    # 6) 配对校验 (openssl 可用时) — 证书公钥 ↔ 私钥公钥必须一致;
+    #    只查文件头不查配对, 会漏掉 "新 key + 旧 pem" 这类半更新
+    if command -v openssl >/dev/null 2>&1; then
+        _cpk=$(openssl x509 -in "${_ssl_tmp}/${_root_domain}.pem" -pubkey -noout 2>/dev/null | openssl md5 2>/dev/null)
+        _kpk=$(openssl pkey -in "${_ssl_tmp}/${_root_domain}.key" -pubout 2>/dev/null | openssl md5 2>/dev/null)
+        if [ -z "$_cpk" ] || [ "$_cpk" != "$_kpk" ]; then
+            log error "SyncSSL: ${_root_domain} 证书与私钥不配对 — 源文件可能损坏, 保持旧证书"
+            rm -rf "$_ssl_tmp"; return 0
+        fi
+    fi
+
+    # 7) 内容对比 (sha256, 非 mtime) — 仅当 key/pem 任一内容真正变化才部署 + 触发重启;
+    #    远程仅重写时间戳/内容未变时不误判为已更新 (避免每天无谓重启 xray)
+    _key_hash_before=$(_Sha256File "$_key_file")
+    _pem_hash_before=$(_Sha256File "$_pem_file")
+    _key_hash_after=$(_Sha256File "${_ssl_tmp}/${_root_domain}.key")
+    _pem_hash_after=$(_Sha256File "${_ssl_tmp}/${_root_domain}.pem")
+    if [ "$_key_hash_before" = "$_key_hash_after" ] && [ "$_pem_hash_before" = "$_pem_hash_after" ]; then
+        log info "SyncSSL: ${_root_domain} 证书内容无变化, 保持现状"
+        rm -rf "$_ssl_tmp"; return 0
+    fi
+
+    # 8) 原子部署 — install 单文件覆盖, 权限收紧 (key 600 / pem 644)
+    if ! install -m 0600 "${_ssl_tmp}/${_root_domain}.key" "$_key_file" 2>/dev/null; then
+        log error "SyncSSL: 写入 ${_key_file} 失败"
+        rm -rf "$_ssl_tmp"; return 0
+    fi
+    if ! install -m 0644 "${_ssl_tmp}/${_root_domain}.pem" "$_pem_file" 2>/dev/null; then
+        log error "SyncSSL: 写入 ${_pem_file} 失败"
+        rm -rf "$_ssl_tmp"; return 0
+    fi
+    rm -rf "$_ssl_tmp"
+    _updated=1
+    log info "SyncSSL: ${_root_domain} 证书已原子更新 (key/pem 配对校验通过)"
+
+    # 9) 全部通过
     log info "SyncSSL: ${_root_domain} 证书同步完成 (updated=${_updated})"
 
-    # 9) 检测到更新 → reload nginx + 重启 xray, 让新证书生效
+    # 10) 检测到更新 → reload nginx + 重启 xray, 让新证书生效
     if [ "$_updated" = "1" ]; then
         log info "SyncSSL: 检测到证书更新, 重载服务"
 
