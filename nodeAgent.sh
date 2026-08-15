@@ -378,12 +378,15 @@ _Sha256File() {
     [ -f "$1" ] || return 0
     # 文件存在: 计算内容指纹, 优先 sha256 → md5 → cksum (同次调用 before/after 用同一算法, 不影响对比)
     if command -v sha256sum >/dev/null 2>&1; then
-        _sh_out=$(sha256sum "$1" 2>/dev/null)
+        _sh_out=$(sha256sum "$1" 2>/dev/null) || _sh_out=""
     elif command -v md5sum >/dev/null 2>&1; then
-        _sh_out=$(md5sum "$1" 2>/dev/null)
+        _sh_out=$(md5sum "$1" 2>/dev/null) || _sh_out=""
     else
-        _sh_out=$(cksum "$1" 2>/dev/null | awk '{print $1"-"$2}')
+        _sh_out=$(cksum "$1" 2>/dev/null | awk '{print $1"-"$2}') || _sh_out=""
     fi
+    # `|| _sh_out=""` 使哈希命令失败 (如文件被并发删除/权限异常) 时落入下方
+    # size:mtime 兜底分支, 而不是被 set -e 放大为整个 nodeAgent 退出 —
+    # 否则兜底分支永远不可达 (死代码), "始终返回 0" 的承诺不成立。
     # 正常: sha256/md5 输出 "<hash>  <path>", 取首字段; cksum 分支已是 "crc-size" (无空格, 取整串)。
     # 读失败 (_sh_out 为空) → 用 size:mtime 兜底: 避免"前后两次都读失败=都空串"被误判为
     # "内容未变"而漏掉真实更新 (证书真变时 size/mtime 必变, 仍能触发 before != after → 重启)。
@@ -704,13 +707,14 @@ PatchFixTrafficResetDayAndUsed() {
     fi
 
     # 3) wget -N 下载到 /tmp (按 basename 保存; 文件保留不删除)
+    #    下载在子 shell 内 cd /tmp, 不污染主流程 cwd (与 PatchXraySighupReloadBug 一致);
+    #    执行用绝对路径, 与当前 cwd 解耦
     _patch_url="${NODEHUB_URL}/.patches/fix_traffic_reset_day_and_traffic_used.py"
-    cd /tmp || { log error "进入 /tmp 失败"; return 0; }
-    if wget -N -T 30 "$_patch_url" 2>/dev/null; then
+    if ( cd /tmp && wget -N -T 30 "$_patch_url" 2>/dev/null ); then
         # 4) 执行 — 脚本自带 Telegram 通知 (直接读 ~/.env), 失败不阻断 nodeAgent
         #    vnstat 缺失 / 上报失败 均由脚本自身发 Telegram, 此处不再转发信号
         log info "执行流量校准补丁 (仅 traffic_used)"
-        python3 fix_traffic_reset_day_and_traffic_used.py || true
+        python3 /tmp/fix_traffic_reset_day_and_traffic_used.py || true
     else
         log warn "下载流量校准补丁失败: ${_patch_url}"
     fi
