@@ -821,7 +821,10 @@ MODPROBE_EOF
                 rm -f "${_swap_file}" 2>/dev/null || true
             fi
         else
-            log warn "swap 文件创建失败, 跳过"
+            # dd 中途失败 (如磁盘写满) 会残留部分写入的 swapfile 继续占磁盘, 可能反过来
+            # 阻碍恢复 — 与上方 mkswap/swapon 失败分支一致, 清理残留 (此分支未 swapon, 删除安全)
+            log warn "swap 文件创建失败, 清理残留文件"
+            rm -f "${_swap_file}" 2>/dev/null || true
         fi
     else
         log debug "内存 ${_mem_mb}MB >= 2GB, 跳过 swap 创建"

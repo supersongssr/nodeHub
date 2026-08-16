@@ -114,8 +114,12 @@ esac
 if [ -n "$REMOTE_HOST" ]; then
     # 通过 ssh 执行自身 (stdin 传入脚本内容, 远程用 sh 跑; 剥离 --host 避免递归)
     # 远程为非 TTY, 颜色由 [ -t 1 ] 自动关闭, 无需转发 --no-color
-    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$REMOTE_HOST" \
-        "sh -s -- --target $TARGET $( [ "$JSON_OUTPUT" = 1 ] && echo --json ) $( [ "$QUIET" = 1 ] && echo --quiet )" \
+    # TARGET 虽已经入口白名单校验, 仍以单引号包裹传递 (纵深防御, 保证只作为单个 argv)。
+    # StrictHostKeyChecking=accept-new (OpenSSH>=7.6): 首次连接记录主机密钥、之后
+    #   指纹变化即拒绝 — 比 =no 抗 DNS 劫持/中间人; 本脚本以登录身份在远端执行,
+    #   信道可信度重要。老版 OpenSSH 不识别 accept-new 时可 DIAG_SSH_STRICT=no 回退。
+    ssh -o "StrictHostKeyChecking=${DIAG_SSH_STRICT:-accept-new}" -o ConnectTimeout=10 "$REMOTE_HOST" \
+        "sh -s -- --target '$TARGET' $( [ "$JSON_OUTPUT" = 1 ] && echo --json ) $( [ "$QUIET" = 1 ] && echo --quiet )" \
         < "$0"
     exit $?
 fi
@@ -1012,28 +1016,34 @@ check_net() {
 # ============================================================
 _check_node_port_external() {
     _resolve_node_port
+    # 协议感知: NODE_PORT 可能承载 TCP (VLESS/TLS, nginx 反代或 xray 直听) 也可能承载
+    #   UDP (Hysteria2 — proxyInstall.sh 防火墙就是按 node_port/tcp + node_port/udp 双
+    #   放行的), 故用 -tulnp 同查两协议; 仅查 TCP 会对 hysteria2 直听 NODE_PORT 的
+    #   节点误报 NODE_PORT_NOT_LISTENING (TCP/UDP 是两个独立命名空间, 见 _PortOverlapCheck)。
+    # 注意: -tulnp 输出比 -tlnp 多首列 Netid, 本地地址从 $4 变为 $5。
     # 端口锚定用 ([^0-9]|$) 而非 \b: \b 是 GNU grep 扩展, busybox/BSD grep 不识别会静默无输出 → _listen 恒空 → 误报 NODE_PORT 无监听。
     # ([^0-9]|$) 跨实现一致, 且避免 :443 误匹到 :4430 / IPv6 地址段等子串。
-    _listen=$(ss -H -tlnp 2>/dev/null | grep -E "[:.]$_NODE_PORT([^0-9]|$)")
+    _listen=$(ss -H -tulnp 2>/dev/null | grep -E "[:.]$_NODE_PORT([^0-9]|$)")
     if [ -z "$_listen" ]; then
         # 提示实际对外监听端口 —— 常见: ~/.env 的 NODE_PORT 已过期, 实际端口在别处
-        _actual=$(ss -H -tlnp 2>/dev/null | grep -E 'users:.+"(xray|nginx)"' \
-                 | grep -vE '127\.0\.0\.1|::1' | awk '{print $4}' | tr '\n' ',' | sed 's/,$//')
+        _actual=$(ss -H -tulnp 2>/dev/null | grep -E 'users:.+"(xray|nginx)"' \
+                 | grep -vE '127\.0\.0\.1|::1' | awk '{print $5}' | tr '\n' ',' | sed 's/,$//')
         if [ -n "$_actual" ]; then
             _hint="实际对外监听端口: [$_actual] —— ~/.env 的 NODE_PORT=$_NODE_PORT 疑似过期, 与实际不符 (重跑安装脚本会读到错误端口搞坏代理)"
         else
             _hint="xray/nginx 均未监听任何对外端口, 检查服务是否启动"
         fi
-        result FAIL "NODE_PORT_NOT_LISTENING" "NODE_PORT=$_NODE_PORT 无进程监听 → 外部无法连接" \
+        result FAIL "NODE_PORT_NOT_LISTENING" "NODE_PORT=$_NODE_PORT (TCP/UDP 均无监听) → 外部无法连接" \
             "$_hint。核对 ~/.env / node.json / node.env 的 NODE_PORT 与实际配置一致"
         return
     fi
-    _binds=$(printf '%s\n' "$_listen" | awk '{print $4}')
+    _binds=$(printf '%s\n' "$_listen" | awk '{print $5}')
     # 外部可达 = 存在非环回监听地址 (* / 0.0.0.0 / [::] / 公网IP)
     _external=$(printf '%s\n' "$_binds" | grep -vE '^(127\.|\[?::1\])' | head -1)
     if [ -n "$_external" ]; then
-        _b=$(printf '%s\n' "$_binds" | tr '\n' ',' | sed 's/,$//')
-        result PASS "NODE_PORT_EXTERNAL" "NODE_PORT=$_NODE_PORT 监听在对外地址 [$_b] → 外部可达"
+        _b=$(printf '%s\n' "$_listen" | awk '{print $1"/"$5}' | sort -u | tr '\n' ',' | sed 's/,$//')
+        result PASS "NODE_PORT_EXTERNAL" "NODE_PORT=$_NODE_PORT 监听在对外地址 [$_b] → 外部可达" \
+            "TCP/UDP 任一协议对外监听即视为可达 (Hysteria2 走 UDP)"
     else
         result FAIL "NODE_PORT_LOCALHOST_ONLY" "NODE_PORT=$_NODE_PORT 仅监听 127.0.0.1/::1 → 外部无法访问" \
             "xray inbound 的 listen 留空或设 0.0.0.0; nginx listen 行去掉 127.0.0.1: 前缀"

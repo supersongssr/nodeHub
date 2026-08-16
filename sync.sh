@@ -79,7 +79,9 @@ Init() {
     # (SSL 同步已交由 nodeAgent.sh:SyncSSL, 此处仅保证 GeoData / Xray 插件
     #   定期更新, 否则二者无任何自动触发源)
     if [ "$(id -u)" = "0" ]; then
-        sed -i '/sync\.sh/d' /etc/crontab 2>/dev/null || true
+        # 用完整路径锚定删除旧条目: 裸 '/sync\.sh/d' 会误删任何名字含 sync.sh 子串的
+        # 无关条目 (如 /opt/backup/backup-sync.sh); sed 地址用 \#...# 作定界符容纳路径中的 /
+        sed -i "\#${NODEHUB_DIR}/sync.sh#d" /etc/crontab 2>/dev/null || true
         echo "0 3 * * * root /bin/sh ${NODEHUB_DIR}/sync.sh" >> /etc/crontab 2>/dev/null \
             || Log "crontab 写入失败 — 请检查 /etc/crontab 权限"
         Log "目录就绪, crontab 已配置 (03:00)"
