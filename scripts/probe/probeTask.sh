@@ -46,10 +46,18 @@ plog() {
 }
 
 # ============================================================
-# 动态节点判定 — stat_client 服务带 -g (group 模式)
-# 固定节点 (user 模式无 -g) 直接退出, 不采集
+# 动态节点判定 — 首选显式声明字段, 兕底 stat_client -g 标记
+#   1. ~/node.env 的 node_class="dynamic" (proxyInstall v2.4.1+ 写入, 显式可靠)
+#   2. stat_client 服务带 -g (group 模式) — 历史节点无 node_class 字段时的兕底
+# 固定节点 (node_class 非 dynamic 且 user 模式无 -g) 直接退出, 不采集
+# ⚠ 不要用“是否有 node_name”判定节点类型: 固定/动态节点均可拥有 name
 # ============================================================
 IsDynamicNode() {
+    # 1. 显式声明: node_class=dynamic
+    if [ -f ~/node.env ] && grep -q '^node_class="*dynamic"*' ~/node.env 2>/dev/null; then
+        return 0
+    fi
+    # 2. 兕底: group 模式标记 (-g)
     _svc=/etc/systemd/system/stat_client.service
     [ -f "$_svc" ] || return 1
     grep -qE -- '( -g |--group )' "$_svc" 2>/dev/null

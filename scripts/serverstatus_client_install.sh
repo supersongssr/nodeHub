@@ -8,7 +8,7 @@
 
 set -eu
 
-VERSION="v1.0.0-20260530"
+VERSION="v1.1.0-20260817"
 
 # ============================================================
 # ERR Trap — 任何命令失败时打印诊断信息后终止
@@ -84,6 +84,12 @@ CLIENT_FILE="${CLIENT_DIR}/stat_client"
 SERVICE_CONF="/etc/systemd/system/stat_client.service"
 
 Download() {
+    # 幂等: 二进制已存在且可执行 → 跳过下载 (重装/改 alias 场景无需重复拉取)
+    if [ -x "$CLIENT_FILE" ]; then
+        log info "stat_client 已存在 (${CLIENT_FILE})，跳过下载"
+        return 0
+    fi
+
     _zip_name="client-${ARCH}-unknown-linux-musl.zip"
     _download_url="https://github.com/zdz/ServerStatus-Rust/releases/latest/download/${_zip_name}"
 
@@ -109,20 +115,29 @@ Download() {
 # E. 写入 systemd 服务
 # ============================================================
 # 参数透传: 第一个参数即 stat_client 的全部命令行参数 (已由调用方拼好)
+# --alias 值 (若提供) 会提取出来:
+#   1. 写入 unit Description — systemctl status 一眼可见节点名
+#   2. 快照到 stat_client.args — 重装/诊断时可追溯最终生效参数
 WriteService() {
     STAT_ARGS="$1"
-    [ -z "$STAT_ARGS" ] && die "缺少 stat_client 参数 — 用法: $0 '<stat_client 的 -a/-u/-p/[-g]/... 参数>'"
-    log info "写入 systemd 配置 (版本 ${_latest}) — ExecStart 参数: ${STAT_ARGS}"
+    [ -z "$STAT_ARGS" ] && die "缺少 stat_client 参数 — 用法: $0 '<stat_client 的 -a/-u/-p/[-g]/--alias/... 参数>'"
+
+    # 提取 --alias 后的第一个词作为节点名 (无则标记 unnamed)
+    NODE_ALIAS=$(printf '%s' "$STAT_ARGS" | sed -n 's/.*--alias[[:space:]][[:space:]]*\([^[:space:]]*\).*/\1/p')
+    [ -z "$NODE_ALIAS" ] && NODE_ALIAS="unnamed"
+
+    log info "写入 systemd 配置 (版本 ${_latest}) — 节点名: ${NODE_ALIAS} | ExecStart 参数: ${STAT_ARGS}"
     cat > "${SERVICE_CONF}" <<-EOF
 #Version=${_latest}
 [Unit]
-Description=ServerStatus-Rust Client
+Description=ServerStatus-Rust Client (${NODE_ALIAS})
 After=network.target
 
 [Service]
 User=root
 Group=root
 Environment="RUST_BACKTRACE=1"
+Environment="NODE_NAME=${NODE_ALIAS}"
 WorkingDirectory=${WORKING_DIR}
 ExecStart=${CLIENT_FILE} ${STAT_ARGS}
 ExecReload=/bin/kill -HUP \$MAINPID
@@ -133,7 +148,10 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    log info "systemd 配置已写入 ${SERVICE_CONF}"
+    # 参数快照 — 供 proxyInstall 幂等检测与人工诊断读取
+    printf '%s\n' "$STAT_ARGS" > "${CLIENT_DIR}/stat_client.args" 2>/dev/null || true
+
+    log info "systemd 配置已写入 ${SERVICE_CONF} (节点名: ${NODE_ALIAS})"
 }
 
 # ============================================================
@@ -151,7 +169,7 @@ EnableService() {
 # ============================================================
 Verify() {
     if systemctl is-active --quiet stat_client; then
-        log info "✅ stat_client 运行正常"
+        log info "✅ stat_client 运行正常 (节点名: ${NODE_ALIAS:-unnamed})"
         systemctl status stat_client --no-pager || true
     else
         die "❌ stat_client 启动失败，请检查: journalctl -u stat_client -n 50"
@@ -180,6 +198,7 @@ main() {
     Cleanup
 
     log info "===== ServerStatus 客户端安装完成 ====="
+    log info "节点名(alias): ${NODE_ALIAS:-unnamed} — 在 ServerStatus 面板直接搜索该名称即可定位节点"
 }
 
 main "$@"

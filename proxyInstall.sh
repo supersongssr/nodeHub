@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.3.0-20260429"
+VERSION="v2.4.1-20260817"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -191,6 +191,74 @@ sanitize_int() {
 }
 
 # ============================================================
+# 节点名清洗 — 生成可安全用于 API 调用 / URL / ServerStatus 的 slug
+# 规则: 小写 | 空格/斜杠/点→'-' | 仅保留 [a-z0-9_-] | 压缩连续分隔符 | 去首尾分隔符
+# ============================================================
+SanitizeName() {
+    printf '%s' "$1" \
+        | tr 'A-Z' 'a-z' \
+        | tr ' /.' '---' \
+        | tr -cd 'a-z0-9_-' \
+        | sed -E 's/([-_]){2,}/\1/g; s/^[-_]+//; s/[-_]+$//'
+}
+
+# ============================================================
+# 节点名解析 — Step1_Register 之后调用 (v2_name 已由面板回传确定)
+# 优先级:
+#   1. 显式指定: 环境变量 NODE_NAME / ~/.env NODE_NAME / STAT_NAME (人工改名入口)
+#   2. 粘性复用: 已持久化到 ~/node.env 的 node_name ★核心: 重装/重跑不换名
+#   3. v2_name (面板注册回传, 仅首次无持久化值时使用)
+#   4. 兜底: 自动生成 ${API_PANEL}_${NODE_ID}
+# 产出: node_name (非空保证: 极端情况下兜底为 node_${NODE_ID})
+# ============================================================
+ResolveNodeName() {
+    _nn="${NODE_NAME:-${STAT_NAME:-}}"
+
+    # 粘性复用: 已持久化的 node_name 优先 — 保证 NAME 固定不变,
+    # 重装/重跑不换名, 不产生 ServerStatus 孤儿条目 (v2_name 变化也不再自动改名)
+    if [ -z "$_nn" ]; then
+        _nn="${node_name:-}"   # LoadEnv 已 source ~/node.env
+        [ -z "$_nn" ] && [ -f ~/node.env ] \
+            && _nn=$(grep '^node_name=' ~/node.env 2>/dev/null | tail -1 | sed 's/^node_name="//;s/"$//' || true)
+        [ -n "$_nn" ] && log info "node_name 粘性复用已持久化值: ${_nn}"
+    fi
+
+    [ -z "$_nn" ] && _nn="${v2_name:-}"
+    [ -z "$_nn" ] && _nn="${API_PANEL}_${NODE_ID}"
+
+    node_name=$(SanitizeName "$_nn")
+    [ -z "$node_name" ] && node_name="node_${NODE_ID}"   # 极端兜底: sanitize 后为空
+
+    log info "node_name 已解析: ${node_name} (来源: ${_nn})"
+}
+
+# ============================================================
+# 节点名持久化 — 三处同步, 供不同消费方式读取:
+#   ~/node.env  → node_name="xxx"   (source ~/node.env 后直接用 $node_name)
+#   ~/node.name → 单行纯文本        (cat ~/node.name 即可读, 供 systemd/监控/人工)
+#   ~/node.json → node_name 字段     (jq -r '.node_name' ~/node.json)
+# ============================================================
+PersistNodeName() {
+    [ -z "${node_name:-}" ] && { log warn "PersistNodeName: node_name 为空，跳过持久化"; return 0; }
+
+    SetNodeEnv "node_name" "$node_name"
+    # 节点类别显式化: proxyInstall 仅部署动态节点 (固定节点不跑本脚本)
+    # probeTask.sh IsDynamicNode 首选读此字段, stat_client -g 检测仅作历史节点兜底
+    SetNodeEnv "node_class" "dynamic"
+
+    printf '%s\n' "$node_name" > ~/node.name
+    chmod 644 ~/node.name 2>/dev/null || true
+
+    if [ -f ~/node.json ]; then
+        _tmp_json=$(jq --arg nn "$node_name" '.node_name = $nn' ~/node.json 2>/dev/null) \
+            && printf '%s\n' "$_tmp_json" > ~/node.json \
+            || log warn "~/node.json 写入 node_name 失败 (文件可能损坏), 跳过"
+    fi
+
+    log info "node_name=${node_name} 已持久化 → ~/node.env | ~/node.name | ~/node.json"
+}
+
+# ============================================================
 # ~/node.env 原子写入
 # ============================================================
 SetNodeEnv() {
@@ -283,6 +351,7 @@ LoadEnv() {
     _ENV_STAT_USER="${STAT_USER:-}"
     _ENV_STAT_API_URL="${STAT_API_URL:-}"
     _ENV_STAT_API_PASSWORD="${STAT_API_PASSWORD:-}"
+    _ENV_NODE_NAME="${NODE_NAME:-}"
 
     # 1. 加载 ~/.env (用户手工只读配置 — 全大写变量)
     if [ -f ~/.env ]; then
@@ -344,6 +413,7 @@ LoadEnv() {
     [ -n "${_ENV_STAT_USER}" ]          && STAT_USER="${_ENV_STAT_USER}"
     [ -n "${_ENV_STAT_API_URL}" ]       && STAT_API_URL="${_ENV_STAT_API_URL}"
     [ -n "${_ENV_STAT_API_PASSWORD}" ]  && STAT_API_PASSWORD="${_ENV_STAT_API_PASSWORD}"
+    [ -n "${_ENV_NODE_NAME}" ]         && NODE_NAME="${_ENV_NODE_NAME}" && log info "环境变量 NODE_NAME=${NODE_NAME} (最高优先级)"
 
     # ----------------------------------------------------------
     # ~/.env 大写变量 → 透传（无默认值，由 panel 下发）
@@ -418,6 +488,11 @@ LoadEnv() {
 
     # 节点描述 (可选)
     node_info="${NODE_INFO:-}"
+
+    # 节点名 (可选) — 显式指定 node_name; 未指定时优先用面板注册回传的 v2_name
+    # 优先级: 环境变量 NODE_NAME > ~/.env NODE_NAME > STAT_NAME > v2_name > ${API_PANEL}_${NODE_ID}
+    # 解析在 Step1_Register 之后的 ResolveNodeName() 中完成
+    # 节点侧随时读取: cat ~/node.name | source ~/node.env 后用 $node_name | jq .node_name ~/node.json
 
     # root_domain: 环境变量 ROOT_DOMAIN > ~/node.env (root_domain)
     root_domain="${root_domain:-${ROOT_DOMAIN:-}}"
@@ -1236,15 +1311,24 @@ Step0_ApplyId() {
 
 # ============================================================
 # Step 0.5: 安装 ServerStatus 客户端
-# 在 Step0 获取 node_id 之后，下载并运行 serverstatus_client_install.sh
+# 位于 Step1_Register 之后 — node_name 已由 ResolveNodeName 解析并持久化:
+#   * --alias = node_name  (ServerStatus 面板上直接搜 name 即可查到节点)
+#   * -u USER  默认 = node_name (v2_name 面板侧唯一, 重装时面板回传同名, USER 稳定)
+#   * 可通过 STAT_USER 显式覆盖; group 模式仍可 STAT_GID 指定分组
 # ============================================================
 Step0_5_InstallServerStatus() {
     log info "Step 0.5: 安装 ServerStatus 客户端"
 
-    # 已安装则跳过
+    # node_name 防御 (ResolveNodeName 应已赋值)
+    [ -z "${node_name:-}" ] && node_name="${API_PANEL}_${NODE_ID}"
+
+    # 幂等检测: 已安装且 alias 未变 → 跳过; alias 变化 (面板改名) → 重写 service
     if [ -f /opt/ServerStatus/client/stat_client ]; then
-        log info "stat_client 已存在，跳过安装"
-        return 0
+        if grep -q -- "--alias ${node_name}" /etc/systemd/system/stat_client.service 2>/dev/null; then
+            log info "stat_client 已存在且 alias=${node_name} 未变化，跳过安装"
+            return 0
+        fi
+        log info "stat_client 已存在但 alias 变化 → 重写 systemd 配置 (node_name=${node_name})"
     fi
 
     _script_name="serverstatus_client_install.sh"
@@ -1255,46 +1339,38 @@ Step0_5_InstallServerStatus() {
     chmod +x "/tmp/${_script_name}"
 
     # ---- 拼装 stat_client 参数 (透传给子脚本, 子脚本不读 .env) ----
-    # proxyInstall 已 . ~/.env + export 覆盖, 故 STAT_API_URL / STAT_API_PASSWORD / STAT_GID / STAT_USER / STAT_NAME 直接可用
-    # NODE_ID 已在 LoadEnv/Step0 解析; API_PANEL 必存在 (LoadEnv 已校验)
+    # proxyInstall 已 . ~/.env + export 覆盖, 故 STAT_API_URL / STAT_API_PASSWORD / STAT_GID / STAT_USER 直接可用
+    # node_name 已由 ResolveNodeName 解析并持久化 — 后续调用只需 name 即可定位节点
     #
-    # 模式判定 (3 选 1):
-    #   1. STAT_GID 存在               → group 模式 (-g), USER 自动取 = GID (可被 STAT_USER/STAT_NAME 覆盖)
-    #   2. STAT_USER 或 STAT_NAME 存在 → user 模式 (无 -g)
-    #   3. 两者都没有                  → 默认 group 模式: STAT_GID=${API_PANEL}, USER 自动生成
+    # 模式判定:
+    #   STAT_GID 显式指定             → group 模式 (-g)          [动态节点, probe 采集]
+    #   STAT_USER 显式指定 (无 GID)   → user 模式 (无 -g)        [固定节点专用, 手工指定]
+    #   均未指定                      → 默认 group 模式 (GID=${API_PANEL})
     [ -z "${STAT_API_URL:-}" ]      && { log error "~/.env 缺少 STAT_API_URL，跳过 ServerStatus 安装"; return 0; }
     [ -z "${STAT_API_PASSWORD:-}" ] && { log error "~/.env 缺少 STAT_API_PASSWORD，跳过 ServerStatus 安装"; return 0; }
 
-    # 1. 定模式 & GID: STAT_GID 优先 → 有 USER 则纯 user 模式 → 都没有则默认 group 模式 (GID=${API_PANEL})
-    if   [ -n "${STAT_GID:-}" ]; then
-        : # group 模式 — GID 已显式指定
-    elif [ -n "${STAT_USER:-}" ] || [ -n "${STAT_NAME:-}" ]; then
-        : # user 模式 — 不带 -g
-    else
+    # 1. 定模式: 默认 group 模式 (STAT_GID=${API_PANEL}); 仅显式 STAT_USER 无 GID 时才 user 模式
+    # ⚠ group 模式 (-g) 是"动态节点"的判定标记 (probeTask.sh IsDynamicNode 检测 -g):
+    #   默认必须保持 group, 否则新装动态节点会被探针采集静默跳过 (误判为固定节点)
+    if [ -z "${STAT_GID:-}" ] && [ -z "${STAT_USER:-}" ]; then
         STAT_GID="${API_PANEL}"
-        log info "STAT_GID / STAT_USER 均未指定 → 默认 group 模式 (STAT_GID=${STAT_GID})"
+        log info "STAT_GID / STAT_USER 均未指定 → 默认 group 模式 (STAT_GID=${STAT_GID}, 动态节点标记)"
     fi
 
-    # 2. 定 USER: STAT_USER 优先 → STAT_NAME 兜底 → group 模式自动取 = GID
+    # 2. 定 USER: STAT_USER 显式优先 → 默认 node_name (ServerStatus 上的可读唯一键)
     if   [ -n "${STAT_USER:-}" ]; then
         _stat_u="${STAT_USER}"
-    elif [ -n "${STAT_NAME:-}" ]; then
-        _stat_u="${STAT_NAME}"
-    elif [ -n "${STAT_GID:-}" ]; then
-        _stat_u="${API_PANEL}_${NODE_ID}"
-        log info "group 模式自动生成 USER: ${_stat_u} (可设 STAT_USER 覆盖)"
     else
-        log error "无法确定 USER (STAT_USER/STAT_NAME/STAT_GID 均为空)，跳过 ServerStatus 安装"
-        return 0
+        _stat_u="${node_name}"
     fi
 
-    # 3. 拼参: STAT_GID 存在 → group 模式 (追加 -g 与 --alias); 否则纯 user 模式
+    # 3. 拼参: STAT_GID 存在 → group 模式 (追加 -g); alias 恒为 node_name
     if [ -n "${STAT_GID:-}" ]; then
-        _stat_args="-a ${STAT_API_URL} -u ${_stat_u} -p ${STAT_API_PASSWORD} -g ${STAT_GID} --alias ${NODE_ID} --interval 17"
-        log info "stat_client (group 模式): GID=${STAT_GID} USER=${_stat_u} ALIAS=${NODE_ID}"
+        _stat_args="-a ${STAT_API_URL} -u ${_stat_u} -p ${STAT_API_PASSWORD} -g ${STAT_GID} --alias ${node_name} --interval 17"
+        log info "stat_client (group 模式): GID=${STAT_GID} USER=${_stat_u} ALIAS=${node_name}"
     else
-        _stat_args="-a ${STAT_API_URL} -u ${_stat_u} -p ${STAT_API_PASSWORD} --interval 17"
-        log info "stat_client (user 模式): USER=${_stat_u}"
+        _stat_args="-a ${STAT_API_URL} -u ${_stat_u} -p ${STAT_API_PASSWORD} --alias ${node_name} --interval 17"
+        log info "stat_client (user 模式): USER=${_stat_u} ALIAS=${node_name}"
     fi
     log info "stat_client 参数: ${_stat_args}"
 
@@ -2086,8 +2162,12 @@ Main() {
     DetectPanel
     InitSystem
     Step0_ApplyId
-    Step0_5_InstallServerStatus
     Step1_Register
+    # node_name 解析与持久化 — 必须在注册之后: 主来源 v2_name 由面板回传确认
+    ResolveNodeName
+    PersistNodeName
+    # ServerStatus 移至注册后安装: alias/USER 用最终 node_name, 面板上搜 name 即可定位节点
+    Step0_5_InstallServerStatus
     Step1_5_DownloadSSL
     Step2_5_InstallAriaNg
     Step3_InstallNginx
@@ -2101,6 +2181,7 @@ Main() {
 
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"
+    log info "node_name=${node_name:-无} (读取方式: cat ~/node.name | grep node_name ~/node.env | jq -r .node_name ~/node.json)"
     log info "node_ids=${node_ids:-无}"
     log info "node_port=${node_port}"
     log info "API_PANEL=${API_PANEL}"
