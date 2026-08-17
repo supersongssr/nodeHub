@@ -7,10 +7,10 @@ node proxy scripts hub — V2「瘦节点、胖面板」架构的代理节点脚
 
 | 脚本 | 作用 |
 | --- | --- |
-| `proxyInstall.sh` | 节点安装：环境初始化 → 注册 → nginx → xray → 解析 DNS → status 循环；含代理节点内核网络调优（conntrack / swap，`TuneKernelForProxy`）。 |
+| `proxyInstall.sh` | 节点安装：环境初始化 → 注册（回传 v2_name）→ `node_name` 解析与持久化（粘性复用，重装不换名；读 `~/node.env` / `~/node.name` / `~/node.json`，方案见 [`plans/node-name-identity.md`](plans/node-name-identity.md)）→ ServerStatus 客户端（`--alias` = `node_name`）→ nginx → xray → 解析 DNS → status 循环；含代理节点内核网络调优（conntrack / swap，`TuneKernelForProxy`）。 |
 | `nodeAgent.sh` | 节点状态上报（cron 每小时）：采集网卡 rx/tx + uptime + vnstat 近 7 日流量上报面板；每日 03:00 同步 SSL 证书（`SyncSSL`）；按日期窗口调度一次性补丁（`RunPatches`）。 |
 | `nodeMonitor.sh` | 每分钟流量采样（Mbps）+ 定时任务调度器（独立 crontab `* * * * *`）。 |
-| `proxyDiagnose.sh` | 代理故障一键诊断（xray / nginx / 安装环境 / 网络 / 证书 / 出站连通性），支持 `--target`、`--json`、`--host` 远程诊断；`--host` ssh 首次连接自动记录主机密钥、指纹变化即拒绝（老版 OpenSSH 可 `DIAG_SSH_STRICT=no` 回退）；默认只读，不改系统。 |
+| `proxyDiagnose.sh` | 代理故障一键诊断（xray / nginx / 安装环境 / 网络 / 证书 / 出站连通性 / 本周期流量），支持 `--target`、`--json`、`--host` 远程诊断；`--host` ssh 首次连接自动记录主机密钥、指纹变化即拒绝（老版 OpenSSH 可 `DIAG_SSH_STRICT=no` 回退）；`--target traffic` 用 vnstat 统计本周期 tx 出站流量（自上一个 `NODE_TRAFFIC_RESETDAY` 起，配 `NODE_TRAFFIC_LIMIT` 时含限额提醒）；默认只读，不改系统。 |
 | `sync.sh` | 节点数据同步与首次初始化（GeoData + Xray 插件）；自动注册每晚 03:00 的 crontab（幂等，仅 root；非 root 排障运行时跳过注册，GeoData/Xray 更新照常）。 |
 | `manage.sh` | 节点运维交互菜单（自检 / 状态 / 重启服务 / 同步 SSL / 日志 / 更新 / 重装）。 |
 | `unlockCheck.sh` | IP 服务解锁检测（流媒体 / AI / 社交 / 搜索），结果上报 `/api/node/unlock_check`。 |
