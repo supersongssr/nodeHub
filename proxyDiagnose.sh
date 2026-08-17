@@ -27,6 +27,8 @@
 #           (nf_conntrack_max 默认 8192 在多用户代理下秒级打满; 常因 /etc/sysctl.conf
 #            写了 conntrack 调优键但【值为空】→ sysctl -p 静默失败回退默认; 无 swap 的小
 #            VPS 尤甚, 内存尖峰直接硬挂。本次 103.173.155.212 死机根因, 详见 check_net NW7/NW8/NW9)
+#         · 本周期出站流量统计 (vnstat tx × ~/.env NODE_TRAFFIC_RESETDAY, 起点几月几号
+#           显式标注; 配 NODE_TRAFFIC_LIMIT 时顺带限额用量提醒, 详见 check_traffic)
 #
 # 设计原则:
 #   1. 只读诊断, 默认绝不修改系统 (只查询 + 报告), 修复动作需显式 --fix (预留)
@@ -42,6 +44,7 @@
 #   ./proxyDiagnose.sh --target net         # 只查网络与防火墙 (含 NODE_PORT 对外可达性)
 #   ./proxyDiagnose.sh --target cert        # 只查 TLS 证书 (root_domain + nginx .conf 引用证书)
 #   ./proxyDiagnose.sh --target outbound    # 只查出站连通性 (IPv4/IPv6 web + domainStrategy)
+#   ./proxyDiagnose.sh --target traffic     # 只查本周期流量 (vnstat tx, 自上一个 NODE_TRAFFIC_RESETDAY)
 #   ./proxyDiagnose.sh --json               # 输出 JSON (供程序解析)
 #   ./proxyDiagnose.sh --quiet              # 只输出 FAIL/WARN, 不输出 PASS
 #   ./proxyDiagnose.sh --no-color           # 关闭颜色
@@ -103,8 +106,8 @@ done
 # 未校验值既是注入面 (脚本声明可供面板/nodeAgent 程序化调用), 也会把非法值
 # 原样透传到远端。Main() 里的同款 case 仅作本地分发的双保险。
 case "$TARGET" in
-    all|xray|nginx|env|net|cert|outbound) ;;
-    *) echo "未知 --target: $TARGET (可选: all|xray|nginx|env|net|cert|outbound)" >&2; exit 2 ;;
+    all|xray|nginx|env|net|cert|outbound|traffic) ;;
+    *) echo "未知 --target: $TARGET (可选: all|xray|nginx|env|net|cert|outbound|traffic)" >&2; exit 2 ;;
 esac
 # ============================================================
 # 远程模式: 把自身推送到远程主机执行 (保证远程环境一致)
@@ -1111,6 +1114,128 @@ check_outbound() {
 }
 
 # ============================================================
+# 本周期流量 (traffic) — vnstat tx × ~/.env NODE_TRAFFIC_RESETDAY
+#
+# 定义: 从【上一个 NODE_TRAFFIC_RESETDAY】(含当天) 到今天的 tx 出站流量。
+#   · NODE_TRAFFIC_RESETDAY = 每月流量重置日 (1-31), 读 ~/.env; 面板多次追加同名
+#     行时取最后一行 (与 source 语义一致, 后写覆盖先写); 未配置/非法 → WARN 跳过。
+#   · 周期起点: 今日日号 ≥ 重置日 → 本月重置日; 否则 → 上月重置日。
+#     重置日 > 所在月天数时取该月末天 (如 31 遇 2 月 → 28/29), 纯算术不依赖 GNU date。
+#   · 只累加【tx 出站】(rx 入站不计, 与面板计费口径一致), 多网卡求和;
+#     数据源: vnstat --json d 每日库, 按日期 ≥ 周期起点过滤。
+#   · 完整性: 每日库最早记录晚于周期起点 (被 DailyDays 滚动清理) → WARN 统计偏小;
+#     vnstatd 超 1 天未刷新 → WARN 数据失真; 配 NODE_TRAFFIC_LIMIT (GB) 时做限额对比。
+# ============================================================
+check_traffic() {
+    say "本周期流量 (vnstat tx, 自上一个 NODE_TRAFFIC_RESETDAY 起)"
+
+    # T1. 前置依赖: vnstat + jq (解析 JSON 求和)
+    if ! has vnstat; then
+        result WARN "TRAFFIC_VNSTAT_MISSING" "未安装 vnstat, 无法统计本周期流量" \
+            "安装: apt install -y vnstat && systemctl enable --now vnstat (运行一段时间后才有数据)"
+        return 0
+    fi
+    if ! has jq; then
+        result WARN "TRAFFIC_JQ_MISSING" "无 jq, 无法解析 vnstat JSON" "安装: apt install -y jq"
+        return 0
+    fi
+
+    # T2. 解析 ~/.env 的 NODE_TRAFFIC_RESETDAY / NODE_TRAFFIC_LIMIT
+    _env_read() {  # _env_read <key> → 输出 ~/.env 中该 key 最后一行的值 (面板会追加同名行)
+        grep -E "^[[:space:]]*$1[[:space:]]*=" "$HOME/.env" 2>/dev/null | tail -1 \
+            | sed -E "s/^[^=]*=//; s/[\"'[:space:]]//g"
+    }
+    _rd=$(_env_read NODE_TRAFFIC_RESETDAY)
+    _rd=${_rd:-${NODE_TRAFFIC_RESETDAY:-}}
+    _rd=$(printf '%s' "$_rd" | sed 's/^0*//'); [ -z "$_rd" ] && _rd=0   # 去前导零防八进制误判
+    if [ "$_rd" -lt 1 ] || [ "$_rd" -gt 31 ]; then
+        result WARN "TRAFFIC_RESETDAY_INVALID" \
+            "~/.env 未配置有效的 NODE_TRAFFIC_RESETDAY (当前: '${NODE_TRAFFIC_RESETDAY:-未设置}', 需 1-31)" \
+            "在 ~/.env 写入 NODE_TRAFFIC_RESETDAY=<1-31> (每月流量重置日) 后重跑"
+        return 0
+    fi
+
+    # T3. 周期起点 = 上一个重置日 (纯整数运算, 免 GNU date)
+    _y=$(date +%Y); _m=$(date +%m | sed 's/^0//'); _d=$(date +%d | sed 's/^0//')
+    if [ "$_d" -lt "$_rd" ]; then
+        _m=$((_m - 1))
+        [ "$_m" -eq 0 ] && { _m=12; _y=$((_y - 1)); }
+    fi
+    _dim=$(awk -v m="$_m" -v y="$_y" 'BEGIN{d=31; if(m==4||m==6||m==9||m==11)d=30; else if(m==2)d=(y%4==0&&(y%100!=0||y%400==0))?29:28; print d}')
+    _sd=$_rd; [ "$_sd" -gt "$_dim" ] && _sd=$_dim      # 重置日 31 遇 2 月 → 28/29
+    _start_ymd=$(printf '%04d-%02d-%02d' "$_y" "$_m" "$_sd")
+    _start_cn="${_m}月${_sd}号"                          # 上次重置日 (几月几号)
+
+    # T4. vnstat 每日库求和: 只取 tx, 日期 ≥ 周期起点, 多网卡求和
+    _vn=$(vnstat --json d 2>/dev/null)
+    if [ -z "$_vn" ] || ! printf '%s' "$_vn" | jq -e '.interfaces' >/dev/null 2>&1; then
+        result WARN "TRAFFIC_VNSTAT_NOJSON" "vnstat --json d 无有效输出" \
+            "检查 vnstat 数据库 (ls /var/lib/vnstat/) 与服务: systemctl status vnstat"
+        return 0
+    fi
+    _ymd='((.date.year|tostring) + "-" + (("0"+(.date.month|tostring))[-2:]) + "-" + (("0"+(.date.day|tostring))[-2:]))'
+    _sum_tx=$(printf '%s' "$_vn" | jq -r --arg s "$_start_ymd" \
+        "[.interfaces[]?.traffic.day[]? | select($_ymd >= \$s) | .tx] | add // 0")
+    _sum_tx=$(_num "$_sum_tx" 0)
+    _ifs=$(printf '%s' "$_vn" | jq -r '[.interfaces[]?.name] | join(",")')
+    _min_day=$(printf '%s' "$_vn" | jq -r "[.interfaces[]?.traffic.day[]? | $_ymd] | min // empty")
+
+    # T5. 可读化 + 周期天数/日均
+    _gib=$(awk -v b="$_sum_tx" 'BEGIN{printf "%.2f", b/1073741824}')
+    _gb=$(awk  -v b="$_sum_tx" 'BEGIN{printf "%.2f", b/1000000000}')
+    _days=""
+    _start_epoch=$(date -d "$_start_ymd" +%s 2>/dev/null)   # GNU date; 失败则不显示天数
+    if [ -n "$_start_epoch" ]; then
+        _days=$(( ( $(date +%s) - _start_epoch ) / 86400 ))
+        [ "$_days" -lt 0 ] && _days=0
+    fi
+
+    # T6. 主结论: 本周期 tx 流量 (信息性 → PASS; 重置日几月几号必列)
+    _t="本周期 tx 出站流量: ${_gib} GiB (上次重置日: ${_start_cn}, ${_start_ymd})"
+    _x="只统计 tx 出站, rx 不计入; 周期 = 上一个 NODE_TRAFFIC_RESETDAY ($_rd 号) ${_start_ymd} (含当天) → 今天"
+    [ -n "$_days" ] && _x="$_x, 已 $_days 天"
+    if [ -n "$_days" ] && [ "$_days" -gt 0 ]; then
+        _avg=$(awk -v b="$_sum_tx" -v d="$_days" 'BEGIN{printf "%.2f", b/1073741824/d}')
+        _x="$_x, 日均 tx ${_avg} GiB"
+    fi
+    _x="$_x; vnstat 网卡[$_ifs], 原始值 $_sum_tx B"
+    result PASS "TRAFFIC_TX_CYCLE" "$_t" "$_x"
+
+    # T7. 覆盖完整性 — 每日库最早记录晚于周期起点 → 周期前段已滚动清理, 统计偏小
+    if [ -n "$_min_day" ] && awk -v a="$_min_day" -v b="$_start_ymd" 'BEGIN{exit !(a > b)}'; then
+        result WARN "TRAFFIC_DAILY_COVERAGE" \
+            "vnstat 每日库最早仅到 ${_min_day}, 晚于周期起点 ${_start_ymd} → 上述 tx 偏小" \
+            "vnstat 只保留最近若干天明细, 周期前段已被滚动清理。调大 /etc/vnstat.conf 的 DailyDays 后 systemctl restart vnstat (更早的历史已不可恢复)"
+    fi
+
+    # T8. 数据新鲜度 — vnstatd 超 1 天未写库 → 统计失真
+    _upd=$(printf '%s' "$_vn" | jq -r '[.interfaces[]?.updated.timestamp] | max // empty')
+    _upd=$(_num "$_upd" "")
+    if [ -n "$_upd" ]; then
+        _age=$(( $(date +%s) - _upd ))
+        [ "$_age" -gt 86400 ] && result WARN "TRAFFIC_VNSTAT_STALE" \
+            "vnstat 数据已 $((_age / 3600)) 小时未刷新 (最后: $(date -d "@$_upd" '+%F %T' 2>/dev/null || echo "$_upd"))" \
+            "vnstatd 可能已停: systemctl status vnstat; systemctl restart vnstat"
+    fi
+
+    # T9. 限额对比 — ~/.env NODE_TRAFFIC_LIMIT (GB, 1000 进制); ≥80% 提醒, ≥100% 告警
+    _lim=$(_env_read NODE_TRAFFIC_LIMIT)
+    _lim=${_lim:-${NODE_TRAFFIC_LIMIT:-}}
+    _lim=$(printf '%s' "$_lim" | sed 's/^0*//'); [ -z "$_lim" ] && _lim=0
+    if [ "$_lim" -gt 0 ]; then
+        _pct=$(awk -v b="$_sum_tx" -v l="$_lim" 'BEGIN{printf "%.1f", b/(l*1000000000)*100}')
+        if awk -v b="$_sum_tx" -v l="$_lim" 'BEGIN{exit !(b >= l*1000000000)}'; then
+            result WARN "TRAFFIC_LIMIT_EXCEEDED" \
+                "本周期 tx ${_gb} GB 已达限额 NODE_TRAFFIC_LIMIT=${_lim} GB 的 ${_pct}%" \
+                "超限节点可能被面板停机/额外计费; 控制用户量或升级套餐; 下次重置: 下月 ${_rd} 号"
+        elif awk -v b="$_sum_tx" -v l="$_lim" 'BEGIN{exit !(b >= l*1000000000*0.8)}'; then
+            result WARN "TRAFFIC_LIMIT_NEAR" "本周期 tx 已用限额 ${_pct}% (${_gb}/${_lim} GB)" \
+                "用量超八成, 提前规划 (控制用户/升级套餐)"
+        fi
+    fi
+}
+
+# ============================================================
 # TLS 证书专项 (cert) — 只检查【在用】证书, 不做全盘扫描:
 #   1. ~/node.json 中 root_domain 对应的证书 (按 CN/SAN 匹配定位)
 #   2. /etc/nginx 中 *.conf 声明 ssl_certificate 引用的证书
@@ -1198,6 +1323,7 @@ Main() {
             check_cert
             check_net
             check_outbound
+            check_traffic
             ;;
         xray)     check_xray ;;
         nginx)    check_nginx ;;
@@ -1205,7 +1331,8 @@ Main() {
         net)      check_net ;;
         cert)     check_cert ;;
         outbound) check_outbound ;;
-        *) echo "未知 --target: $TARGET (可选: all|xray|nginx|env|net|cert|outbound)" >&2; exit 2 ;;
+        traffic)  check_traffic ;;
+        *) echo "未知 --target: $TARGET (可选: all|xray|nginx|env|net|cert|outbound|traffic)" >&2; exit 2 ;;
     esac
 
     summary
