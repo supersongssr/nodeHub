@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.9.0-20260817"
+VERSION="v2.9.1-20260817"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -238,9 +238,14 @@ PersistNodeName() {
     [ -z "${node_name:-}" ] && { log warn "PersistNodeName: node_name 为空，跳过持久化"; return 0; }
 
     SetNodeEnv "node_name" "$node_name"
-    # 节点类别显式化: proxyInstall 仅部署动态节点 (固定节点不跑本脚本)
-    # probeTask.sh IsDynamicNode 首选读此字段, stat_client -g 检测仅作历史节点兜底
-    SetNodeEnv "node_class" "dynamic"
+    # 节点类别显式化 — 与 STAT_USER 联动 (probeTask.sh IsDynamicNode 首选读此字段):
+    #   STAT_USER 显式指定 → 固定节点 (人工命名, 不按 IP 检索, 探针采集跳过)
+    #   未指定            → 动态节点 (-u=md5(IP), 探针采集; -g 检测仅作历史节点兜底)
+    if [ -n "${STAT_USER:-}" ]; then
+        SetNodeEnv "node_class" "static"
+    else
+        SetNodeEnv "node_class" "dynamic"
+    fi
 
     printf '%s\n' "$node_name" > ~/node.name
     chmod 644 ~/node.name 2>/dev/null || true
@@ -1363,12 +1368,18 @@ Step0_ApplyId() {
 
 # ============================================================
 # Step 0.5: 安装 ServerStatus 客户端
-# 位于 Step1_Register 之后 — node_name / stat_user 均已解析并持久化:
-#   * -u USER  默认 = stat_user = md5(IP) (IPv4 优先, 零密钥) ★外部项目只知
-#              IP 即可在公开 stat 数据中定位本节点那一行 (username 字段匹配);
-#              派生失败时回退 node_name (无法按 IP 检索, 仅告警)
-#   * --alias = node_name = node_id (面板分配的节点 ID, 面板展示名)
-#   * STAT_USER 显式覆盖 USER; group 模式 (-g) 保留为动态节点标记 (probeTask 依赖)
+# 位于 Step1_Register 之后 — node_name / stat_user 均已解析并持久化
+# ★节点类别由 STAT_USER 是否显式指定决定 (与 PersistNodeName 的 node_class 联动):
+#   动态节点 (未设 STAT_USER, 默认路径):
+#     -u USER  = stat_user = md5(IP) (IPv4 优先, 零密钥) ★外部项目只知
+#                IP 即可在公开 stat 数据中定位本节点那一行 (username 匹配)
+#     --alias = node_name = node_id (面板分配的节点 ID, 面板展示名)
+#     -g      = ${API_PANEL} (默认) — 动态节点标记 (probeTask 采集依据)
+#   固定节点 (显式设 STAT_USER):
+#     -u USER  = STAT_USER (人工命名, 稳定不变; 按 IP 检索契约不适用)
+#     user 模式 (无 -g) → probeTask 判定为固定节点, 跳过采集
+#     --alias 同上; 如需可读展示名可另设 NODE_NAME
+# 派生失败 (IP 空/md5sum 缺失) 回退 USER=node_name, 仅告警不中断
 # ============================================================
 Step0_5_InstallServerStatus() {
     log info "Step 0.5: 安装 ServerStatus 客户端"

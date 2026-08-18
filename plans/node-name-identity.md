@@ -2,21 +2,37 @@
 
 > 实施: proxyInstall.sh v2.9.0 (2026-08-17) · 关联: plans/stat-ip-identity.md
 
-## 1. 当前规则 (v2.9, 最终形态)
+## 1. 当前规则 (v2.9.1, 最终形态)
 
-两个身份各司其职:
+两个身份各司其职; ★节点类别由 `STAT_USER` 是否显式指定决定:
 
-```
-node_name = node_id                       # 面板分配的节点 ID, 稳定不变
-stat_user = md5(IP)                       # 全量 32 位小写 hex, IPv4 优先, 零密钥
-```
-
-ServerStatus 客户端参数:
+### 动态节点 (默认路径, 未设 STAT_USER)
 
 ```
-stat_client -u <stat_user> --alias <node_name> [-g <group>]
-             └─ username, 行主键          └─ 展示名 (面板上显示节点 ID)
+node_name = node_id                       # 面板分配的节点 ID → --alias 展示名
+stat_user = md5(IP)                       # 全量 32 hex, IPv4 优先 → -u 检索主键
+node_class = dynamic                      # probeTask 探针采集
+stat_client -u <md5(IP)> --alias <node_id> -g <API_PANEL>
 ```
+
+### 固定节点 (显式设 STAT_USER)
+
+```
+stat_user = STAT_USER                     # 人工命名, 稳定不变 → -u
+node_class = static                       # probeTask 跳过采集 (user 模式无 -g)
+stat_client -u <STAT_USER> --alias <node_id|NODE_NAME>     # 无 -g
+```
+
+按 IP 检索契约仅适用于动态节点 (固定节点人工命名, 不参与 md5(IP) 检索)。
+
+### 行为矩阵
+
+| 配置 | -u USER | -g 分组 | node_class | probeTask | 类别 |
+|---|---|---|---|---|---|
+| 都不设 (默认) | md5(IP) | ${API_PANEL} | dynamic | 采集 | **动态节点** ★标准路径 |
+| 只设 STAT_GID | md5(IP) | 自定义组 | dynamic | 采集 | 动态节点 (自定义组) |
+| 只设 STAT_USER | STAT_USER | 无 | static | 跳过 | **固定节点** |
+| 都设 | STAT_USER | 自定义组 | static | 跳过 | 固定节点挂组 (少见) |
 
 ### 字段分工
 
