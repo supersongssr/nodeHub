@@ -1,85 +1,91 @@
-# 节点统一命名方案 (node_name)
+# 节点统一命名方案 (node_name / stat_user)
 
-> 实施: proxyInstall.sh v2.4.1 + scripts/serverstatus_client_install.sh v1.1.0 (2026-08-17)
-> v2.4.1: ① node_name 粘性持久化 (重装不换名) ② 恢复默认 group 模式 (修复 probe 判定回归)
->         ③ node_class=dynamic 显式化动态/固定判定 (probeTask.sh 优先读取)
+> 实施: proxyInstall.sh v2.9.0 (2026-08-17) · 关联: plans/stat-ip-identity.md
 
-## 1. 目标
+## 1. 当前规则 (v2.9, 最终形态)
 
-每个动态注册的节点拥有一个**稳定、可读、唯一**的 `node_name`。
-之后所有调用——ServerStatus 面板查询、面板 API、人工运维——**只需 name 即可定位节点**,无需再记 node_id / IP / 分组等。
-
-## 2. name 生成规则 (优先级从高到低)
-
-| 优先级 | 来源 | 示例 |
-|---|---|---|
-| 1 | 环境变量 `NODE_NAME`(人工改名唯一入口) | `NODE_NAME=my-custom-node` |
-| 2 | `~/.env` 中的 `NODE_NAME` | 同上 |
-| 3 | `STAT_NAME` | 兼容旧变量 |
-| 4 | **粘性复用**: `~/node.env` 已持久化的 `node_name` ★重装不换名 | — |
-| 5 | 面板注册回传的 `v2_name`(仅首次) | `sgp-hy2-01` |
-| 6 | 自动生成 `${API_PANEL}_${NODE_ID}` | `ssp_42` |
-
-★ 粘性设计 (v2.4.1): 首次生成后持久化, 之后重装/重跑一律复用旧值; 
-面板 v2_name 改名**不会**自动同步 (需 NODE_NAME 环境变量显式改名)。
-目的: 保证 name 永久固定, ServerStatus 不产生孤儿条目。
-
-**清洗规则** (`SanitizeName`): 转小写 → 空格/斜杠/点转 `-` → 仅保留 `[a-z0-9_-]` → 压缩连续分隔符 → 去首尾分隔符。
-极端清洗后为空时兜底 `node_${NODE_ID}`。
-
-## 3. name 三处持久化 (随处可读)
-
-| 位置 | 形式 | 读取方式 |
-|---|---|---|
-| `~/node.env` | `node_name="sgp-hy2-01"` | `source ~/node.env` 后直接用 `$node_name` (nodeAgent/nodeMonitor/manage.sh 均可) |
-| `~/node.name` | 单行纯文本 | `cat ~/node.name` (给 systemd/监控探针/人工) |
-| `~/node.json` | `"node_name": "sgp-hy2-01"` | `jq -r '.node_name' ~/node.json` |
-
-## 4. ServerStatus 接入 (name 即索引)
-
-- `stat_client --alias ${node_name}` — ServerStatus 面板上**直接搜 name** 即可查到节点数据
-- `-u USER` 默认 = `node_name`(v2_name 面板侧唯一;重装时面板回传同名 → USER 稳定,不产生孤儿条目)
-- `STAT_USER` 显式指定时仍优先
-- systemd unit:
-  - `Description=ServerStatus-Rust Client (sgp-hy2-01)` — `systemctl status stat_client` 一眼可见节点名
-  - `Environment=NODE_NAME=sgp-hy2-01` — 服务进程内可直接读
-  - 参数快照落盘 `/opt/ServerStatus/client/stat_client.args`
-
-## 5. 关键时序调整
+两个身份各司其职:
 
 ```
-原: Step0 → Step0.5(ServerStatus, alias=NODE_ID) → Step1(register, 回传 v2_name)
-新: Step0 → Step1(register, 回传 v2_name) → ResolveNodeName → PersistNodeName → Step0.5(ServerStatus, alias=node_name)
+node_name = node_id                       # 面板分配的节点 ID, 稳定不变
+stat_user = md5(IP)                       # 全量 32 位小写 hex, IPv4 优先, 零密钥
 ```
 
-原因: name 的主来源 `v2_name` 在 Step1 注册回传后才最终确定。
-附带收益: Step1 失败(节点未注册成功)时不再安装监控,语义更合理。
+ServerStatus 客户端参数:
 
-## 6. 幂等 / 重装行为
+```
+stat_client -u <stat_user> --alias <node_name> [-g <group>]
+             └─ username, 行主键          └─ 展示名 (面板上显示节点 ID)
+```
 
-- node_name 粘性复用 → 重装后 alias 不变 → stat_client 跳过重写
-- 仅当 `NODE_NAME` 环境变量显式指定新名时才重写 unit (人工改名入口)
-- 子脚本检测二进制已存在时跳过重复下载
-- 旧节点升级注意: 首次重装后 USER 从 `${API_PANEL}_${NODE_ID}` 变为 `node_name`,
-  ServerStatus 服务端旧条目会残留为 offline, 可按旧 USER 清理一次
-  (全新节点无此问题; v2_name 未变的重装节点 USER 也不变)
+### 字段分工
 
-## 6.5 动态/固定节点判定 (v2.4.1 显式化)
+| stat_client 参数 | 字段 | 值 | 受众 |
+|---|---|---|---|
+| `-u` (username, **行主键**) | `stat_user` | `md5(IP)` | ★外部项目: 只知 IP → 算 md5 → 匹配 username 字段即命中 |
+| `--alias` (展示名) | `node_name` | `node_id` | 人 (面板显示节点 ID, 与面板侧对齐) |
+| `-g` (分组) | group | `${API_PANEL}` 默认, 可 `STAT_GID` 覆盖 | 动态节点标记 (probeTask 依赖 `-g`) |
 
-| | 动态节点 | 固定节点 |
+### 关键性质
+
+| 性质 | 说明 |
+|---|---|
+| **node_name 稳定** | = 面板分配的 node_id, 重装不变; alias 无唯一性约束 (主键是 -u) |
+| **stat_user 纯函数** | 只看 IP — 重装 / 面板重置 / NODE_ID 复用 / 换组 / 改名均不变 |
+| **零密钥** | 外部项目 `hashlib.md5(IP)` 一行代码即得, 无 pepper/NODE_ID/面板信息 |
+| **非粘性 (stat_user)** | 每次安装按当前 IP 重算; 换 IP → 换新身份, 旧条目转 offline 待清理 |
+| **IP 不以明文出现** | 公开数据中 username 是 md5 值, 非明文 IP; 已知取舍: md5(IPv4) 可被彩虹表反查 (代理 IP 本就是公开地址) |
+| **显式覆盖入口** | `NODE_NAME`/`STAT_NAME` 覆盖 alias; `STAT_USER` 覆盖 username (覆盖后按 IP 检索契约失效) |
+
+### IP 归一化 (节点与消费端必须一致)
+
+选择: 公网 IPv4 (`node_ip`) 优先 → IPv6 (`node_ipv6`);
+归一化: 去空白/换行 → 小写 → 去 `%zone` 后缀。
+例: `md5("1.2.3.4") = 6465ec74397c9126916786bbcd6d7601`
+
+## 2. 持久化 (随处可读)
+
+| 位置 | node_name | stat_user |
 |---|---|---|
-| 安装方式 | proxyInstall.sh 批量自动装 | 人工 (server_status/status.sh 等) |
-| stat_client 模式 | group (`-g`, 默认) | user (无 `-g`) |
-| node_id | apply_id 自动分配 | 无此流程 |
-| 生命周期 | 被墙自动回收 | 长期存活, SSH 凭证在 probe config.toml |
-| probe 探针采集 | ✅ | ❌ (IsDynamicNode 直接退出) |
-| ~/node.env node_class | `dynamic` (v2.4.1+ 写入) | 无此文件/字段 |
+| `~/node.env` | `node_name="42"` | `stat_user="6465ec74..."` |
+| `~/node.name` / `~/node.stat_user` | 单行纯文本 | 单行纯文本 |
+| `~/node.json` | `.node_name` | `.stat_user` |
 
-判定链 (probeTask.sh IsDynamicNode): `node_class=dynamic` 显式声明 → 兕底 `grep ' -g '` stat_client.service。
-⚠ 不要用"是否有 node_name"判定节点类型 — 两类节点都可拥有 name。
-⚠ Step0_5 默认模式必须保持 group: 改成 user 会把新装动态节点误判为固定 → probe 静默停止。
+systemd unit: `Description=ServerStatus-Rust Client (42)` + `Environment=NODE_NAME=42`;
+参数快照: `/opt/ServerStatus/client/stat_client.args`
 
-## 7. 面板侧约定 (后续配合)
+## 3. 消费端示例
 
-- 面板已有 `v2_name`(register 时上报),按 name 查询节点的 API 可直接以 `v2_name` 为索引键
-- 建议面板 API 支持 `node_name=` 参数查询(向后兼容 `node_id=`)
+**Python**
+```python
+import hashlib
+stat_user = hashlib.md5(ip.strip().lower().split("%")[0].encode()).hexdigest()
+row = next(r for r in stats_json if r["username"] == stat_user)
+```
+
+**Shell**
+```sh
+printf '%s' "1.2.3.4" | md5sum | awk '{print $1}'
+```
+
+## 4. 时序与幂等
+
+```
+Step0(node_id) → Step1_Register(采集 node_ip) → ResolveNodeName(=node_id)
+  → PersistNodeName → DeriveStatIdentity(=md5(IP)) → Step0_5(ServerStatus)
+```
+
+- 重装同 IP: stat_user/alias 均不变 → Step0_5 幂等跳过
+- 换 IP / 改 NODE_NAME: unit 中 `-u` 或 `--alias` 变化 → 自动重写并重启
+- stat_user 派生失败 (IP 空 / md5sum 缺失): USER 回退 node_name + 告警, 不中断安装
+
+## 5. 演进记录
+
+| 版本 | node_name (alias) | stat_user (-u) |
+|---|---|---|
+| v2.4 | `${API_PANEL}_${NODE_ID}` | 无 (user=alias) |
+| v2.5 | `+md5(IP)[:6]` 后缀 | 无 |
+| v2.6 | 后缀 HMAC(pepper) | 无 |
+| v2.7 | `+sha256("name:"+IP)[:6]` + 粘性 | 无 |
+| v2.8 | `md5(IP)` (角色错位: alias 承担检索) | sha256("stat:"+IP)[:12] |
+| **v2.9 (当前)** | **`node_id`** (稳定展示名) | **`md5(IP)`** (检索主键, 角色归位) |

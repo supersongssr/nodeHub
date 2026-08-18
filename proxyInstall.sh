@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.4.1-20260817"
+VERSION="v2.9.0-20260817"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -203,33 +203,29 @@ SanitizeName() {
 }
 
 # ============================================================
-# 节点名解析 — Step1_Register 之后调用 (v2_name 已由面板回传确定)
-# 优先级:
-#   1. 显式指定: 环境变量 NODE_NAME / ~/.env NODE_NAME / STAT_NAME (人工改名入口)
-#   2. 粘性复用: 已持久化到 ~/node.env 的 node_name ★核心: 重装/重跑不换名
-#   3. v2_name (面板注册回传, 仅首次无持久化值时使用)
-#   4. 兜底: 自动生成 ${API_PANEL}_${NODE_ID}
-# 产出: node_name (非空保证: 极端情况下兜底为 node_${NODE_ID})
+# 节点名解析 — Step0_ApplyId 之后调用 (NODE_ID 已分配)
+# 规则 (优先级):
+#   1. 显式指定: 环境变量 NODE_NAME / ~/.env NODE_NAME / STAT_NAME (人工命名入口)
+#   2. 动态节点: node_name = node_id ★面板分配的节点 ID, 稳定不变
+#      — 对应 ServerStatus --alias (展示名): 面板上显示节点 ID, 与面板侧对齐
+#      — node_id 由面板分配并持久化 (~/node.env), 重装不变
+#      — alias 仅是展示名, 无唯一性约束 (stat 行主键是 -u=stat_user)
+# 产出: node_name (非空保证: 极端情况下兜底 node_${NODE_ID})
 # ============================================================
 ResolveNodeName() {
+    # 1. 显式指定 (人工命名入口): 环境变量 NODE_NAME > ~/.env NODE_NAME > STAT_NAME
     _nn="${NODE_NAME:-${STAT_NAME:-}}"
 
-    # 粘性复用: 已持久化的 node_name 优先 — 保证 NAME 固定不变,
-    # 重装/重跑不换名, 不产生 ServerStatus 孤儿条目 (v2_name 变化也不再自动改名)
+    # 2. 动态节点: node_name = node_id (面板分配, 与面板侧对齐)
     if [ -z "$_nn" ]; then
-        _nn="${node_name:-}"   # LoadEnv 已 source ~/node.env
-        [ -z "$_nn" ] && [ -f ~/node.env ] \
-            && _nn=$(grep '^node_name=' ~/node.env 2>/dev/null | tail -1 | sed 's/^node_name="//;s/"$//' || true)
-        [ -n "$_nn" ] && log info "node_name 粘性复用已持久化值: ${_nn}"
+        _nn="${NODE_ID}"
+        log info "动态生成 node_name: ${_nn} (= node_id)"
     fi
-
-    [ -z "$_nn" ] && _nn="${v2_name:-}"
-    [ -z "$_nn" ] && _nn="${API_PANEL}_${NODE_ID}"
 
     node_name=$(SanitizeName "$_nn")
     [ -z "$node_name" ] && node_name="node_${NODE_ID}"   # 极端兜底: sanitize 后为空
 
-    log info "node_name 已解析: ${node_name} (来源: ${_nn})"
+    log info "node_name 已解析: ${node_name}"
 }
 
 # ============================================================
@@ -256,6 +252,61 @@ PersistNodeName() {
     fi
 
     log info "node_name=${node_name} 已持久化 → ~/node.env | ~/node.name | ~/node.json"
+}
+
+# ============================================================
+# stat 身份派生 (stat_user) — 外部项目"只知 IP"即可在公开 stat 数据中
+# 定位本节点那一行: 检索主键 = -u (username 字段)
+#   stat_user = md5(IP)  全量 32 位小写 hex ★IPv4 优先 (无 v4 用 v6), 零密钥
+# 设计:
+#   * 纯函数: 外部项目 hashlib.md5(IP) 一行代码即得 → 匹配公开数据的
+#     username 字段命中本节点; 无需 pepper / NODE_ID / 面板信息
+#   * 确定性: 重装 / 面板重置 / NODE_ID 复用 / 换组均不变 (只看 IP)
+#   * 非粘性: 每次安装按当前 IP 重算 — 换 IP 自动换新身份,
+#     服务端旧条目转 offline 待清理
+#   * 已知取舍: md5(IPv4) 可被现成彩虹表反查 (代理 IP 本就是公开地址);
+#     IP 不能从 stat 数据被"直接读出" — username 是 md5 值, 非明文 IP
+#   * 零依赖: md5sum 属 coreutils (Debian 默认有), 无需 openssl
+# IP 选择: node_ip (IPv4) 优先, 无则 node_ipv6; 归一化: 去空白/小写/去 %zone
+#   (消费端必须用同样归一化与优先级, 见 plans/stat-ip-identity.md)
+# 持久化 (仅为可读): ~/node.env (stat_user=) | ~/node.stat_user | ~/node.json (.stat_user)
+# 失败策略: IP 为空 / md5sum 不可用 → 置空并告警, 不中断安装
+#           (Step0_5 回退 USER=node_name, 代价: 外部无法按 IP 检索)
+# ============================================================
+DeriveStatIdentity() {
+    stat_user=""
+
+    _ident_ip="${node_ip:-${node_ipv6:-}}"
+    [ -z "$_ident_ip" ] && { log error "DeriveStatIdentity: node_ip/node_ipv6 均为空, 跳过"; return 0; }
+
+    # 归一化 — 消费端必须用同样规则 (小写/无空白/无 %zone)
+    _ident_ip=$(printf '%s' "$_ident_ip" | tr -d '\n\r ' | tr 'A-F' 'a-f' | sed 's/%.*$//')
+
+    if ! command -v md5sum >/dev/null 2>&1; then
+        log error "md5sum 不可用 (coreutils 异常?) — stat_user 派生失败, USER 将回退 node_name"
+        return 0
+    fi
+
+    _hex=$(printf '%s' "${_ident_ip}" | md5sum | awk '{print $1}')
+    case "$_hex" in
+        ''|*[!0-9a-f]*)
+            log error "stat_user md5 计算异常 (hex='$_hex'), USER 将回退 node_name"
+            return 0
+            ;;
+    esac
+
+    stat_user="$_hex"
+
+    # 持久化 (仅为可读; 真源始终是 IP, 每次安装重算覆盖)
+    SetNodeEnv "stat_user" "$stat_user"
+    printf '%s\n' "$stat_user" > ~/node.stat_user
+    if [ -f ~/node.json ]; then
+        _tmp_sj=$(jq --arg su "$stat_user" '.stat_user = $su' ~/node.json 2>/dev/null) \
+            && printf '%s\n' "$_tmp_sj" > ~/node.json \
+            || log warn "~/node.json 写入 stat_user 失败, 跳过"
+    fi
+
+    log info "stat_user=${stat_user} (= md5(${_ident_ip})) — 外部项目按 IP 同式派生即可检索; 已持久化到 node.env/node.stat_user/node.json"
 }
 
 # ============================================================
@@ -489,8 +540,9 @@ LoadEnv() {
     # 节点描述 (可选)
     node_info="${NODE_INFO:-}"
 
-    # 节点名 (可选) — 显式指定 node_name; 未指定时优先用面板注册回传的 v2_name
-    # 优先级: 环境变量 NODE_NAME > ~/.env NODE_NAME > STAT_NAME > v2_name > ${API_PANEL}_${NODE_ID}
+    # 节点名 (可选) — 显式指定优先; 动态节点默认 node_name = node_id (面板节点 ID)
+    #   (对应 stat_client --alias 展示名; 按 IP 检索走 stat_user = md5(IP), 见 DeriveStatIdentity)
+    # 优先级: 环境变量 NODE_NAME > ~/.env NODE_NAME > STAT_NAME > node_id
     # 解析在 Step1_Register 之后的 ResolveNodeName() 中完成
     # 节点侧随时读取: cat ~/node.name | source ~/node.env 后用 $node_name | jq .node_name ~/node.json
 
@@ -1311,25 +1363,18 @@ Step0_ApplyId() {
 
 # ============================================================
 # Step 0.5: 安装 ServerStatus 客户端
-# 位于 Step1_Register 之后 — node_name 已由 ResolveNodeName 解析并持久化:
-#   * --alias = node_name  (ServerStatus 面板上直接搜 name 即可查到节点)
-#   * -u USER  默认 = node_name (v2_name 面板侧唯一, 重装时面板回传同名, USER 稳定)
-#   * 可通过 STAT_USER 显式覆盖; group 模式仍可 STAT_GID 指定分组
+# 位于 Step1_Register 之后 — node_name / stat_user 均已解析并持久化:
+#   * -u USER  默认 = stat_user = md5(IP) (IPv4 优先, 零密钥) ★外部项目只知
+#              IP 即可在公开 stat 数据中定位本节点那一行 (username 字段匹配);
+#              派生失败时回退 node_name (无法按 IP 检索, 仅告警)
+#   * --alias = node_name = node_id (面板分配的节点 ID, 面板展示名)
+#   * STAT_USER 显式覆盖 USER; group 模式 (-g) 保留为动态节点标记 (probeTask 依赖)
 # ============================================================
 Step0_5_InstallServerStatus() {
     log info "Step 0.5: 安装 ServerStatus 客户端"
 
-    # node_name 防御 (ResolveNodeName 应已赋值)
-    [ -z "${node_name:-}" ] && node_name="${API_PANEL}_${NODE_ID}"
-
-    # 幂等检测: 已安装且 alias 未变 → 跳过; alias 变化 (面板改名) → 重写 service
-    if [ -f /opt/ServerStatus/client/stat_client ]; then
-        if grep -q -- "--alias ${node_name}" /etc/systemd/system/stat_client.service 2>/dev/null; then
-            log info "stat_client 已存在且 alias=${node_name} 未变化，跳过安装"
-            return 0
-        fi
-        log info "stat_client 已存在但 alias 变化 → 重写 systemd 配置 (node_name=${node_name})"
-    fi
+    # node_name 防御 (ResolveNodeName 应已赋值; md5 路径恒非空)
+    [ -z "${node_name:-}" ] && node_name="node_${NODE_ID}"
 
     _script_name="serverstatus_client_install.sh"
     _script_url="${NODEHUB_URL}/scripts/${_script_name}"
@@ -1357,11 +1402,22 @@ Step0_5_InstallServerStatus() {
         log info "STAT_GID / STAT_USER 均未指定 → 默认 group 模式 (STAT_GID=${STAT_GID}, 动态节点标记)"
     fi
 
-    # 2. 定 USER: STAT_USER 显式优先 → 默认 node_name (ServerStatus 上的可读唯一键)
+    # 2. 定 USER: STAT_USER 显式优先 → 默认 stat_user (按 IP 检索的主键) → 兕底 node_name
     if   [ -n "${STAT_USER:-}" ]; then
         _stat_u="${STAT_USER}"
     else
-        _stat_u="${node_name}"
+        _stat_u="${stat_user:-${node_name}}"
+        [ -z "${stat_user:-}" ] && log warn "stat_user 未派生 (IP 缺失?) — USER 回退 node_name, 外部项目将无法按 IP 检索"
+    fi
+
+    # 幂等检测: 已安装且 -u USER 与 --alias 均未变 → 跳过; 任一变化 (换 IP/改名) → 重写 service
+    if [ -f /opt/ServerStatus/client/stat_client ]; then
+        if grep -q -- "-u ${_stat_u} " /etc/systemd/system/stat_client.service 2>/dev/null \
+           && grep -q -- "--alias ${node_name}" /etc/systemd/system/stat_client.service 2>/dev/null; then
+            log info "stat_client 已存在且 USER=${_stat_u} / alias=${node_name} 均未变化，跳过安装"
+            return 0
+        fi
+        log info "stat_client 已存在但 USER/alias 变化 → 重写 systemd 配置 (USER=${_stat_u} alias=${node_name})"
     fi
 
     # 3. 拼参: STAT_GID 存在 → group 模式 (追加 -g); alias 恒为 node_name
@@ -2163,10 +2219,12 @@ Main() {
     InitSystem
     Step0_ApplyId
     Step1_Register
-    # node_name 解析与持久化 — 必须在注册之后: 主来源 v2_name 由面板回传确认
+    # node_name 解析与持久化 (= node_id, alias 展示名)
     ResolveNodeName
     PersistNodeName
-    # ServerStatus 移至注册后安装: alias/USER 用最终 node_name, 面板上搜 name 即可定位节点
+    # stat_user = md5(IP): stat 检索主键 (-u), 须在 ProbeHardware 采集 node_ip 之后
+    DeriveStatIdentity
+    # ServerStatus 移至注册后安装: -u=stat_user=md5(IP) (按 IP 检索) / alias=node_name=node_id
     Step0_5_InstallServerStatus
     Step1_5_DownloadSSL
     Step2_5_InstallAriaNg
@@ -2181,7 +2239,8 @@ Main() {
 
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"
-    log info "node_name=${node_name:-无} (读取方式: cat ~/node.name | grep node_name ~/node.env | jq -r .node_name ~/node.json)"
+    log info "node_name=${node_name:-无} (= node_id, alias 展示名); 读取: cat ~/node.name | grep node_name ~/node.env | jq -r .node_name ~/node.json"
+    log info "stat_user=${stat_user:-未派生} = md5(IP) (IPv4 优先) — 外部项目按 IP 算 md5 匹配 username 即可检索; 读取: grep stat_user ~/node.env | cat ~/node.stat_user"
     log info "node_ids=${node_ids:-无}"
     log info "node_port=${node_port}"
     log info "API_PANEL=${API_PANEL}"
