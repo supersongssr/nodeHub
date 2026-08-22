@@ -32,7 +32,7 @@ stat_client -u <STAT_USER> --alias <node_id|NODE_NAME>     # 无 -g
 | 都不设 (默认) | md5(IP) | ${API_PANEL} | dynamic | 采集 | **动态节点** ★标准路径 |
 | 只设 STAT_GID | md5(IP) | 自定义组 | dynamic | 采集 | 动态节点 (自定义组) |
 | 只设 STAT_USER | STAT_USER | 无 | static | 跳过 | **固定节点** |
-| 都设 | STAT_USER | 自定义组 | static | 跳过 | 固定节点挂组 (少见) |
+| 都设 | STAT_USER | 自定义组 | static | 采集 (-g 兜底命中) | 固定节点挂组 (少见; node_class=static 但 unit 带 -g，`IsDynamicNode` 的 -g 兜底仍会命中) |
 
 ### 字段分工
 
