@@ -14,10 +14,21 @@ ARIANG_DIR="/var/www/ariang"
 ARIANG_ZIP="/tmp/AriaNg-${ARIANG_VERSION}.zip"
 
 # ============================================================
-# 脚本身份 (供 Telegram 通知标注来源: 脚本路径)
+# 脚本身份 (供 Telegram 通知标注来源 / 安装成功后自删除)
+# _SCRIPT_PATH 解析为绝对路径, 保证 rm 时不受当前工作目录影响
 # ============================================================
-_SCRIPT_PATH="$0"
 _SCRIPT_NAME="${0##*/}"
+case "$0" in
+    /*) _SCRIPT_PATH="$0" ;;
+    *)
+        _sp_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd) || _sp_dir=""
+        if [ -n "$_sp_dir" ]; then
+            _SCRIPT_PATH="${_sp_dir}/${_SCRIPT_NAME}"
+        else
+            _SCRIPT_PATH="$0"
+        fi
+        ;;
+esac
 
 # ============================================================
 # Telegram 通知 — 收敛到 log() 内统一触发
@@ -2222,6 +2233,40 @@ Step4_6_DeployManageScript() {
 
 
 # ============================================================
+# Step Final: 安装成功后自删除脚本本体 — 避免安装方式泄漏
+# 触发: 仅 Main() 全部步骤成功后调用 (失败路径不删, 便于重跑/排查)
+# 跳过: KEEP_INSTALLER=1 (保留脚本供调试) | 管道安装 ($0=sh, 无实体文件)
+# 安全: 仅当文件存在且以 #! 开头才删, 避免误删无关文件; 删除失败仅告警不中断
+# 注: 父 shell 内存中的执行命令 (history) 无法由本脚本清除, 如需彻底抹除
+#       请在安装命令前加空格 (HISTCONTROL=ignorespace) 或事后手动清理 history
+# ============================================================
+SelfDestruct() {
+    if [ "${KEEP_INSTALLER:-0}" = "1" ]; then
+        log info "KEEP_INSTALLER=1, 保留安装脚本: ${_SCRIPT_PATH}"
+        return 0
+    fi
+
+    # 管道方式安装 (curl ... | sh) 时 $0 是解释器名, 无实体脚本可删
+    case "${_SCRIPT_NAME}" in
+        sh|bash|dash|ash|zsh)
+            log debug "管道方式安装 (${_SCRIPT_NAME}), 无脚本文件可删, 跳过自删除"
+            return 0
+            ;;
+    esac
+
+    if [ -f "${_SCRIPT_PATH}" ] && [ "$(head -c 2 "${_SCRIPT_PATH}" 2>/dev/null)" = "#!" ]; then
+        if rm -f "${_SCRIPT_PATH}" 2>/dev/null; then
+            log info "安装成功, 安装脚本已自删除: ${_SCRIPT_PATH}"
+        else
+            log warn "安装脚本自删除失败: ${_SCRIPT_PATH} (可手动删除)"
+        fi
+    else
+        log debug "未找到脚本实体 (${_SCRIPT_PATH}), 跳过自删除"
+    fi
+}
+
+
+# ============================================================
 # 主流程
 # ============================================================
 Main() {
@@ -2290,6 +2335,9 @@ Main() {
 
     # 安装成功，清除 EXIT trap
     trap - EXIT
+
+    # 安装成功后自删除脚本本体 (避免安装方式泄漏; KEEP_INSTALLER=1 可保留调试)
+    SelfDestruct
 }
 
 Main "$@"
