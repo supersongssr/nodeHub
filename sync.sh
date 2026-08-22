@@ -144,6 +144,8 @@ SyncXray() {
         "https://github.com/supersongssr/xray-plugin-ssp/releases/download/v0.0.9/xray-plugin-ssp-v26.6.27" \
         || { Log "Xray: ssp 下载失败"; _ok=0; }
 
+    wget -N -q -T 120 -P "$XRAY_DIR" https://github.com/supersongssr/xray-plugin-api/releases/download/v0.1.0/xray-plugin-api-v26.6.27 || { Log "Xray: api 下载失败"; _ok=0; }
+
     # 按子步骤成败汇总输出, 与 SyncGeoData 风格一致
     if [ "$_ok" -eq 1 ]; then
         Log "Xray 插件下载完成"
