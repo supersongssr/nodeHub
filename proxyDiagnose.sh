@@ -23,6 +23,9 @@
 #            本次 38.45.72.223 故障根因, 详见 check_outbound)
 #         · NODE_PORT 只 bind 127.0.0.1 → 端口本地"在监听"但外部无法访问
 #           (详见 _check_node_port_external)
+#         · NODE_PORT 大陆方向被墙 — 本机监听/证书/海外访问全正常, 唯大陆方向 TCP
+#           握手全部超时 (借 tcp.ping.pe 大陆探测点 tcping, 与海外探测点对照判定,
+#            详见 _check_node_port_cn_tcping)
 #         · conntrack 连接跟踪表打满 → 海量丢包 → 内存耗尽【硬死锁】
 #           (nf_conntrack_max 默认 8192 在多用户代理下秒级打满; 常因 /etc/sysctl.conf
 #            写了 conntrack 调优键但【值为空】→ sysctl -p 静默失败回退默认; 无 swap 的小
@@ -41,7 +44,7 @@
 #   ./proxyDiagnose.sh --target xray        # 只查 xray
 #   ./proxyDiagnose.sh --target nginx       # 只查 nginx
 #   ./proxyDiagnose.sh --target env         # 只查安装环境 (磁盘/内存/DNS/依赖/锁)
-#   ./proxyDiagnose.sh --target net         # 只查网络与防火墙 (含 NODE_PORT 对外可达性)
+#   ./proxyDiagnose.sh --target net         # 只查网络与防火墙 (含 NODE_PORT 对外可达性 + 大陆 tcping 被墙检测)
 #   ./proxyDiagnose.sh --target cert        # 只查 TLS 证书 (root_domain + nginx .conf 引用证书)
 #   ./proxyDiagnose.sh --target outbound    # 只查出站连通性 (IPv4/IPv6 web + domainStrategy)
 #   ./proxyDiagnose.sh --target traffic     # 只查本周期流量 (vnstat tx, 自上一个 NODE_TRAFFIC_RESETDAY)
@@ -900,7 +903,7 @@ _check_oom_for() {
 # 网络与防火墙 (net)
 # ============================================================
 check_net() {
-    say "网络与防火墙 (iptables / ufw / firewalld / SELinux / conntrack / sysctl)"
+    say "网络与防火墙 (iptables / ufw / firewalld / SELinux / conntrack / sysctl / NODE_PORT 对外可达与大陆 tcping)"
 
     # NW1. iptables DROP/REJECT 规则 (可能拦截代理端口)
     if has iptables; then
@@ -1010,6 +1013,9 @@ check_net() {
 
     # NW9. NODE_PORT 对外可达性 (端口监听 ≠ 外部可访问; 详见 _check_node_port_external)
     _check_node_port_external
+
+    # NW10. NODE_PORT 大陆 tcping 被墙检测 (海外可达 ≠ 大陆可达; 详见 _check_node_port_cn_tcping)
+    _check_node_port_cn_tcping
 }
 
 # ============================================================
@@ -1050,6 +1056,214 @@ _check_node_port_external() {
     else
         result FAIL "NODE_PORT_LOCALHOST_ONLY" "NODE_PORT=$_NODE_PORT 仅监听 127.0.0.1/::1 → 外部无法访问" \
             "xray inbound 的 listen 留空或设 0.0.0.0; nginx listen 行去掉 127.0.0.1: 前缀"
+    fi
+}
+
+# ============================================================
+# NODE_PORT 大陆 tcping 被墙检测 (NW10) — "端口在监听 + 海外可达" ≠ "大陆可达"
+#
+# 被墙的表现: 本机端口监听正常 / 证书有效 / 海外客户端一切正常, 但大陆方向 TCP
+#   握手全部超时或重置 → 用户侧"连不上", 而节点侧常规检查全部 PASS —— 与出站 IPv4
+#   被封 (check_outbound) 同属"本机一切正常"型隐蔽故障, 必须借大陆视角才能发现。
+#
+# 做法: 借 tcp.ping.pe 的大陆探测点对 <node_ip>:<node_port> 做 TCP 连通测试,
+#   并与海外探测点【对照】; 大陆探测点覆盖三网 + 云厂两类 (2026-08 实测 13 点):
+#     · 电信 China Telecom ×2 (江苏/丽水) / 移动 China Mobile ×2 / 联通 China Unicom ×2
+#       —— 丽水系为原生运营商线路, 能区分【单网被墙/干扰】(仅某一家全断)
+#     · 腾讯云 ×5 (成都/重庆/广州/南京/上海) + 阿里云 ×2 (青岛/上海) —— 云厂骨干对照
+#   判定结果按运营商细分统计 (电信 X/Y 移动 X/Y 联通 X/Y 云厂 X/Y):
+#     · 大陆全失败 + 海外基本正常 → FAIL NODE_PORT_CN_BLOCKED   (三网+云厂全断, 疑似整 IP/端口被墙)
+#     · 大陆部分失败              → WARN NODE_PORT_CN_PARTIAL   (单网 0/N 全挂 = 疑似单网被墙/干扰,
+#                                                              以 ! 标注; 否则视为部分线路丢包)
+#     · 大陆全部成功              → PASS NODE_PORT_CN_OK
+#   全球探测点全失败 → 不是大陆方向问题 (端口未开/安全组, 交给 NW9 判定), 不误报被墙。
+#
+# 端口来源: _resolve_node_port (NODE_PORT 环境变量 > ~/.env > ~/node.json 的 node_port
+#   > ~/node.env > 默认 443), 与 NW9/安装脚本同源。
+# 目标 IP 来源: ~/node.json 的 node_ip > 已 source 的 node_ip (~/.env / node.env)
+#   > 公网探测 (api.ip.sb / ifconfig.me, -4)。
+#
+# 接口流程 (2026-08 实测逆向, 纯 POSIX sh + curl, 无需 JS):
+#   1. GET  /IP:PORT              → 响应内嵌 antiflood=<hex> cookie, 提取后须携带
+#   2. GET  /IP:PORT?browsercheck=ok -b cookie -L → 页面内嵌 taskStartQuery/taskStartToken
+#   3. POST ajax_startTask_v1.php (query + start_token, 须带 Origin 头, 否则 Invalid origin)
+#        → {"data":{"stream_id":..., "pinger_count":167}}
+#   4. 轮询 GET ajax_getPingResults_v2.php?type=tcp&totalPolls=N&stream_id=ID
+#      (每轮只返回【增量】, 需拼接累积), 直到 "outstandingNodeCount":0
+# 结果语义 (实测验证): "result":1 = 连接失败 (1.1.1.1:443 大陆 13 点全 1 = 确系大陆被墙;
+#                      关闭端口全球全 1); "result":V>1 = 成功, V/100 ≈ 毫秒
+#                      (baidu.com:443 大陆点 15.8~30.2ms)。
+#
+# 限制:
+#   · 只测 TCP —— NODE_PORT 仅监听 UDP (Hysteria2 直听) 时跳过: TCP/UDP 是两个独立
+#     命名空间, 纯 UDP 端口 tcping 全失败属正常, 不能判被墙 (同 NW9 的协议感知注意)。
+#   · 依赖 tcp.ping.pe 可达 (大陆探测点由其代测, 节点本机只与其 HTTPS 通信);
+#     服务不可达/繁忙时 WARN 跳过, 绝不误报。
+#   · 耗时 ~15-60s; NODE_CN_TCPING=0 (环境变量或 ~/.env) 可整体跳过本检查。
+# ============================================================
+_check_node_port_cn_tcping() {
+    [ "${NODE_CN_TCPING:-1}" = "0" ] && return 0
+    _resolve_node_port
+    has curl || { result WARN "CN_TCPING_NO_CURL" "无 curl, 跳过大陆 tcping 被墙检测"; return 0; }
+
+    # 前置: NODE_PORT 必须有 TCP 监听 (纯 UDP 端口 tcping 无意义, 见上方限制)
+    # 端口锚定 ([^0-9]|$): 避免 :443 误匹 :4430 / IPv6 地址段 (与 NW9 同款)
+    if ! ss -H -tlnp 2>/dev/null | grep -qE "[:.]$_NODE_PORT([^0-9]|$)"; then
+        result WARN "CN_TCPING_UDP_ONLY" "NODE_PORT=$_NODE_PORT 无 TCP 监听 (疑似纯 UDP: Hysteria2 直听), 跳过大陆 tcping 被墙检测" \
+            "tcping 只能测 TCP; UDP 端口的封锁需用户侧实测/抓包判断 (probeTask.sh 采集方向)"
+        return 0
+    fi
+
+    # 目标 IP: node.json .node_ip > 已 source 的 node_ip > 公网探测
+    _pe_host=""
+    if [ -f "$HOME/node.json" ] && has jq; then
+        _pe_host=$(jq -r '.node_ip // empty' "$HOME/node.json" 2>/dev/null)
+    fi
+    [ -z "$_pe_host" ] && _pe_host="${node_ip:-}"
+    [ -z "$_pe_host" ] && _pe_host=$(curl -4 -sS --connect-timeout 6 --max-time 10 https://api.ip.sb 2>/dev/null | tr -d '\n\r ')
+    [ -z "$_pe_host" ] && _pe_host=$(curl -4 -sS --connect-timeout 6 --max-time 10 https://ifconfig.me 2>/dev/null | tr -d '\n\r ')
+    if [ -z "$_pe_host" ]; then
+        result WARN "CN_TCPING_NO_IP" "无法确定本机公网 IP, 跳过 NODE_PORT=$_NODE_PORT 大陆 tcping 被墙检测" \
+            "node.json 无 node_ip 字段且公网探测 (api.ip.sb/ifconfig.me) 失败; 可在 ~/.env 固定 node_ip=<公网IPv4>"
+        return 0
+    fi
+
+    # ping.pe 目标格式: IPv6 需方括号包裹
+    case "$_pe_host" in
+        *:*) _pe_tgt="[${_pe_host}]:${_NODE_PORT}" ;;
+        *)   _pe_tgt="${_pe_host}:${_NODE_PORT}" ;;
+    esac
+    _pe_ua="Mozilla/5.0 (X11; Linux x86_64) NodeHub-proxyDiagnose"
+    _pe_b="https://tcp.ping.pe"
+
+    # 1) antiflood cookie: 首访响应内嵌 document.cookie 赋值, 提取后携带重访
+    _pe_page=$(curl -sS --connect-timeout 8 --max-time 20 -A "$_pe_ua" "${_pe_b}/${_pe_tgt}" 2>/dev/null)
+    _pe_af=$(printf '%s' "$_pe_page" | grep -oE 'antiflood=[a-f0-9]+' | head -1 | cut -d= -f2)
+    if [ -z "$_pe_af" ]; then
+        result WARN "CN_TCPING_SERVICE_DOWN" "tcp.ping.pe 不可达, 跳过 ${_pe_tgt} 大陆 tcping 被墙检测" \
+            "本检查依赖其大陆探测点代测; 服务恢复后重跑, 或人工在 https://tcp.ping.pe/${_pe_tgt} 复核"
+        return 0
+    fi
+    sleep 2
+    _pe_page=$(curl -sS -L --connect-timeout 8 --max-time 40 -A "$_pe_ua" -b "antiflood=$_pe_af" \
+        "${_pe_b}/${_pe_tgt}?browsercheck=ok" 2>/dev/null)
+    _pe_tok=$(printf '%s' "$_pe_page" | grep -oE 'var taskStartToken = "[^"]*"' | head -1 | sed 's/^.*"\(.*\)"$/\1/')
+    _pe_qry=$(printf '%s' "$_pe_page" | grep -oE 'var taskStartQuery = "[^"]*"' | head -1 | sed 's/^.*"\(.*\)"$/\1/')
+    if [ -z "$_pe_tok" ] || [ -z "$_pe_qry" ]; then
+        result WARN "CN_TCPING_SERVICE_CHANGE" "tcp.ping.pe 页面无任务令牌 (接口疑似变更), 跳过被墙检测" \
+            "人工在 https://tcp.ping.pe/${_pe_tgt} 复核大陆节点连通性"
+        return 0
+    fi
+
+    # 2) 启动探测任务 (须带 Origin 头, 否则 {"ok":false,"error":"Invalid origin"})
+    _pe_start=$(curl -sS --connect-timeout 8 --max-time 20 -A "$_pe_ua" -b "antiflood=$_pe_af" \
+        -H "X-Requested-With: XMLHttpRequest" -H "Origin: ${_pe_b}" -e "${_pe_b}/${_pe_tgt}" \
+        --data-urlencode "query=$_pe_qry" --data-urlencode "start_token=$_pe_tok" \
+        "${_pe_b}/ajax_startTask_v1.php" 2>/dev/null)
+    _pe_sid=$(printf '%s' "$_pe_start" | grep -oE '"stream_id":"?[0-9]+' | grep -oE '[0-9]+$')
+    if [ -z "$_pe_sid" ]; then
+        case "$_pe_start" in
+            *too_many*)
+                result WARN "CN_TCPING_SERVICE_BUSY" "tcp.ping.pe 并发任务已满, 本次跳过被墙检测" \
+                    "检测服务繁忙, 稍后重跑 ./proxyDiagnose.sh --target net" ;;
+            *)
+                result WARN "CN_TCPING_SERVICE_ERROR" "tcp.ping.pe 任务启动失败, 跳过被墙检测: $(printf '%s' "$_pe_start" | head -c 120)" \
+                    "人工在 https://tcp.ping.pe/${_pe_tgt} 复核" ;;
+        esac
+        return 0
+    fi
+
+    # 3) 轮询增量结果拼接累积; "outstandingNodeCount":0 = 全部探测点已回报, 提前收工
+    _pe_all=""
+    _pe_i=0
+    while [ "$_pe_i" -lt 12 ]; do
+        sleep 4
+        _pe_r=$(curl -sS --connect-timeout 8 --max-time 25 -A "$_pe_ua" -b "antiflood=$_pe_af" \
+            -e "${_pe_b}/${_pe_tgt}" \
+            "${_pe_b}/ajax_getPingResults_v2.php?type=tcp&totalPolls=$((_pe_i + 1))&stream_id=$_pe_sid" 2>/dev/null)
+        _pe_all="${_pe_all}
+$_pe_r"
+        case "$_pe_r" in
+            *'"outstandingNodeCount":0'*) break ;;
+        esac
+        [ -z "$_pe_r" ] && [ "$_pe_i" -ge 2 ] && break   # 连续空响应及早止损
+        _pe_i=$((_pe_i + 1))
+    done
+
+    # 4) 解析汇总: 轮询 JSON 行 {"node_id":"CN_5","timestamp_ms":N,"result":V,"result_text":""}
+    #    V=1 失败 / V>1 成功 (V/100≈ms); CN_ 前缀 = 大陆探测点, 其余作海外对照。
+    #    大陆点按运营商细分 — node→provider 映射取自探测页 <tr> 的 data-provider 属性
+    #    (电信 China Telecom / 移动 China Mobile / 联通 China Unicom; 腾讯云·阿里云等归云厂)。
+    #    awk 输出双行: 第1行 = 总量 (总数 大陆ok 大陆fail 海外ok 海外fail 大陆平均ms);
+    #                  第2行 = 分网明细 "电信 ok/N 移动 ok/N ...", 单网 0/N 全挂以 ! 标注
+    #                  (单网被墙/干扰特征, 与三网全断的处置不同)。
+    _pe_prov=$(printf '%s' "$_pe_page" \
+        | grep -oE "data-pinger-id='CN_[0-9]+'[^>]*data-provider='[^']*'" \
+        | sed -E "s/^data-pinger-id='(CN_[0-9]+)'.*data-provider='([^']*)'.*$/\1 \2/")
+    _pe_out=$({ printf '%s\n' "$_pe_prov" | sed 's/^/P /'
+        printf '%s\n' "$_pe_all" \
+            | grep -oE '"node_id":"[A-Za-z0-9_]+","timestamp_ms":[0-9]+,"result":-?[0-9]+' \
+            | sed -E 's/^"node_id":"([^"]*)","timestamp_ms":[0-9]+,"result":(-?[0-9]+)$/\1 \2/'
+        } | awk '
+            function tag(p) {
+                if (p ~ /Telecom/) return "CT"
+                if (p ~ /Mobile/)  return "CM"
+                if (p ~ /Unicom/)  return "CU"
+                return "CLD"
+            }
+            $1 == "P" { p = $0; sub(/^P [^ ]+ /, "", p); m[$2] = tag(p); next }
+            {
+                v = $2 + 0; t++
+                if ($1 ~ /^CN_/) {
+                    if (v > 1) { cnok++; cns += v; cok[m[$1]]++ } else { cnfail++; cfa[m[$1]]++ }
+                } else {
+                    if (v > 1) ok++; else fail++
+                }
+            }
+            END {
+                printf "%d %d %d %d %d %d\n", t, cnok, cnfail, ok, fail, (cnok ? int(cns / cnok / 100 + 0.5) : 0)
+                s = ""
+                n = cok["CT"] + cfa["CT"]; if (n > 0) s = s " 电信 " (cok["CT"] + 0) "/" n (cok["CT"] == 0 ? "!" : "")
+                n = cok["CM"] + cfa["CM"]; if (n > 0) s = s " 移动 " (cok["CM"] + 0) "/" n (cok["CM"] == 0 ? "!" : "")
+                n = cok["CU"] + cfa["CU"]; if (n > 0) s = s " 联通 " (cok["CU"] + 0) "/" n (cok["CU"] == 0 ? "!" : "")
+                n = cok["CLD"] + cfa["CLD"]; if (n > 0) s = s " 云厂 " (cok["CLD"] + 0) "/" n (cok["CLD"] == 0 ? "!" : "")
+                print substr(s, 2)
+            }')
+    _pe_tot=$(printf '%s\n' "$_pe_out" | sed -n 1p)
+    _pe_car=$(printf '%s\n' "$_pe_out" | sed -n 2p)
+    # shellcheck disable=SC2046,SC2086  # 故意分词: 把 awk 的 6 个汇总值赋给位置参数
+    set -- $_pe_tot
+    [ $# -ge 6 ] || set -- 0 0 0 0 0 0
+    _pe_t=$(_num "$1" 0);    _pe_cnok=$(_num "$2" 0);  _pe_cnfail=$(_num "$3" 0)
+    _pe_ok=$(_num "$4" 0);   _pe_fail=$(_num "$5" 0);  _pe_avg=$(_num "$6" 0)
+    _pe_cnt=$((_pe_cnok + _pe_cnfail))
+    _pe_ost=$((_pe_ok + _pe_fail))
+
+    # 5) 判定
+    if [ "$_pe_t" -eq 0 ]; then
+        result WARN "CN_TCPING_PARSE_EMPTY" "tcp.ping.pe 未返回任何探测结果, 跳过被墙判定" \
+            "人工在 https://tcp.ping.pe/${_pe_tgt} 复核"
+    elif [ "$_pe_cnt" -eq 0 ]; then
+        result WARN "CN_TCPING_NO_CN_NODE" "tcp.ping.pe 本次无大陆探测点回报 (全球共 ${_pe_t} 点), 无法判定被墙" \
+            "大陆探测点可能临时下线, 稍后重跑; 人工在 https://tcp.ping.pe/${_pe_tgt} 复核"
+    elif [ "$_pe_ost" -gt 0 ] && [ "$_pe_ok" -eq 0 ]; then
+        # 全球全失败 → 端口本身不可达 (非大陆方向问题), 不误报被墙, 交给 NW9
+        result WARN "CN_TCPING_PORT_UNREACHABLE" "${_pe_tgt} 全球 ${_pe_t} 个探测点全部失败 → 端口本身不可达, 非大陆方向问题" \
+            "先看 NW9 NODE_PORT_NOT_LISTENING / 云安全组 / 本机防火墙; 全球不通不是被墙的特征"
+    elif [ "$_pe_cnok" -eq 0 ]; then
+        result FAIL "NODE_PORT_CN_BLOCKED" \
+            "NODE_PORT=${_NODE_PORT} 大陆方向疑似被墙: 大陆 ${_pe_cnfail}/${_pe_cnt} 个探测点 TCP 全部失败 (三网+云厂全断: ${_pe_car}), 海外 ${_pe_ok}/${_pe_ost} 正常" \
+            "本机监听/证书/海外访问全正常, 唯独大陆不通 = 典型 IP/端口被墙特征。处置: ① https://tcp.ping.pe/${_pe_tgt} 多时段人工复核 ② 换端口 (重跑 proxyInstall.sh) ③ 套 CDN/中转 ④ 联系机房换 IP"
+    elif [ "$_pe_cnfail" -gt 0 ]; then
+        case "$_pe_car" in
+            *' 0/'*!*) _pe_hint="分网: ${_pe_car} — 标 ! 的运营商 0/N 全挂, 疑似【单网被墙/干扰】(仅某一家断, 其余网正常): 受影响用户换接入网/套 CDN 可绕, 无需整机换 IP" ;;
+            *)         _pe_hint="分网: ${_pe_car} — 各网均有通有断, 多为部分线路抖动/丢包而非封锁; 持续恶化会演变为全断 (NODE_PORT_CN_BLOCKED)" ;;
+        esac
+        result WARN "NODE_PORT_CN_PARTIAL" \
+            "大陆 ${_pe_cnok}/${_pe_cnt} 个探测点可达, ${_pe_cnfail} 个失败 (平均 ${_pe_avg}ms)" "$_pe_hint"
+    else
+        result PASS "NODE_PORT_CN_OK" "NODE_PORT=${_NODE_PORT} 大陆 ${_pe_cnt}/${_pe_cnt} 个探测点 tcping 可达 (平均 ${_pe_avg}ms)" \
+            "大陆方向未被墙, 三网+云厂全通 (分网: ${_pe_car:-未知})"
     fi
 }
 
