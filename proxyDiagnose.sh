@@ -1195,8 +1195,9 @@ $_pe_r"
     #    大陆点按运营商细分 — node→provider 映射取自探测页 <tr> 的 data-provider 属性
     #    (电信 China Telecom / 移动 China Mobile / 联通 China Unicom; 腾讯云·阿里云等归云厂)。
     #    awk 输出双行: 第1行 = 总量 (总数 大陆ok 大陆fail 海外ok 海外fail 大陆平均ms);
-    #                  第2行 = 分网明细 "电信 ok/N 移动 ok/N ...", 单网 0/N 全挂以 ! 标注
-    #                  (单网被墙/干扰特征, 与三网全断的处置不同)。
+    #                  第2行 = 逐网状态, 每类三段 "标签 状态 ok/total"
+    #                  (顺序: 移动 电信 联通 云厂 海外; 状态 ∈ 通/部分/断, 断=0/N 全挂,
+#                   与海外对照后可区分单网被墙/三网被墙/端口不可达)
     _pe_prov=$(printf '%s' "$_pe_page" \
         | grep -oE "data-pinger-id='CN_[0-9]+'[^>]*data-provider='[^']*'" \
         | sed -E "s/^data-pinger-id='(CN_[0-9]+)'.*data-provider='([^']*)'.*$/\1 \2/")
@@ -1211,6 +1212,11 @@ $_pe_r"
                 if (p ~ /Unicom/)  return "CU"
                 return "CLD"
             }
+            function emit(lbl, o, n,   st) {
+                if (n <= 0) return
+                st = "断"; if (o == n) st = "通"; else if (o > 0) st = "部分"
+                s = s " " lbl " " st " " o "/" n
+            }
             $1 == "P" { p = $0; sub(/^P [^ ]+ /, "", p); m[$2] = tag(p); next }
             {
                 v = $2 + 0; t++
@@ -1223,10 +1229,11 @@ $_pe_r"
             END {
                 printf "%d %d %d %d %d %d\n", t, cnok, cnfail, ok, fail, (cnok ? int(cns / cnok / 100 + 0.5) : 0)
                 s = ""
-                n = cok["CT"] + cfa["CT"]; if (n > 0) s = s " 电信 " (cok["CT"] + 0) "/" n (cok["CT"] == 0 ? "!" : "")
-                n = cok["CM"] + cfa["CM"]; if (n > 0) s = s " 移动 " (cok["CM"] + 0) "/" n (cok["CM"] == 0 ? "!" : "")
-                n = cok["CU"] + cfa["CU"]; if (n > 0) s = s " 联通 " (cok["CU"] + 0) "/" n (cok["CU"] == 0 ? "!" : "")
-                n = cok["CLD"] + cfa["CLD"]; if (n > 0) s = s " 云厂 " (cok["CLD"] + 0) "/" n (cok["CLD"] == 0 ? "!" : "")
+                emit("移动", cok["CM"] + 0, cok["CM"] + cfa["CM"])
+                emit("电信", cok["CT"] + 0, cok["CT"] + cfa["CT"])
+                emit("联通", cok["CU"] + 0, cok["CU"] + cfa["CU"])
+                emit("云厂", cok["CLD"] + 0, cok["CLD"] + cfa["CLD"])
+                emit("海外", ok + 0, ok + fail)
                 print substr(s, 2)
             }')
     _pe_tot=$(printf '%s\n' "$_pe_out" | sed -n 1p)
@@ -1239,32 +1246,73 @@ $_pe_r"
     _pe_cnt=$((_pe_cnok + _pe_cnfail))
     _pe_ost=$((_pe_ok + _pe_fail))
 
-    # 5) 判定
+    # 5) 判定 — 逐网展示阻断状态 (移动/电信/联通/云厂/海外 各自: 通/部分/断), 不笼统汇总
     if [ "$_pe_t" -eq 0 ]; then
         result WARN "CN_TCPING_PARSE_EMPTY" "tcp.ping.pe 未返回任何探测结果, 跳过被墙判定" \
             "人工在 https://tcp.ping.pe/${_pe_tgt} 复核"
-    elif [ "$_pe_cnt" -eq 0 ]; then
+        return 0
+    fi
+    if [ "$_pe_cnt" -eq 0 ]; then
         result WARN "CN_TCPING_NO_CN_NODE" "tcp.ping.pe 本次无大陆探测点回报 (全球共 ${_pe_t} 点), 无法判定被墙" \
             "大陆探测点可能临时下线, 稍后重跑; 人工在 https://tcp.ping.pe/${_pe_tgt} 复核"
-    elif [ "$_pe_ost" -gt 0 ] && [ "$_pe_ok" -eq 0 ]; then
-        # 全球全失败 → 端口本身不可达 (非大陆方向问题), 不误报被墙, 交给 NW9
-        result WARN "CN_TCPING_PORT_UNREACHABLE" "${_pe_tgt} 全球 ${_pe_t} 个探测点全部失败 → 端口本身不可达, 非大陆方向问题" \
-            "先看 NW9 NODE_PORT_NOT_LISTENING / 云安全组 / 本机防火墙; 全球不通不是被墙的特征"
-    elif [ "$_pe_cnok" -eq 0 ]; then
-        result FAIL "NODE_PORT_CN_BLOCKED" \
-            "NODE_PORT=${_NODE_PORT} 大陆方向疑似被墙: 大陆 ${_pe_cnfail}/${_pe_cnt} 个探测点 TCP 全部失败 (三网+云厂全断: ${_pe_car}), 海外 ${_pe_ok}/${_pe_ost} 正常" \
-            "本机监听/证书/海外访问全正常, 唯独大陆不通 = 典型 IP/端口被墙特征。处置: ① https://tcp.ping.pe/${_pe_tgt} 多时段人工复核 ② 换端口 (重跑 proxyInstall.sh) ③ 套 CDN/中转 ④ 联系机房换 IP"
-    elif [ "$_pe_cnfail" -gt 0 ]; then
-        case "$_pe_car" in
-            *' 0/'*!*) _pe_hint="分网: ${_pe_car} — 标 ! 的运营商 0/N 全挂, 疑似【单网被墙/干扰】(仅某一家断, 其余网正常): 受影响用户换接入网/套 CDN 可绕, 无需整机换 IP" ;;
-            *)         _pe_hint="分网: ${_pe_car} — 各网均有通有断, 多为部分线路抖动/丢包而非封锁; 持续恶化会演变为全断 (NODE_PORT_CN_BLOCKED)" ;;
-        esac
-        result WARN "NODE_PORT_CN_PARTIAL" \
-            "大陆 ${_pe_cnok}/${_pe_cnt} 个探测点可达, ${_pe_cnfail} 个失败 (平均 ${_pe_avg}ms)" "$_pe_hint"
-    else
-        result PASS "NODE_PORT_CN_OK" "NODE_PORT=${_NODE_PORT} 大陆 ${_pe_cnt}/${_pe_cnt} 个探测点 tcping 可达 (平均 ${_pe_avg}ms)" \
-            "大陆方向未被墙, 三网+云厂全通 (分网: ${_pe_car:-未知})"
+        return 0
     fi
+
+    # 分网状态串 + 逐网明细表: line2 每类三段 "标签 状态 ok/total"
+    #   _pe_car_s: 紧凑串 "移动:断(0/2) ... 海外:通(153/154)" (进结论标题/JSON)
+    #   _pe_tbl:   逐网明细行 (文本模式展示; 状态着色 断=红 部分=黄 通=绿)
+    _pe_car_s=""; _pe_tbl=""
+    # shellcheck disable=SC2086  # 故意分词: 逐组 (三段一组) 读取 awk 分网状态
+    set -- $_pe_car
+    while [ $# -ge 3 ]; do
+        _pe_car_s="${_pe_car_s:+${_pe_car_s} }${1}:${2}(${3})"
+        case "$2" in
+            断)   _sc="$_C_RED" ;;
+            部分) _sc="$_C_YELLOW" ;;
+            *)    _sc="$_C_GREEN" ;;
+        esac
+        _pe_tbl="${_pe_tbl}    │   ${1}  ${_sc}${2}${_C_RESET}  ${3}
+"
+        shift 3
+    done
+
+    if [ "$_pe_ost" -gt 0 ] && [ "$_pe_ok" -eq 0 ]; then
+        # 全球全失败 → 端口本身不可达 (非大陆方向问题), 不误报被墙, 交给 NW9
+        _pe_lvl=WARN; _pe_code=CN_TCPING_PORT_UNREACHABLE
+        _pe_title="${_pe_tgt} 端口本身不可达: 全球 ${_pe_t} 个探测点全部失败"
+        _pe_detail="全球 (含海外) 全断不是被墙的特征 → 先看 NW9 NODE_PORT_NOT_LISTENING / 云安全组 / 本机防火墙"
+    elif [ "$_pe_cnok" -eq 0 ]; then
+        _pe_lvl=FAIL; _pe_code=NODE_PORT_CN_BLOCKED
+        _pe_title="NODE_PORT=${_NODE_PORT} 疑似被墙: 三网+云厂全断 (大陆 ${_pe_cnfail}/${_pe_cnt}), 海外 ${_pe_ok}/${_pe_ost} 正常"
+        _pe_detail="本机监听/证书/海外访问全正常, 唯独大陆不通 = 典型 IP/端口被墙特征。处置: ① https://tcp.ping.pe/${_pe_tgt} 多时段人工复核 ② 换端口 (重跑 proxyInstall.sh) ③ 套 CDN/中转 ④ 联系机房换 IP"
+    elif [ "$_pe_cnfail" -gt 0 ]; then
+        _pe_lvl=WARN; _pe_code=NODE_PORT_CN_PARTIAL
+        # 全断网名单 (状态=断 的网): 非空 → 单网/多网被墙; 空 → 各网均有通有断的抖动
+        # shellcheck disable=SC2086  # 故意分词: 逐 token 过滤 :断( 项
+        _pe_dead=$(printf '%s\n' $_pe_car_s | grep ':断(' | cut -d: -f1 | tr '\n' '/' | sed 's:/$::')
+        if [ -n "$_pe_dead" ]; then
+            _pe_title="NODE_PORT=${_NODE_PORT} 部分被墙: ${_pe_dead} 全断, 其余网可达 (大陆 ${_pe_cnok}/${_pe_cnt} 通, 平均 ${_pe_avg}ms)"
+            _pe_detail="疑似【单网被墙/干扰】(仅 ${_pe_dead} 断, 其余网正常): 受影响用户换接入网/套 CDN 可绕, 无需整机换 IP; 持续恶化会演变为三网全断 (NODE_PORT_CN_BLOCKED)"
+        else
+            _pe_title="NODE_PORT=${_NODE_PORT} 部分线路抖动: 各网均有通有断 (大陆 ${_pe_cnok}/${_pe_cnt} 通, 平均 ${_pe_avg}ms)"
+            _pe_detail="无整网全断, 多为部分探测点/线路抖动丢包而非封锁; 用户单线路不通可复测确认"
+        fi
+    else
+        _pe_lvl=PASS; _pe_code=NODE_PORT_CN_OK
+        _pe_title="NODE_PORT=${_NODE_PORT} 未被墙: 三网+云厂全通 (大陆 ${_pe_cnt}/${_pe_cnt}, 平均 ${_pe_avg}ms)"
+        _pe_detail="大陆方向未被墙; 海外为对照 (海外正常 + 大陆全断 = 被墙特征)"
+    fi
+
+    # 输出: 逐网明细表 (文本模式; PASS 且 --quiet 时随结论一并静默) + 结论行
+    if [ "$JSON_OUTPUT" != 1 ]; then
+        if [ "$QUIET" != 1 ] || [ "$_pe_lvl" != PASS ]; then
+            printf '%b    ┌─ NODE_PORT=%s 分网 tcping 阻断明细 (状态 成功/总数)%b\n' "$_C_DIM" "$_NODE_PORT" "$_C_RESET"
+            printf '%b' "$_pe_tbl"
+            printf '%b    └─ 海外为对照: 海外通 + 大陆断 = 被墙特征%b\n' "$_C_DIM" "$_C_RESET"
+        fi
+    fi
+    [ -n "$_pe_car_s" ] && _pe_title="${_pe_title} [${_pe_car_s}]"
+    result "$_pe_lvl" "$_pe_code" "$_pe_title" "$_pe_detail"
 }
 
 # ============================================================
