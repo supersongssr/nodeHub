@@ -53,6 +53,10 @@
 #   ./proxyDiagnose.sh --quiet              # 只输出 FAIL/WARN, 不输出 PASS
 #   ./proxyDiagnose.sh --no-color           # 关闭颜色
 #   ./proxyDiagnose.sh --host root@1.2.3.4  # 远程诊断 (ssh 执行, 本地无需登录)
+#   NODE_TARGET_IP=5.6.7.8 NODE_PORT=443 ./proxyDiagnose.sh --target net
+#                                          # 在任意第三方服务器上远程测【别的】节点是否被墙
+#                                          #   (探测由 ping.pe 代测, 与运行位置无关;
+#                                          #    自动跳过本机监听类检查与交叉验证)
 #
 # 退出码: 失败项数 (上限 99), 0 = 全部通过
 # ============================================================
@@ -1027,6 +1031,15 @@ check_net() {
 # ============================================================
 _check_node_port_external() {
     _resolve_node_port
+    # 远程目标模式 (NODE_TARGET_IP 指定了非本机 IP): ss/监听检查只对本机有意义, 跳过
+    if [ -n "${NODE_TARGET_IP:-}" ] \
+       && ! printf '%s' " $(hostname -I 2>/dev/null) " | grep -qF " ${NODE_TARGET_IP} "; then
+        if [ "$JSON_OUTPUT" != 1 ]; then
+            printf '%b    └ 远程目标模式: NODE_TARGET_IP=%s 非本机, 跳过 NODE_PORT 本机监听检查 (ss 只能看本机)%b\n' \
+                "$_C_DIM" "$NODE_TARGET_IP" "$_C_RESET"
+        fi
+        return 0
+    fi
     # 协议感知: NODE_PORT 可能承载 TCP (VLESS/TLS, nginx 反代或 xray 直听) 也可能承载
     #   UDP (Hysteria2 — proxyInstall.sh 防火墙就是按 node_port/tcp + node_port/udp 双
     #   放行的), 故用 -tulnp 同查两协议; 仅查 TCP 会对 hysteria2 直听 NODE_PORT 的
@@ -1112,6 +1125,15 @@ _check_node_port_external() {
 #   · 依赖 tcp.ping.pe 可达 (大陆探测点由其代测, 节点本机只与其 HTTPS 通信);
 #     服务不可达/繁忙时 WARN 跳过, 绝不误报。
 #   · 耗时: 单轮 ~15-60s, 触发交叉验证时翻倍 (~2min)。
+#
+# 远程用法 (在第三方服务器上测【别的】节点, 无需登录目标机):
+#   NODE_TARGET_IP=1.2.3.4 NODE_PORT=443 ./proxyDiagnose.sh --target net
+#   · 核心被墙判定 (三网+云厂+海外对照) 完全可用 — 测量由 ping.pe 探测点完成,
+#     与脚本运行位置无关; NODE_TARGET_IP 优先级最高, 不被 ~/.env/node.json 覆盖
+#     (否则第三方服务器若自身也是节点, 会误测成它自己)。
+#   · 远程目标自动降级: 跳过本机监听前置检查与 NW9 (ss 只能看本机端口)、跳过随机
+#     端口交叉验证 (临时监听必须开在目标机上, 远程开了测的也是目标机的未开端口)。
+#   · 需要完整诊断 (含交叉验证) 用 --host root@1.2.3.4 把脚本推到节点上执行。
 # ============================================================
 
 # ---- ping.pe 探测封装 (供主测/交叉验证复用) ----
@@ -1262,25 +1284,40 @@ _check_node_port_cn_tcping() {
     _resolve_node_port
     has curl || { result WARN "CN_TCPING_NO_CURL" "无 curl, 跳过大陆 tcping 被墙检测"; return 0; }
 
-    # 前置: NODE_PORT 必须有 TCP 监听 (纯 UDP 端口 tcping 无意义, 见上方限制)
-    # 端口锚定 ([^0-9]|$): 避免 :443 误匹 :4430 / IPv6 地址段 (与 NW9 同款)
-    if ! ss -H -tlnp 2>/dev/null | grep -qE "[:.]$_NODE_PORT([^0-9]|$)"; then
-        result WARN "CN_TCPING_UDP_ONLY" "NODE_PORT=$_NODE_PORT 无 TCP 监听 (疑似纯 UDP: Hysteria2 直听), 跳过大陆 tcping 被墙检测" \
-            "tcping 只能测 TCP; UDP 端口的封锁需用户侧实测/抓包判断 (probeTask.sh 采集方向)"
+    # 目标 IP: NODE_TARGET_IP (在第三方服务器上测别的节点; 最高优先, 不被 ~/.env 覆盖)
+#   > 已 source 的 node_ip > ~/node.json .node_ip > 公网探测 (探测的是运行机自己的 IP)
+    _pe_from_detect=0
+    _pe_host="${NODE_TARGET_IP:-${node_ip:-}}"
+    if [ -z "$_pe_host" ] && [ -f "$HOME/node.json" ] && has jq; then
+        _pe_host=$(jq -r '.node_ip // empty' "$HOME/node.json" 2>/dev/null)
+    fi
+    if [ -z "$_pe_host" ]; then
+        _pe_host=$(curl -4 -sS --connect-timeout 6 --max-time 10 https://api.ip.sb 2>/dev/null | tr -d '\n\r ')
+        [ -z "$_pe_host" ] && _pe_host=$(curl -4 -sS --connect-timeout 6 --max-time 10 https://ifconfig.me 2>/dev/null | tr -d '\n\r ')
+        [ -n "$_pe_host" ] && _pe_from_detect=1
+    fi
+    if [ -z "$_pe_host" ]; then
+        result WARN "CN_TCPING_NO_IP" "无法确定目标公网 IP, 跳过 NODE_PORT=$_NODE_PORT 大陆 tcping 被墙检测" \
+            "未配 node_ip 且公网探测 (api.ip.sb/ifconfig.me) 失败; 测远程节点用 NODE_TARGET_IP=<目标IP> NODE_PORT=<端口>"
         return 0
     fi
 
-    # 目标 IP: node.json .node_ip > 已 source 的 node_ip > 公网探测
-    _pe_host=""
-    if [ -f "$HOME/node.json" ] && has jq; then
-        _pe_host=$(jq -r '.node_ip // empty' "$HOME/node.json" 2>/dev/null)
-    fi
-    [ -z "$_pe_host" ] && _pe_host="${node_ip:-}"
-    [ -z "$_pe_host" ] && _pe_host=$(curl -4 -sS --connect-timeout 6 --max-time 10 https://api.ip.sb 2>/dev/null | tr -d '\n\r ')
-    [ -z "$_pe_host" ] && _pe_host=$(curl -4 -sS --connect-timeout 6 --max-time 10 https://ifconfig.me 2>/dev/null | tr -d '\n\r ')
-    if [ -z "$_pe_host" ]; then
-        result WARN "CN_TCPING_NO_IP" "无法确定本机公网 IP, 跳过 NODE_PORT=$_NODE_PORT 大陆 tcping 被墙检测" \
-            "node.json 无 node_ip 字段且公网探测 (api.ip.sb/ifconfig.me) 失败; 可在 ~/.env 固定 node_ip=<公网IPv4>"
+    # 目标是否本机: 决定监听类检查 (ss 前置 / 交叉验证临时端口) 是否适用。
+#   本机 = 目标 IP 在本机网卡上, 或目标来自公网探测 (探测的就是运行机自己);
+#   第三方服务器上测别的节点 → 非本机 → 跳过一切"开监听/ss"类步骤, 纯借 ping.pe 远测。
+    _pe_islocal=0
+    _pe_ips=" $(hostname -I 2>/dev/null) "
+    # 取不到本机 IP 列表 → 保守视为本机 (保持旧行为); tr 判空保持 POSIX 可移植
+    [ -z "$(printf '%s' "$_pe_ips" | tr -d ' ')" ] && _pe_islocal=1
+    case "$_pe_ips" in *" $_pe_host "*) _pe_islocal=1 ;; esac
+    [ "$_pe_from_detect" = 1 ] && _pe_islocal=1
+
+    # 前置 (仅本机目标): NODE_PORT 必须有 TCP 监听 (纯 UDP 端口 tcping 无意义, 见上方限制);
+#   远程目标无法 ss → 不微此检查, 端口实际未开时海外探测点也会失败 → PORT_UNREACHABLE 兜底
+    # 端口锚定 ([^0-9]|$): 避免 :443 误匹 :4430 / IPv6 地址段 (与 NW9 同款)
+    if [ "$_pe_islocal" = 1 ] && ! ss -H -tlnp 2>/dev/null | grep -qE "[:.]$_NODE_PORT([^0-9]|$)"; then
+        result WARN "CN_TCPING_UDP_ONLY" "NODE_PORT=$_NODE_PORT 无 TCP 监听 (疑似纯 UDP: Hysteria2 直听), 跳过大陆 tcping 被墙检测" \
+            "tcping 只能测 TCP; UDP 端口的封锁需用户侧实测/抓包判断 (probeTask.sh 采集方向)"
         return 0
     fi
 
@@ -1356,6 +1393,15 @@ _check_node_port_cn_tcping() {
     #    临时端口可能被本机防火墙/云安全组拦截 (默认只放行业务端口) → 全球全断时判
     #    "无法判定"绝不误报 IP 被墙; 大陆断+海外通 才是封锁特征 (与主测同款海外对照)。
     [ "${NODE_CN_TCPING_XCHECK:-1}" = "0" ] && return 0
+    # 远程目标 (第三方服务器上测别的节点): 临时监听会开在【运行机】而非目标机, 测了也是
+    # 目标机的未开端口 → 无意义, 跳过; 需完整交叉验证用 --host 在节点本机跑
+    if [ "$_pe_islocal" != 1 ]; then
+        if [ "$JSON_OUTPUT" != 1 ]; then
+            printf '%b    └ 远程目标模式: 跳过随机端口交叉验证 (临时监听需开在目标机; 完整验证用 --host %s 在节点上跑)%b\n' \
+                "$_C_DIM" "${NODE_TARGET_IP:-$_pe_host}" "$_C_RESET"
+        fi
+        return 0
+    fi
     case "$_pe_code" in
         NODE_PORT_CN_BLOCKED) ;;
         NODE_PORT_CN_PARTIAL) [ -n "$_pe_dead_main" ] || return 0 ;;
