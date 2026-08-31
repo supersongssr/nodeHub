@@ -4,18 +4,18 @@
 
 ## 1. 当前规则 (v2.9.1, 最终形态)
 
-两个身份各司其职; ★节点类别由 `STAT_USER` 是否显式指定决定:
+两个身份各司其职; ★stat 模式由 `STAT_GID` / `STAT_USER` 互斥二选一决定 (均需显式指定, 见行为矩阵):
 
-### 动态节点 (默认路径, 未设 STAT_USER)
+### 动态节点 (group 模式: 只设 STAT_GID, 留空 STAT_USER)
 
 ```
 node_name = node_id                       # 面板分配的节点 ID → --alias 展示名
 stat_user = md5(IP)                       # 全量 32 hex, IPv4 优先 → -u 检索主键
 node_class = dynamic                      # probeTask 探针采集
-stat_client -u <md5(IP)> --alias <node_id> -g <API_PANEL>
+stat_client -u <md5(IP)> --alias <node_id> -g <STAT_GID>
 ```
 
-### 固定节点 (显式设 STAT_USER)
+### 固定节点 (user 模式: 只设 STAT_USER, 留空 STAT_GID)
 
 ```
 stat_user = STAT_USER                     # 人工命名, 稳定不变 → -u
@@ -25,14 +25,17 @@ stat_client -u <STAT_USER> --alias <node_id|NODE_NAME>     # 无 -g
 
 按 IP 检索契约仅适用于动态节点 (固定节点人工命名, 不参与 md5(IP) 检索)。
 
+`STAT_GID` 与 `STAT_USER` 同时设置 → 配置冲突: 告警 (推 Telegram) 并跳过 stat 安装;
+两者均未设置 → 跳过 stat client 安装 (不装监控, 代理功能不受影响, 其余步骤照常)。
+
 ### 行为矩阵
 
 | 配置 | -u USER | -g 分组 | node_class | probeTask | 类别 |
 |---|---|---|---|---|---|
-| 都不设 (默认) | md5(IP) | ${API_PANEL} | dynamic | 采集 | **动态节点** ★标准路径 |
-| 只设 STAT_GID | md5(IP) | 自定义组 | dynamic | 采集 | 动态节点 (自定义组) |
-| 只设 STAT_USER | STAT_USER | 无 | static | 跳过 | **固定节点** |
-| 都设 | STAT_USER | 自定义组 | static | 采集 (-g 兜底命中) | 固定节点挂组 (少见; node_class=static 但 unit 带 -g，`IsDynamicNode` 的 -g 兜底仍会命中) |
+| 都不设 | — (不安装) | — | dynamic | — | 跳过 stat client 安装 (不装监控, 代理不受影响; 已移除 `${API_PANEL}` 默认兜底) |
+| 只设 STAT_GID | md5(IP) | STAT_GID | dynamic | 采集 | **动态节点** ★group 模式标准路径 |
+| 只设 STAT_USER | STAT_USER | 无 | static | 跳过 | **固定节点** (user 模式) |
+| 都设 | — (不安装) | — | static | — | **配置冲突**: 告警 (推 Telegram) + 跳过 stat 安装, 其余步骤照常 |
 
 ### 字段分工
 
@@ -40,7 +43,7 @@ stat_client -u <STAT_USER> --alias <node_id|NODE_NAME>     # 无 -g
 |---|---|---|---|
 | `-u` (username, **行主键**) | `stat_user` | `md5(IP)` | ★外部项目: 只知 IP → 算 md5 → 匹配 username 字段即命中 |
 | `--alias` (展示名) | `node_name` | `node_id` | 人 (面板显示节点 ID, 与面板侧对齐) |
-| `-g` (分组) | group | `${API_PANEL}` 默认, 可 `STAT_GID` 覆盖 | 动态节点标记 (probeTask 依赖 `-g`) |
+| `-g` (分组) | group | `STAT_GID` (显式指定; 已移除 `${API_PANEL}` 默认兜底) | 动态节点标记 (probeTask 依赖 `-g`) |
 
 ### 关键性质
 

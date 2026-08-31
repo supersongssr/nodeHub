@@ -28,14 +28,15 @@ stat_user = md5( ip )        # 全量 32 位小写 hex, 无前缀无域
 
 ## 3. stat 行的字段分工 (仅动态节点; 固定节点人工设 STAT_USER 命名, 不适用本契约)
 
-★节点类别由 `STAT_USER` 是否显式指定决定 (与 proxyInstall 写入的 `node_class` 联动):
-设了 = 固定节点 (user 模式无 -g, probeTask 跳过采集); 未设 = 动态节点 (下表)。
+★stat 模式由 `STAT_GID` / `STAT_USER` 互斥二选一决定 (proxyInstall Step0_5):
+只设 `STAT_GID` = 动态节点 / group 模式 (下表); 只设 `STAT_USER` = 固定节点 (user 模式无 -g, probeTask 跳过采集);
+两者均设 = 配置冲突 → 告警并跳过 stat 安装; 两者均不设 → 跳过 stat client 安装 (不装监控, 代理不受影响)。
 
 | 字段 | 值 | 受众 |
 |---|---|---|
 | `-u` (username, **检索主键**) | `stat_user` = `6465ec74397c9126916786bbcd6d7601` | ★外部项目 (按 IP 算 md5) |
 | `--alias` (展示名) | `node_name` = `node_id` (如 `42`, 面板节点 ID) | 人 |
-| `-g` (分组) | `${API_PANEL}` 默认, 可 `STAT_GID` 覆盖 | 动态节点标记 (probeTask 依赖 `-g`) |
+| `-g` (分组) | `STAT_GID` (显式指定; 已移除 `${API_PANEL}` 默认值) | 动态节点标记 (probeTask 依赖 `-g`) |
 
 ## 4. IP 归一化 (节点与消费端必须一致)
 
@@ -72,6 +73,9 @@ stat_user=$(printf '%s' "1.2.3.4" | md5sum | awk '{print $1}')
 
 ## 6. 节点侧行为 (proxyInstall.sh v2.9)
 
+- `Step0_5` 模式判定 (`STAT_GID` / `STAT_USER` 互斥二选一): 只设 `STAT_GID` → group 模式
+  (`-g ${STAT_GID}`, 动态节点); 只设 `STAT_USER` → 固定 user 模式 (无 `-g`);
+  均设 = 配置冲突, 告警并跳过安装; 均不设 = 跳过 stat client 安装 (不装监控)。
 - `DeriveStatIdentity()` (Step1_Register 后): IPv4 优先选 IP → 归一化 → md5 →
   写入 `-u`; 失败 (IP 空 / md5sum 缺失) 回退 USER=node_name 并告警, 不中断安装。
 - 持久化 (仅为可读, 每次重算覆盖): `~/node.env` (`stat_user=`)、`~/node.stat_user`、
