@@ -1380,16 +1380,18 @@ Step0_ApplyId() {
 # ============================================================
 # Step 0.5: 安装 ServerStatus 客户端
 # 位于 Step1_Register 之后 — node_name / stat_user 均已解析并持久化
-# ★节点类别由 STAT_USER 是否显式指定决定 (与 PersistNodeName 的 node_class 联动):
-#   动态节点 (未设 STAT_USER, 默认路径):
+# ★模式判定 (STAT_GID / STAT_USER 互斥, 二选一, 由 ~/.env / 环境变量显式指定):
+#   group 模式 (STAT_GID 有值 且 STAT_USER 为空):
 #     -u USER  = stat_user = md5(IP) (IPv4 优先, 零密钥) ★外部项目只知
 #                IP 即可在公开 stat 数据中定位本节点那一行 (username 匹配)
 #     --alias = node_name = node_id (面板分配的节点 ID, 面板展示名)
-#     -g      = ${API_PANEL} (默认) — 动态节点标记 (probeTask 采集依据)
-#   固定节点 (显式设 STAT_USER):
+#     -g      = STAT_GID — 动态节点标记 (probeTask 采集依据)
+#   固定 user 模式 (STAT_GID 为空 且 STAT_USER 有值):
 #     -u USER  = STAT_USER (人工命名, 稳定不变; 按 IP 检索契约不适用)
-#     user 模式 (无 -g) → probeTask 判定为固定节点, 跳过采集
+#     无 -g → probeTask 判定为固定节点, 跳过采集
 #     --alias 同上; 如需可读展示名可另设 NODE_NAME
+#   两者均有值 → 配置冲突: log warn (推 Telegram) 警告 + 跳过 stat 安装, 其余步骤照常
+#   两者均无值 → 跳过 stat client 安装 (不装监控, 其余步骤照常)
 # 派生失败 (IP 空/md5sum 缺失) 回退 USER=node_name, 仅告警不中断
 # ============================================================
 Step0_5_InstallServerStatus() {
@@ -1398,33 +1400,31 @@ Step0_5_InstallServerStatus() {
     # node_name 防御 (ResolveNodeName 应已赋值; md5 路径恒非空)
     [ -z "${node_name:-}" ] && node_name="node_${NODE_ID}"
 
-    _script_name="serverstatus_client_install.sh"
-    _script_url="${NODEHUB_URL}/scripts/${_script_name}"
-
-    cd /tmp
-    wget -N --timeout=60 --tries=3 "${_script_url}" || die "${_script_name} 下载失败: ${_script_url}"
-    chmod +x "/tmp/${_script_name}"
-
     # ---- 拼装 stat_client 参数 (透传给子脚本, 子脚本不读 .env) ----
     # proxyInstall 已 . ~/.env + export 覆盖, 故 STAT_API_URL / STAT_API_PASSWORD / STAT_GID / STAT_USER 直接可用
     # node_name 已由 ResolveNodeName 解析并持久化 — 后续调用只需 name 即可定位节点
     #
-    # 模式判定:
-    #   STAT_GID 显式指定             → group 模式 (-g)          [动态节点, probe 采集]
-    #   STAT_USER 显式指定 (无 GID)   → user 模式 (无 -g)        [固定节点专用, 手工指定]
-    #   均未指定                      → 默认 group 模式 (GID=${API_PANEL})
+    # 模式判定 (STAT_GID / STAT_USER 互斥, 二选一):
+    #   STAT_GID 有值 且 STAT_USER 为空  → group 模式 (-g)         [动态节点, probe 采集]
+    #   STAT_GID 为空 且 STAT_USER 有值  → 固定 user 模式 (无 -g)   [固定节点, 手工指定]
+    #   两者均有值                       → 配置冲突: warn 警告 (推 Telegram) + 跳过 stat 安装
+    #   两者均无值                       → 跳过 stat client 安装 (不装监控)
+
+    # 1. 定模式: 互斥校验 — 冲突/均空均跳过 stat 安装 (return 0, 不中断主流程)
+    # ⚠ group 模式 (-g) 是"动态节点"的判定标记 (probeTask.sh IsDynamicNode 检测 -g)
+    if [ -n "${STAT_GID:-}" ] && [ -n "${STAT_USER:-}" ]; then
+        log warn "STAT_GID 与 STAT_USER 同时设置 (STAT_GID=${STAT_GID} STAT_USER=${STAT_USER}) — 配置冲突, 跳过 stat client 安装。group 模式请清空 STAT_USER; 固定 user 模式请清空 STAT_GID"
+        return 0
+    fi
+    if [ -z "${STAT_GID:-}" ] && [ -z "${STAT_USER:-}" ]; then
+        log info "STAT_GID / STAT_USER 均未指定 → 跳过 stat client 安装 (不装监控, 代理功能不受影响; 需要监控请显式设置 STAT_GID 或 STAT_USER 二选一)"
+        return 0
+    fi
+
     [ -z "${STAT_API_URL:-}" ]      && { log error "~/.env 缺少 STAT_API_URL，跳过 ServerStatus 安装"; return 0; }
     [ -z "${STAT_API_PASSWORD:-}" ] && { log error "~/.env 缺少 STAT_API_PASSWORD，跳过 ServerStatus 安装"; return 0; }
 
-    # 1. 定模式: 默认 group 模式 (STAT_GID=${API_PANEL}); 仅显式 STAT_USER 无 GID 时才 user 模式
-    # ⚠ group 模式 (-g) 是"动态节点"的判定标记 (probeTask.sh IsDynamicNode 检测 -g):
-    #   默认必须保持 group, 否则新装动态节点会被探针采集静默跳过 (误判为固定节点)
-    if [ -z "${STAT_GID:-}" ] && [ -z "${STAT_USER:-}" ]; then
-        STAT_GID="${API_PANEL}"
-        log info "STAT_GID / STAT_USER 均未指定 → 默认 group 模式 (STAT_GID=${STAT_GID}, 动态节点标记)"
-    fi
-
-    # 2. 定 USER: STAT_USER 显式优先 → 默认 stat_user (按 IP 检索的主键) → 兕底 node_name
+    # 2. 定 USER: 固定模式用 STAT_USER; group 模式用 stat_user (按 IP 检索主键) → 兜底 node_name
     if   [ -n "${STAT_USER:-}" ]; then
         _stat_u="${STAT_USER}"
     else
@@ -1441,6 +1441,14 @@ Step0_5_InstallServerStatus() {
         fi
         log info "stat_client 已存在但 USER/alias 变化 → 重写 systemd 配置 (USER=${_stat_u} alias=${node_name})"
     fi
+
+    # 下载安装子脚本 (置于模式/幂等校验之后 — 冲突/均空/幂等跳过路径不发起网络请求)
+    _script_name="serverstatus_client_install.sh"
+    _script_url="${NODEHUB_URL}/scripts/${_script_name}"
+
+    cd /tmp
+    wget -N --timeout=60 --tries=3 "${_script_url}" || die "${_script_name} 下载失败: ${_script_url}"
+    chmod +x "/tmp/${_script_name}"
 
     # 3. 拼参: STAT_GID 存在 → group 模式 (追加 -g); alias 恒为 node_name
     if [ -n "${STAT_GID:-}" ]; then
