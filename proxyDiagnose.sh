@@ -23,6 +23,9 @@
 #            本次 38.45.72.223 故障根因, 详见 check_outbound)
 #         · NODE_PORT 只 bind 127.0.0.1 → 端口本地"在监听"但外部无法访问
 #           (详见 _check_node_port_external)
+#         · NODE_PORT 大陆方向被墙 — 本机监听/证书/海外访问全正常, 唯大陆方向 TCP
+#           握手全部超时 (借 tcp.ping.pe 大陆探测点 tcping, 与海外探测点对照判定,
+#            详见 _check_node_port_cn_tcping)
 #         · conntrack 连接跟踪表打满 → 海量丢包 → 内存耗尽【硬死锁】
 #           (nf_conntrack_max 默认 8192 在多用户代理下秒级打满; 常因 /etc/sysctl.conf
 #            写了 conntrack 调优键但【值为空】→ sysctl -p 静默失败回退默认; 无 swap 的小
@@ -41,7 +44,8 @@
 #   ./proxyDiagnose.sh --target xray        # 只查 xray
 #   ./proxyDiagnose.sh --target nginx       # 只查 nginx
 #   ./proxyDiagnose.sh --target env         # 只查安装环境 (磁盘/内存/DNS/依赖/锁)
-#   ./proxyDiagnose.sh --target net         # 只查网络与防火墙 (含 NODE_PORT 对外可达性)
+#   ./proxyDiagnose.sh --target net         # 只查网络与防火墙 (含 NODE_PORT 对外可达性 + 大陆 tcping 被墙检测,
+#                                            #   检出封锁时自动随机开临时端口交叉验证 端口级/IP级 被墙)
 #   ./proxyDiagnose.sh --target cert        # 只查 TLS 证书 (root_domain + nginx .conf 引用证书)
 #   ./proxyDiagnose.sh --target outbound    # 只查出站连通性 (IPv4/IPv6 web + domainStrategy)
 #   ./proxyDiagnose.sh --target traffic     # 只查本周期流量 (vnstat tx, 自上一个 NODE_TRAFFIC_RESETDAY)
@@ -49,6 +53,10 @@
 #   ./proxyDiagnose.sh --quiet              # 只输出 FAIL/WARN, 不输出 PASS
 #   ./proxyDiagnose.sh --no-color           # 关闭颜色
 #   ./proxyDiagnose.sh --host root@1.2.3.4  # 远程诊断 (ssh 执行, 本地无需登录)
+#   NODE_TARGET_IP=5.6.7.8 NODE_PORT=443 ./proxyDiagnose.sh --target net
+#                                          # 在任意第三方服务器上远程测【别的】节点是否被墙
+#                                          #   (探测由 ping.pe 代测, 与运行位置无关;
+#                                          #    自动跳过本机监听类检查与交叉验证)
 #
 # 退出码: 失败项数 (上限 99), 0 = 全部通过
 # ============================================================
@@ -900,7 +908,7 @@ _check_oom_for() {
 # 网络与防火墙 (net)
 # ============================================================
 check_net() {
-    say "网络与防火墙 (iptables / ufw / firewalld / SELinux / conntrack / sysctl)"
+    say "网络与防火墙 (iptables / ufw / firewalld / SELinux / conntrack / sysctl / NODE_PORT 对外可达与大陆 tcping)"
 
     # NW1. iptables DROP/REJECT 规则 (可能拦截代理端口)
     if has iptables; then
@@ -1010,6 +1018,10 @@ check_net() {
 
     # NW9. NODE_PORT 对外可达性 (端口监听 ≠ 外部可访问; 详见 _check_node_port_external)
     _check_node_port_external
+
+    # NW10. NODE_PORT 大陆 tcping 被墙检测 (海外可达 ≠ 大陆可达; 检出封锁时随机新端口交叉验证
+    #      端口级/IP级 被墙; 详见 _check_node_port_cn_tcping)
+    _check_node_port_cn_tcping
 }
 
 # ============================================================
@@ -1019,6 +1031,15 @@ check_net() {
 # ============================================================
 _check_node_port_external() {
     _resolve_node_port
+    # 远程目标模式 (NODE_TARGET_IP 指定了非本机 IP): ss/监听检查只对本机有意义, 跳过
+    if [ -n "${NODE_TARGET_IP:-}" ] \
+       && ! printf '%s' " $(hostname -I 2>/dev/null) " | grep -qF " ${NODE_TARGET_IP} "; then
+        if [ "$JSON_OUTPUT" != 1 ]; then
+            printf '%b    └ 远程目标模式: NODE_TARGET_IP=%s 非本机, 跳过 NODE_PORT 本机监听检查 (ss 只能看本机)%b\n' \
+                "$_C_DIM" "$NODE_TARGET_IP" "$_C_RESET"
+        fi
+        return 0
+    fi
     # 协议感知: NODE_PORT 可能承载 TCP (VLESS/TLS, nginx 反代或 xray 直听) 也可能承载
     #   UDP (Hysteria2 — proxyInstall.sh 防火墙就是按 node_port/tcp + node_port/udp 双
     #   放行的), 故用 -tulnp 同查两协议; 仅查 TCP 会对 hysteria2 直听 NODE_PORT 的
@@ -1051,6 +1072,454 @@ _check_node_port_external() {
         result FAIL "NODE_PORT_LOCALHOST_ONLY" "NODE_PORT=$_NODE_PORT 仅监听 127.0.0.1/::1 → 外部无法访问" \
             "xray inbound 的 listen 留空或设 0.0.0.0; nginx listen 行去掉 127.0.0.1: 前缀"
     fi
+}
+
+# ============================================================
+# NODE_PORT 大陆 tcping 被墙检测 (NW10) — "端口在监听 + 海外可达" ≠ "大陆可达"
+#
+# 被墙的表现: 本机端口监听正常 / 证书有效 / 海外客户端一切正常, 但大陆方向 TCP
+#   握手全部超时或重置 → 用户侧"连不上", 而节点侧常规检查全部 PASS —— 与出站 IPv4
+#   被封 (check_outbound) 同属"本机一切正常"型隐蔽故障, 必须借大陆视角才能发现。
+#
+# 做法: 借 tcp.ping.pe 的大陆探测点对 <node_ip>:<node_port> 做 TCP 连通测试,
+#   并与海外探测点【对照】; 大陆探测点覆盖三网 + 云厂两类 (2026-08 实测 13 点):
+#     · 电信 China Telecom ×2 (江苏/丽水) / 移动 China Mobile ×2 / 联通 China Unicom ×2
+#       —— 丽水系为原生运营商线路, 能区分【单网被墙/干扰】(仅某一家全断)
+#     · 腾讯云 ×5 (成都/重庆/广州/南京/上海) + 阿里云 ×2 (青岛/上海) —— 云厂骨干对照
+#   逐网展示阻断状态 (移动/电信/联通/云厂/海外 各自: 通/部分/断, ok/total):
+#     · 大陆全断 + 海外基本正常 → FAIL NODE_PORT_CN_BLOCKED   (三网+云厂全断)
+#     · 单网 0/N 全挂             → WARN NODE_PORT_CN_PARTIAL   (单网被墙/干扰, 列出全断网)
+#     · 各网均有通有断            → WARN NODE_PORT_CN_PARTIAL   (部分线路抖动, 非封锁)
+#     · 大陆全部成功              → PASS NODE_PORT_CN_OK
+#   全球探测点全失败 → 不是大陆方向问题 (端口未开/安全组, 交给 NW9 判定), 不误报被墙。
+#
+# 交叉验证 (xcheck): 主测判出封锁 (三网全断, 或单网全挂) 时, 本机随机开一个临时 TCP
+#   端口 (20000-60000, python3 优先 / socat 退路, timeout 240s 兜底自灭) 再测一轮,
+#   区分【端口被墙】vs【IP 整段被墙】(处置完全不同):
+#     · 新端口大陆通 (原断网恢复)  → PASS NODE_PORT_CN_XCHECK_PORT  端口级: 换端口可救, IP 未整段封
+#     · 新端口大陆也全断、海外正常 → FAIL NODE_PORT_CN_IP_BLOCKED  IP 级: 换端口无效, 需 CDN/中转/换 IP
+#     · 部分网恢复/部分网仍断     → WARN NODE_PORT_CN_XCHECK_MIXED / XCHECK_IP (网级封锁)
+#     · 新端口全球全断            → WARN CN_XCHECK_INCONCLUSIVE: 防火墙/云安全组拦了临时端口,
+#                                   无法判定 (绝不据此误报 IP 被墙; 海外作对照的同款逻辑)
+#   开关: NODE_CN_TCPING=0 关整个被墙检测; NODE_CN_TCPING_XCHECK=0 只关交叉验证 (省 ~60s)。
+#
+# 端口来源: _resolve_node_port (NODE_PORT 环境变量 > ~/.env > ~/node.json 的 node_port
+#   > ~/node.env > 默认 443), 与 NW9/安装脚本同源。
+# 目标 IP 来源: ~/node.json 的 node_ip > 已 source 的 node_ip (~/.env / node.env)
+#   > 公网探测 (api.ip.sb / ifconfig.me, -4)。
+#
+# 接口流程 (2026-08 实测逆向, 纯 POSIX sh + curl, 无需 JS):
+#   1. GET  /IP:PORT              → 响应内嵌 antiflood=<hex> cookie, 提取后须携带
+#   2. GET  /IP:PORT?browsercheck=ok -b cookie -L → 页面内嵌 taskStartQuery/taskStartToken
+#   3. POST ajax_startTask_v1.php (query + start_token, 须带 Origin 头, 否则 Invalid origin)
+#        → {"data":{"stream_id":..., "pinger_count":167}}
+#   4. 轮询 GET ajax_getPingResults_v2.php?type=tcp&totalPolls=N&stream_id=ID
+#      (每轮只返回【增量】, 需拼接累积), 直到 "outstandingNodeCount":0
+# 结果语义 (实测验证): "result":1 = 连接失败 (1.1.1.1:443 大陆 13 点全 1 = 确系大陆被墙;
+#                      关闭端口全球全 1); "result":V>1 = 成功, V/100 ≈ 毫秒
+#                      (baidu.com:443 大陆点 15.8~30.2ms)。
+#
+# 限制:
+#   · 只测 TCP —— NODE_PORT 仅监听 UDP (Hysteria2 直听) 时跳过: TCP/UDP 是两个独立
+#     命名空间, 纯 UDP 端口 tcping 全失败属正常, 不能判被墙 (同 NW9 的协议感知注意)。
+#   · 依赖 tcp.ping.pe 可达 (大陆探测点由其代测, 节点本机只与其 HTTPS 通信);
+#     服务不可达/繁忙时 WARN 跳过, 绝不误报。
+#   · 耗时: 单轮 ~15-60s, 触发交叉验证时翻倍 (~2min)。
+#
+# 远程用法 (在第三方服务器上测【别的】节点, 无需登录目标机):
+#   NODE_TARGET_IP=1.2.3.4 NODE_PORT=443 ./proxyDiagnose.sh --target net
+#   · 核心被墙判定 (三网+云厂+海外对照) 完全可用 — 测量由 ping.pe 探测点完成,
+#     与脚本运行位置无关; NODE_TARGET_IP 优先级最高, 不被 ~/.env/node.json 覆盖
+#     (否则第三方服务器若自身也是节点, 会误测成它自己)。
+#   · 远程目标自动降级: 跳过本机监听前置检查与 NW9 (ss 只能看本机端口)、跳过随机
+#     端口交叉验证 (临时监听必须开在目标机上, 远程开了测的也是目标机的未开端口)。
+#   · 需要完整诊断 (含交叉验证) 用 --host root@1.2.3.4 把脚本推到节点上执行。
+# ============================================================
+
+# ---- ping.pe 探测封装 (供主测/交叉验证复用) ----
+# _pe_probe <目标 IP:PORT> <标签> — 跑一轮完整的 tcp.ping.pe 全球 tcping (含大陆分网)
+#   成功 → 全局 _peR_t/_peR_cnok/_peR_cnfail/_peR_ok/_peR_fail/_peR_avg +
+#          _peR_car (逐网三段串 "标签 状态 ok/total"), return 0
+#   失败 → 已 emit WARN (标题含 <标签>), return 1, 调用方直接放弃本轮判定
+_pe_probe() {
+    _pp_tgt="$1"; _pp_lbl="${2:-}"
+    _pe_ua="Mozilla/5.0 (X11; Linux x86_64) NodeHub-proxyDiagnose"
+    _pe_b="https://tcp.ping.pe"
+
+    # 1) antiflood cookie: 首访响应内嵌 document.cookie 赋值, 提取后携带重访
+    _pe_page=$(curl -sS --connect-timeout 8 --max-time 20 -A "$_pe_ua" "${_pe_b}/${_pp_tgt}" 2>/dev/null)
+    _pe_af=$(printf '%s' "$_pe_page" | grep -oE 'antiflood=[a-f0-9]+' | head -1 | cut -d= -f2)
+    if [ -z "$_pe_af" ]; then
+        result WARN "CN_TCPING_SERVICE_DOWN" "tcp.ping.pe 不可达, 跳过${_pp_lbl} ${_pp_tgt} 检测" \
+            "本检查依赖其大陆探测点代测; 服务恢复后重跑, 或人工在 https://tcp.ping.pe/${_pp_tgt} 复核"
+        return 1
+    fi
+    sleep 2
+    _pe_page=$(curl -sS -L --connect-timeout 8 --max-time 40 -A "$_pe_ua" -b "antiflood=$_pe_af" \
+        "${_pe_b}/${_pp_tgt}?browsercheck=ok" 2>/dev/null)
+    _pe_tok=$(printf '%s' "$_pe_page" | grep -oE 'var taskStartToken = "[^"]*"' | head -1 | sed 's/^.*"\(.*\)"$/\1/')
+    _pe_qry=$(printf '%s' "$_pe_page" | grep -oE 'var taskStartQuery = "[^"]*"' | head -1 | sed 's/^.*"\(.*\)"$/\1/')
+    if [ -z "$_pe_tok" ] || [ -z "$_pe_qry" ]; then
+        result WARN "CN_TCPING_SERVICE_CHANGE" "tcp.ping.pe 页面无任务令牌 (接口疑似变更), 跳过${_pp_lbl}检测" \
+            "人工在 https://tcp.ping.pe/${_pp_tgt} 复核大陆节点连通性"
+        return 1
+    fi
+
+    # 2) 启动探测任务 (须带 Origin 头, 否则 {"ok":false,"error":"Invalid origin"})
+    _pe_start=$(curl -sS --connect-timeout 8 --max-time 20 -A "$_pe_ua" -b "antiflood=$_pe_af" \
+        -H "X-Requested-With: XMLHttpRequest" -H "Origin: ${_pe_b}" -e "${_pe_b}/${_pp_tgt}" \
+        --data-urlencode "query=$_pe_qry" --data-urlencode "start_token=$_pe_tok" \
+        "${_pe_b}/ajax_startTask_v1.php" 2>/dev/null)
+    _pe_sid=$(printf '%s' "$_pe_start" | grep -oE '"stream_id":"?[0-9]+' | grep -oE '[0-9]+$')
+    if [ -z "$_pe_sid" ]; then
+        case "$_pe_start" in
+            *too_many*)
+                result WARN "CN_TCPING_SERVICE_BUSY" "tcp.ping.pe 并发任务已满, 跳过${_pp_lbl}检测" \
+                    "检测服务繁忙, 稍后重跑 ./proxyDiagnose.sh --target net" ;;
+            *)
+                result WARN "CN_TCPING_SERVICE_ERROR" "tcp.ping.pe 任务启动失败, 跳过${_pp_lbl}检测: $(printf '%s' "$_pe_start" | head -c 120)" \
+                    "人工在 https://tcp.ping.pe/${_pp_tgt} 复核" ;;
+        esac
+        return 1
+    fi
+
+    # 3) 轮询增量结果拼接累积; "outstandingNodeCount":0 = 全部探测点已回报, 提前收工
+    _pe_all=""
+    _pe_i=0
+    while [ "$_pe_i" -lt 12 ]; do
+        sleep 4
+        _pe_r=$(curl -sS --connect-timeout 8 --max-time 25 -A "$_pe_ua" -b "antiflood=$_pe_af" \
+            -e "${_pe_b}/${_pp_tgt}" \
+            "${_pe_b}/ajax_getPingResults_v2.php?type=tcp&totalPolls=$((_pe_i + 1))&stream_id=$_pe_sid" 2>/dev/null)
+        _pe_all="${_pe_all}
+$_pe_r"
+        case "$_pe_r" in
+            *'"outstandingNodeCount":0'*) break ;;
+        esac
+        [ -z "$_pe_r" ] && [ "$_pe_i" -ge 2 ] && break   # 连续空响应及早止损
+        _pe_i=$((_pe_i + 1))
+    done
+
+    # 4) 解析汇总: {"node_id":"CN_5","timestamp_ms":N,"result":V,"result_text":""}
+    #    V=1 失败 / V>1 成功 (V/100≈ms); CN_ 前缀 = 大陆探测点, 其余作海外对照。
+    #    大陆点按运营商细分 — node→provider 映射取自探测页 <tr> 的 data-provider 属性
+    #    (电信 China Telecom / 移动 China Mobile / 联通 China Unicom; 腾讯云·阿里云等归云厂)。
+    #    awk 输出双行: 第1行 = 总量 (总数 大陆ok 大陆fail 海外ok 海外fail 大陆平均ms);
+    #                  第2行 = 逐网状态, 每类三段 "标签 状态 ok/total"
+    #                  (顺序: 移动 电信 联通 云厂 海外; 状态 ∈ 通/部分/断, 断=0/N 全挂)
+    _pe_prov=$(printf '%s' "$_pe_page" \
+        | grep -oE "data-pinger-id='CN_[0-9]+'[^>]*data-provider='[^']*'" \
+        | sed -E "s/^data-pinger-id='(CN_[0-9]+)'.*data-provider='([^']*)'.*$/\1 \2/")
+    _pe_out=$({ printf '%s\n' "$_pe_prov" | sed 's/^/P /'
+        printf '%s\n' "$_pe_all" \
+            | grep -oE '"node_id":"[A-Za-z0-9_]+","timestamp_ms":[0-9]+,"result":-?[0-9]+' \
+            | sed -E 's/^"node_id":"([^"]*)","timestamp_ms":[0-9]+,"result":(-?[0-9]+)$/\1 \2/'
+        } | awk '
+            function tag(p) {
+                if (p ~ /Telecom/) return "CT"
+                if (p ~ /Mobile/)  return "CM"
+                if (p ~ /Unicom/)  return "CU"
+                return "CLD"
+            }
+            function emit(lbl, o, n,   st) {
+                if (n <= 0) return
+                st = "断"; if (o == n) st = "通"; else if (o > 0) st = "部分"
+                s = s " " lbl " " st " " o "/" n
+            }
+            $1 == "P" { p = $0; sub(/^P [^ ]+ /, "", p); m[$2] = tag(p); next }
+            {
+                v = $2 + 0; t++
+                if ($1 ~ /^CN_/) {
+                    if (v > 1) { cnok++; cns += v; cok[m[$1]]++ } else { cnfail++; cfa[m[$1]]++ }
+                } else {
+                    if (v > 1) ok++; else fail++
+                }
+            }
+            END {
+                printf "%d %d %d %d %d %d\n", t, cnok, cnfail, ok, fail, (cnok ? int(cns / cnok / 100 + 0.5) : 0)
+                s = ""
+                emit("移动", cok["CM"] + 0, cok["CM"] + cfa["CM"])
+                emit("电信", cok["CT"] + 0, cok["CT"] + cfa["CT"])
+                emit("联通", cok["CU"] + 0, cok["CU"] + cfa["CU"])
+                emit("云厂", cok["CLD"] + 0, cok["CLD"] + cfa["CLD"])
+                emit("海外", ok + 0, ok + fail)
+                print substr(s, 2)
+            }')
+    # shellcheck disable=SC2046,SC2086  # 故意分词: awk 的 6 个汇总值赋给位置参数
+    set -- $(printf '%s\n' "$_pe_out" | sed -n 1p)
+    [ $# -ge 6 ] || set -- 0 0 0 0 0 0
+    _peR_t=$(_num "$1" 0);    _peR_cnok=$(_num "$2" 0);  _peR_cnfail=$(_num "$3" 0)
+    _peR_ok=$(_num "$4" 0);   _peR_fail=$(_num "$5" 0);  _peR_avg=$(_num "$6" 0)
+    _peR_car=$(printf '%s\n' "$_pe_out" | sed -n 2p)
+    return 0
+}
+
+# _pe_render <逐网三段串> — 生成全局 _pe_car_s (紧凑串, 进标题/JSON) 与 _pe_tbl (逐网明细表行)
+_pe_render() {
+    _pe_car_s=""; _pe_tbl=""
+    # shellcheck disable=SC2086  # 故意分词: 逐组 (三段一组) 读取分网状态
+    set -- $1
+    while [ $# -ge 3 ]; do
+        _pe_car_s="${_pe_car_s:+${_pe_car_s} }${1}:${2}(${3})"
+        case "$2" in
+            断)   _sc="$_C_RED" ;;
+            部分) _sc="$_C_YELLOW" ;;
+            *)    _sc="$_C_GREEN" ;;
+        esac
+        _pe_tbl="${_pe_tbl}    │   ${1}  ${_sc}${2}${_C_RESET}  ${3}
+"
+        shift 3
+    done
+}
+
+# _pe_dead_nets <紧凑串> — 输出状态为"断"的大陆网络名单 (空格分隔; 海外为对照不计入)
+_pe_dead_nets() {
+    [ -n "$1" ] || return 0
+    # shellcheck disable=SC2086  # 故意分词: 逐 token 过滤 :断( 项
+    printf '%s\n' $1 | grep ':断(' | grep -v '^海外:' | cut -d: -f1 | tr '\n' ' ' | sed 's/ *$//'
+}
+
+_check_node_port_cn_tcping() {
+    [ "${NODE_CN_TCPING:-1}" = "0" ] && return 0
+    _resolve_node_port
+    has curl || { result WARN "CN_TCPING_NO_CURL" "无 curl, 跳过大陆 tcping 被墙检测"; return 0; }
+
+    # 目标 IP: NODE_TARGET_IP (在第三方服务器上测别的节点; 最高优先, 不被 ~/.env 覆盖)
+#   > 已 source 的 node_ip > ~/node.json .node_ip > 公网探测 (探测的是运行机自己的 IP)
+    _pe_from_detect=0
+    _pe_host="${NODE_TARGET_IP:-${node_ip:-}}"
+    if [ -z "$_pe_host" ] && [ -f "$HOME/node.json" ] && has jq; then
+        _pe_host=$(jq -r '.node_ip // empty' "$HOME/node.json" 2>/dev/null)
+    fi
+    if [ -z "$_pe_host" ]; then
+        _pe_host=$(curl -4 -sS --connect-timeout 6 --max-time 10 https://api.ip.sb 2>/dev/null | tr -d '\n\r ')
+        [ -z "$_pe_host" ] && _pe_host=$(curl -4 -sS --connect-timeout 6 --max-time 10 https://ifconfig.me 2>/dev/null | tr -d '\n\r ')
+        [ -n "$_pe_host" ] && _pe_from_detect=1
+    fi
+    if [ -z "$_pe_host" ]; then
+        result WARN "CN_TCPING_NO_IP" "无法确定目标公网 IP, 跳过 NODE_PORT=$_NODE_PORT 大陆 tcping 被墙检测" \
+            "未配 node_ip 且公网探测 (api.ip.sb/ifconfig.me) 失败; 测远程节点用 NODE_TARGET_IP=<目标IP> NODE_PORT=<端口>"
+        return 0
+    fi
+
+    # 目标是否本机: 决定监听类检查 (ss 前置 / 交叉验证临时端口) 是否适用。
+#   本机 = 目标 IP 在本机网卡上, 或目标来自公网探测 (探测的就是运行机自己);
+#   第三方服务器上测别的节点 → 非本机 → 跳过一切"开监听/ss"类步骤, 纯借 ping.pe 远测。
+    _pe_islocal=0
+    _pe_ips=" $(hostname -I 2>/dev/null) "
+    # 取不到本机 IP 列表 → 保守视为本机 (保持旧行为); tr 判空保持 POSIX 可移植
+    [ -z "$(printf '%s' "$_pe_ips" | tr -d ' ')" ] && _pe_islocal=1
+    case "$_pe_ips" in *" $_pe_host "*) _pe_islocal=1 ;; esac
+    [ "$_pe_from_detect" = 1 ] && _pe_islocal=1
+
+    # 前置 (仅本机目标): NODE_PORT 必须有 TCP 监听 (纯 UDP 端口 tcping 无意义, 见上方限制);
+#   远程目标无法 ss → 不微此检查, 端口实际未开时海外探测点也会失败 → PORT_UNREACHABLE 兜底
+    # 端口锚定 ([^0-9]|$): 避免 :443 误匹 :4430 / IPv6 地址段 (与 NW9 同款)
+    if [ "$_pe_islocal" = 1 ] && ! ss -H -tlnp 2>/dev/null | grep -qE "[:.]$_NODE_PORT([^0-9]|$)"; then
+        result WARN "CN_TCPING_UDP_ONLY" "NODE_PORT=$_NODE_PORT 无 TCP 监听 (疑似纯 UDP: Hysteria2 直听), 跳过大陆 tcping 被墙检测" \
+            "tcping 只能测 TCP; UDP 端口的封锁需用户侧实测/抓包判断 (probeTask.sh 采集方向)"
+        return 0
+    fi
+
+    # ping.pe 目标格式: IPv6 需方括号包裹
+    case "$_pe_host" in
+        *:*) _pe_tgt="[${_pe_host}]:${_NODE_PORT}" ;;
+        *)   _pe_tgt="${_pe_host}:${_NODE_PORT}" ;;
+    esac
+    # 主测: 原端口一轮完整探测 (流程封装于 _pe_probe, 供下方交叉验证复用)
+    if ! _pe_probe "$_pe_tgt" "原端口"; then return 0; fi
+    _pe_t=$_peR_t; _pe_cnok=$_peR_cnok; _pe_cnfail=$_peR_cnfail
+    _pe_ok=$_peR_ok; _pe_fail=$_peR_fail; _pe_avg=$_peR_avg
+    _pe_cnt=$((_pe_cnok + _pe_cnfail))
+    _pe_ost=$((_pe_ok + _pe_fail))
+    # 分网渲染 + 主测全断网名单 (供判定展示与交叉验证对照)
+    _pe_render "$_peR_car"
+    _pe_dead_main=$(_pe_dead_nets "$_pe_car_s")
+
+    # 5) 判定 — 逐网展示阻断状态 (移动/电信/联通/云厂/海外 各自: 通/部分/断), 不笼统汇总
+    #    (_pe_car_s 紧凑串 / _pe_tbl 明细表 已由 _pe_render 生成)
+    if [ "$_pe_t" -eq 0 ]; then
+        result WARN "CN_TCPING_PARSE_EMPTY" "tcp.ping.pe 未返回任何探测结果, 跳过被墙判定" \
+            "人工在 https://tcp.ping.pe/${_pe_tgt} 复核"
+        return 0
+    fi
+    if [ "$_pe_cnt" -eq 0 ]; then
+        result WARN "CN_TCPING_NO_CN_NODE" "tcp.ping.pe 本次无大陆探测点回报 (全球共 ${_pe_t} 点), 无法判定被墙" \
+            "大陆探测点可能临时下线, 稍后重跑; 人工在 https://tcp.ping.pe/${_pe_tgt} 复核"
+        return 0
+    fi
+
+    # 分网状态串/明细表 已由 _pe_render 生成 (_pe_car_s / _pe_tbl)
+
+    if [ "$_pe_ost" -gt 0 ] && [ "$_pe_ok" -eq 0 ]; then
+        # 全球全失败 → 端口本身不可达 (非大陆方向问题), 不误报被墙, 交给 NW9
+        _pe_lvl=WARN; _pe_code=CN_TCPING_PORT_UNREACHABLE
+        _pe_title="${_pe_tgt} 端口本身不可达: 全球 ${_pe_t} 个探测点全部失败"
+        _pe_detail="全球 (含海外) 全断不是被墙的特征 → 先看 NW9 NODE_PORT_NOT_LISTENING / 云安全组 / 本机防火墙"
+    elif [ "$_pe_cnok" -eq 0 ]; then
+        _pe_lvl=FAIL; _pe_code=NODE_PORT_CN_BLOCKED
+        _pe_title="NODE_PORT=${_NODE_PORT} 疑似被墙: 三网+云厂全断 (大陆 ${_pe_cnfail}/${_pe_cnt}), 海外 ${_pe_ok}/${_pe_ost} 正常"
+        _pe_detail="本机监听/证书/海外访问全正常, 唯独大陆不通 = 典型 IP/端口被墙特征。处置: ① https://tcp.ping.pe/${_pe_tgt} 多时段人工复核 ② 换端口 (重跑 proxyInstall.sh) ③ 套 CDN/中转 ④ 联系机房换 IP"
+    elif [ "$_pe_cnfail" -gt 0 ]; then
+        _pe_lvl=WARN; _pe_code=NODE_PORT_CN_PARTIAL
+        # 全断网名单 (_pe_dead_main, 空格分隔) → 斜杠串用于标题
+        _pe_dead=$(printf '%s' "$_pe_dead_main" | tr ' ' '/')
+        if [ -n "$_pe_dead" ]; then
+            _pe_title="NODE_PORT=${_NODE_PORT} 部分被墙: ${_pe_dead} 全断, 其余网可达 (大陆 ${_pe_cnok}/${_pe_cnt} 通, 平均 ${_pe_avg}ms)"
+            _pe_detail="疑似【单网被墙/干扰】(仅 ${_pe_dead} 断, 其余网正常): 受影响用户换接入网/套 CDN 可绕, 无需整机换 IP; 持续恶化会演变为三网全断 (NODE_PORT_CN_BLOCKED)"
+        else
+            _pe_title="NODE_PORT=${_NODE_PORT} 部分线路抖动: 各网均有通有断 (大陆 ${_pe_cnok}/${_pe_cnt} 通, 平均 ${_pe_avg}ms)"
+            _pe_detail="无整网全断, 多为部分探测点/线路抖动丢包而非封锁; 用户单线路不通可复测确认"
+        fi
+    else
+        _pe_lvl=PASS; _pe_code=NODE_PORT_CN_OK
+        _pe_title="NODE_PORT=${_NODE_PORT} 未被墙: 三网+云厂全通 (大陆 ${_pe_cnt}/${_pe_cnt}, 平均 ${_pe_avg}ms)"
+        _pe_detail="大陆方向未被墙; 海外为对照 (海外正常 + 大陆全断 = 被墙特征)"
+    fi
+
+    # 输出: 逐网明细表 (文本模式; PASS 且 --quiet 时随结论一并静默) + 结论行
+    if [ "$JSON_OUTPUT" != 1 ]; then
+        if [ "$QUIET" != 1 ] || [ "$_pe_lvl" != PASS ]; then
+            printf '%b    ┌─ NODE_PORT=%s 分网 tcping 阻断明细 (状态 成功/总数)%b\n' "$_C_DIM" "$_NODE_PORT" "$_C_RESET"
+            printf '%b' "$_pe_tbl"
+            printf '%b    └─ 海外为对照: 海外通 + 大陆断 = 被墙特征%b\n' "$_C_DIM" "$_C_RESET"
+        fi
+    fi
+    [ -n "$_pe_car_s" ] && _pe_title="${_pe_title} [${_pe_car_s}]"
+    result "$_pe_lvl" "$_pe_code" "$_pe_title" "$_pe_detail"
+
+    # 6) 交叉验证 — 随机开临时新端口再测一轮, 区分【端口被墙】vs【IP 整段被墙】
+    #    仅在主测判出封锁时执行: BLOCKED, 或 PARTIAL 且有整网全断 (_pe_dead_main 非空)。
+    #    临时端口可能被本机防火墙/云安全组拦截 (默认只放行业务端口) → 全球全断时判
+    #    "无法判定"绝不误报 IP 被墙; 大陆断+海外通 才是封锁特征 (与主测同款海外对照)。
+    [ "${NODE_CN_TCPING_XCHECK:-1}" = "0" ] && return 0
+    # 远程目标 (第三方服务器上测别的节点): 临时监听会开在【运行机】而非目标机, 测了也是
+    # 目标机的未开端口 → 无意义, 跳过; 需完整交叉验证用 --host 在节点本机跑
+    if [ "$_pe_islocal" != 1 ]; then
+        if [ "$JSON_OUTPUT" != 1 ]; then
+            printf '%b    └ 远程目标模式: 跳过随机端口交叉验证 (临时监听需开在目标机; 完整验证用 --host %s 在节点上跑)%b\n' \
+                "$_C_DIM" "${NODE_TARGET_IP:-$_pe_host}" "$_C_RESET"
+        fi
+        return 0
+    fi
+    case "$_pe_code" in
+        NODE_PORT_CN_BLOCKED) ;;
+        NODE_PORT_CN_PARTIAL) [ -n "$_pe_dead_main" ] || return 0 ;;
+        *) return 0 ;;
+    esac
+
+    # 选随机临时端口 (20000-60000): 避开 NODE_PORT 与当前已监听端口
+    _xc_port=$(( ($(date +%s) % 40000) + 20000 ))
+    _xc_try=0
+    while [ "$_xc_try" -lt 20 ]; do
+        if [ "$_xc_port" != "$_NODE_PORT" ] \
+           && ! ss -H -tln 2>/dev/null | grep -qE "[:.]${_xc_port}([^0-9]|$)"; then
+            break
+        fi
+        _xc_port=$((_xc_port + 1)); [ "$_xc_port" -gt 60000 ] && _xc_port=20000
+        _xc_try=$((_xc_try + 1))
+    done
+
+    # 起临时监听: python3 优先 (节点标配, probeTask.sh 同依赖), socat 退路; timeout 240s 兜底自灭
+    _xc_pid=""
+    if has python3; then
+        timeout 240 python3 -c "
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', ${_xc_port}))
+s.listen(16)
+while True:
+    c, _ = s.accept()
+    c.close()
+" >/dev/null 2>&1 &
+        _xc_pid=$!
+    elif has socat; then
+        timeout 240 socat TCP-LISTEN:${_xc_port},reuseaddr,fork OPEN:/dev/null >/dev/null 2>&1 &
+        _xc_pid=$!
+    else
+        result WARN "CN_XCHECK_NO_LISTENER" "无 python3/socat, 无法开临时端口, 跳过端口级/IP级交叉验证" \
+            "人工验证: 临时开一端口 (python3 -m http.server 20086) 后 https://tcp.ping.pe/<IP>:20086 看大陆可达性"
+        return 0
+    fi
+
+    # 等监听就绪 (最多 ~2s); 未起来则收尾跳过
+    _xc_up=0; _xc_w=0
+    while [ "$_xc_w" -lt 5 ]; do
+        if ss -H -tln 2>/dev/null | grep -qE "[:.]${_xc_port}([^0-9]|$)"; then _xc_up=1; break; fi
+        sleep 0.4; _xc_w=$((_xc_w + 1))
+    done
+    if [ "$_xc_up" != 1 ]; then
+        kill "$_xc_pid" 2>/dev/null; wait "$_xc_pid" 2>/dev/null
+        result WARN "CN_XCHECK_LISTEN_FAIL" "临时端口 ${_xc_port} 监听启动失败, 跳过交叉验证" \
+            "可能端口被占/权限不足; 重跑或人工验证"
+        return 0
+    fi
+
+    # 第二轮探测 (与主测同流程, 间隔 4s 避免限流); 探完先收监听再判定
+    sleep 4
+    case "$_pe_host" in
+        *:*) _xc_tgt="[${_pe_host}]:${_xc_port}" ;;
+        *)   _xc_tgt="${_pe_host}:${_xc_port}" ;;
+    esac
+    _pe_probe "$_xc_tgt" "验证新端口"
+    _xc_rc=$?
+    kill "$_xc_pid" 2>/dev/null; wait "$_xc_pid" 2>/dev/null
+    [ "$_xc_rc" = 0 ] || return 0    # 探测服务异常已 WARN, 跳过判定
+
+    _pe_render "$_peR_car"
+    _xc_dead_new=$(_pe_dead_nets "$_pe_car_s")
+    _xc_sum="交叉验证新端口 ${_xc_port} 分网: [${_pe_car_s:-无数据}]"
+
+    # 无有效数据 / 新端口全球全断 → 无法判定 (防火墙/安全组拦临时端口, 不误报)
+    if [ "$_peR_t" -eq 0 ] || [ $((_peR_cnok + _peR_cnfail)) -eq 0 ] \
+       || { [ "$_peR_ok" -eq 0 ] && [ "$_peR_fail" -gt 0 ]; }; then
+        _xc_lvl=WARN; _xc_code=CN_XCHECK_INCONCLUSIVE
+        _xc_title="交叉验证无法判定: 新端口 ${_xc_port} 全球 ${_peR_fail}/${_peR_t} 全部失败 → 疑似本机防火墙/云安全组未放行临时端口"
+        _xc_detail="云安全组默认只放行业务端口, 临时端口全球不通属预期, 不能据此判 IP 被墙。想精确验证: 控制台临时放行 ${_xc_port}/tcp 后重跑, 或人工 https://tcp.ping.pe/${_xc_tgt} 复核"
+    else
+        # 逐网对照: 主测全断的网 (_pe_dead_main) 在新端口的表现 → 恢复 / 仍断
+        _xc_still=""; _xc_rec=""
+        for _n in $_pe_dead_main; do
+            case " $_xc_dead_new " in
+                *" $_n "*) _xc_still="${_xc_still:+${_xc_still} }$_n" ;;
+                *)         _xc_rec="${_xc_rec:+${_xc_rec} }$_n" ;;
+            esac
+        done
+        if [ -n "$_xc_rec" ] && [ -z "$_xc_still" ]; then
+            _xc_lvl=PASS; _xc_code=NODE_PORT_CN_XCHECK_PORT
+            _xc_title="交叉验证: 属【端口级被墙】— 新端口 ${_xc_port} 大陆可达 (原全断的 ${_xc_rec} 均恢复) → 仅 NODE_PORT=${_NODE_PORT} 被封, IP 未整段被墙"
+            _xc_detail="换端口即可恢复: 面板改配/重跑 proxyInstall.sh 换 node_port, 无需换 IP。${_xc_sum}"
+        elif [ -n "$_xc_still" ] && [ -z "$_xc_rec" ]; then
+            if [ "$_peR_cnok" -eq 0 ]; then
+                _xc_lvl=FAIL; _xc_code=NODE_PORT_CN_IP_BLOCKED
+                _xc_title="交叉验证: 属【IP 级被墙】— 新端口 ${_xc_port} 大陆亦全断 (${_xc_still}), 而海外 ${_peR_ok}/${_peR_fail} 正常 → 整个 IP 的大陆方向被封"
+                _xc_detail="换端口无效。处置: ① 套 CDN/中转 ② 联系机房换 IP ③ 多时段人工复核 https://tcp.ping.pe/${_xc_tgt}。${_xc_sum}"
+            else
+                _xc_lvl=WARN; _xc_code=NODE_PORT_CN_XCHECK_IP
+                _xc_title="交叉验证: ${_xc_still} 对新旧端口均全断 → 该网封锁针对整个 IP (网级), 其余网正常"
+                _xc_detail="受影响网用户需 CDN/中转或换 IP; 其余网不受影响。${_xc_sum}"
+            fi
+        elif [ -n "$_xc_still" ]; then
+            _xc_lvl=WARN; _xc_code=NODE_PORT_CN_XCHECK_MIXED
+            _xc_title="交叉验证: 混合封锁 — ${_xc_still} 新端口仍全断 (IP级/网级), ${_xc_rec} 新端口恢复 (端口级)"
+            _xc_detail="部分网仅封原端口 (换端口可救), 部分网封整个 IP (需 CDN/中转或换 IP)。${_xc_sum}"
+        else
+            _xc_lvl=WARN; _xc_code=CN_XCHECK_INCONCLUSIVE
+            _xc_title="交叉验证结果异常 (主测全断网在新端口无对照数据), 无法判定端口级/IP级"
+            _xc_detail="人工在 https://tcp.ping.pe/${_xc_tgt} 复核"
+        fi
+    fi
+
+    # 新端口明细表 (文本模式; PASS 且 --quiet 时随结论静默) + 结论行
+    if [ "$JSON_OUTPUT" != 1 ]; then
+        if [ "$QUIET" != 1 ] || [ "$_xc_lvl" != PASS ]; then
+            printf '%b    ┌─ 交叉验证: 随机新端口 %s 分网 tcping 明细 (状态 成功/总数)%b\n' "$_C_DIM" "$_xc_port" "$_C_RESET"
+            printf '%b' "$_pe_tbl"
+            printf '%b    └─ 对照上表: 新端口通 → 端口级封锁 (换端口可救); 新端口大陆也断 → IP 级封锁%b\n' "$_C_DIM" "$_C_RESET"
+        fi
+    fi
+    result "$_xc_lvl" "$_xc_code" "$_xc_title" "$_xc_detail"
 }
 
 # ============================================================
