@@ -1,7 +1,10 @@
 #!/bin/sh
 # ============================================================
 # nodeAgent.sh — V2 瘦节点状态上报脚本
-# 职责: 采集网卡原始 rx/tx 字节数 + 服务器运行时间 + vnstat 7日流量历史，上报至面板
+# 职责: 采集网卡原始 rx/tx 字节数 + 服务器运行时间 + vnstat 7日流量历史，上报至面板;
+#       每日检测 node_port 是否被墙 (借 proxyDiagnose.sh 大陆 tcping),
+#       在【IP 未被墙 + 端口三网全屏蔽】时自动换随机端口重装 (快速复活节点),
+#       并 Telegram 通知被墙情况与处置结果 (详见 DailyPortBlockCheck)
 # 约束: 严禁在节点端进行流量计算、单位换算或清零操作
 # ============================================================
 
@@ -585,6 +588,283 @@ SyncSSL() {
 }
 
 # ============================================================
+# 端口被墙检测 + 快速换端口自愈 — 每日一次
+#
+# 背景: 检测到部分节点【IP 未被墙、仅端口被墙】(大陆三网对 node_port 的 TCP 握手
+#   全部超时), 此时本机监听/证书/海外访问全部正常, 唯独用户侧连不上 ——
+#   通过更换端口即可快速复活节点, 无需换 IP / 套 CDN。
+#
+# 流程 (复用 proxyDiagnose.sh NW10 大陆 tcping 被墙检测, 不重复造轮子):
+#   1. 每日 (默认 05 点后的首个周期) 从 ${NODEHUB_URL} 下载 proxyDiagnose.sh,
+#      以 --target net --json --no-notify 运行 (含主测 + 随机端口交叉验证, 约 1-3 分钟);
+#   2. 解析结果码, 仅在【同时满足】以下两个条件时才自动重装换端口 (must):
+#        · NODE_PORT_CN_BLOCKED      — 端口三网+云厂全断 且 海外正常 (端口被墙)
+#        · NODE_PORT_CN_XCHECK_PORT  — 交叉验证: 随机新端口大陆可达 → IP 未被墙
+#      任一不满足 (IP 级被墙 / 交叉验证无定论 / 单网部分被墙) → 只通知不重装;
+#   3. 重装: 重新下载并执行 proxyInstall.sh, 以环境变量 NODE_PORT=<随机端口>
+#      覆盖旧端口 (安装脚本四层优先级中环境变量层最高, 面板注册时会同步新端口);
+#      随机端口取 20000-60000, 避开历史已用端口 (nodeAgent.portswap.log) /
+#      当前端口 / hy2 port-hop 区间 30000-32000 / 已监听端口 (must: 新端口从未被占用过);
+#   4. 无论是否重装, 均 Telegram 通知: 端口被墙情况 + 是否已自动重装 (must)。
+#
+# 开关 / 调参 (~/.env):
+#   NODE_PORT_BLOCK_CHECK=0       关闭整个检测 (默认开)
+#   NODE_PORT_CHECK_HOUR=5       每日最早执行小时 0-23 (错过窗口的当日可补跑)
+#   NODE_PORT_SWAP_COOLDOWN=72000  换端口冷却秒数 (默认 20h, 防频繁重装)
+#   NODE_CN_TCPING=0             (proxyDiagnose 侧) 关闭大陆 tcping → 本检测随之失效
+#
+# 状态: ~/nodeAgent.portcheck.state (date/attempts/done/last_swap)
+#   · 当日 attempts 上限 3 — 探测服务 (tcp.ping.pe) 异常致无定论时下个小时重试,
+#     最多 3 次避免空转; 得出定论 (未墙/已处置) 后当日不再跑
+# 历史: ~/nodeAgent.portswap.log (每次换端口一行: 时间 旧端口→新端口 重装结果)
+# ============================================================
+
+# ---- 端口检测状态读写 (~/nodeAgent.portcheck.state, key=value 行) ----
+_PortCheckStateGet() {  # <key> → 输出值 (空 = 未设置); 文件不存在输出空, 恒返回 0
+    grep -E "^$1=" ~/nodeAgent.portcheck.state 2>/dev/null | tail -1 | sed "s/^$1=//"
+    return 0
+}
+
+_PortCheckStateSet() {  # <key> <value> — 原子替换 (先写临时文件再 mv)
+    _pcs_k="$1"; _pcs_v="$2"
+    _pcs_f=~/nodeAgent.portcheck.state
+    _pcs_t="${_pcs_f}.tmp.$$"
+    grep -v "^${_pcs_k}=" "$_pcs_f" 2>/dev/null > "$_pcs_t" || true
+    printf '%s=%s\n' "$_pcs_k" "$_pcs_v" >> "$_pcs_t"
+    mv -f "$_pcs_t" "$_pcs_f" 2>/dev/null || true
+    return 0
+}
+
+# ---- 当前 node_port 读取 (~/node.json > ~/node.env > 443; 与 proxyDiagnose 同源) ----
+_PbcReadNodePort() {
+    _p=""
+    if [ -f ~/node.json ] && command -v jq >/dev/null 2>&1; then
+        _p=$(jq -r '.node_port // empty' ~/node.json 2>/dev/null) || true
+    fi
+    if [ -z "$_p" ] && [ -f ~/node.env ]; then
+        _p=$(grep -E '^node_port=' ~/node.env 2>/dev/null | tail -1 | sed 's/^node_port="//;s/"$//')
+    fi
+    case "$_p" in ''|*[!0-9]*) _p=443 ;; esac
+    echo "$_p"
+}
+
+# ---- 随机端口选择: 20000-60000, 避开历史已用端口 / 当前端口 / 30000-32000 (hy2 port-hop) / 已监听端口 ----
+#   历史已用端口 (~/nodeAgent.portswap.log 出现过的全部端口) 永久拉黑: 换下来的端口
+#   大概率已被墙, 再次抽中会让节点上线即失联 (must: 新端口从未被占用过);
+#   日志行中 5 位纯数字即历史端口 (日期/时间/重装结果均不足 5 位, 不会误取)
+#   srand 种子 = 时间 + PID*7 + 迭代号: 同秒内多次重选也不会退化为同一候选值
+_PbcRandomPort() {  # $1 = 当前端口; 成功 echo 随机端口, 失败 return 1
+    _avoid="${1:-}"
+    _hist=$(grep -oE '[0-9]{5}' ~/nodeAgent.portswap.log 2>/dev/null | sort -u | tr '\n' ' ') || true
+    _i=0; _cand=""
+    while [ "$_i" -lt 30 ]; do
+        _cand=$(awk -v s="$(( $(date +%s) + $$ * 7 + _i ))" \
+            'BEGIN{srand(s); printf "%d", int(20000 + rand() * 40001)}')
+        case "$_cand" in ''|*[!0-9]*) _i=$((_i + 1)); continue ;; esac
+        _skip=0
+        for _u in $_avoid $_hist; do
+            if [ "$_cand" = "$_u" ]; then _skip=1; break; fi
+        done
+        if [ "$_skip" = "1" ]; then _i=$((_i + 1)); continue; fi
+        if [ "$_cand" -ge 30000 ] && [ "$_cand" -le 32000 ]; then
+            _i=$((_i + 1)); continue
+        fi
+        if command -v ss >/dev/null 2>&1 \
+           && ss -H -tuln 2>/dev/null | grep -qE "[:.]${_cand}([^0-9]|$)"; then
+            _i=$((_i + 1)); continue
+        fi
+        echo "$_cand"
+        return 0
+    done
+    return 1
+}
+
+# ---- 端口被墙 TG 通知 (专用节流桶 portcheck, 不与 log 等级混用) ----
+_PbcNotify() {  # <正文>
+    NotifyTG "portcheck" "🚨 [NodeHub] ${_SCRIPT_NAME} — 端口被墙检测与自动处置
+节点ID: ${node_id:-${NODE_ID:-N/A}}
+IP: $(_TgNodeIp)
+时间: $(date '+%Y-%m-%d %H:%M:%S')
+$1"
+}
+
+DailyPortBlockCheck() {
+    # 总开关
+    [ "${NODE_PORT_BLOCK_CHECK:-1}" = "0" ] && return 0
+
+    # 每日窗口: 默认 05 点后的首个周期执行 (错过窗口的宕机机当日可补跑)
+    _pbc_hour=$(date '+%H' | sed 's/^0//'); [ -z "$_pbc_hour" ] && _pbc_hour=0
+    _pbc_min_h=$(printf '%s' "${NODE_PORT_CHECK_HOUR:-5}" | sed 's/^0*//')
+    case "$_pbc_min_h" in ''|*[!0-9]*) _pbc_min_h=5 ;; esac
+    if [ "$_pbc_hour" -lt "$_pbc_min_h" ]; then return 0; fi
+
+    # 前置依赖: NODEHUB_URL (下载诊断/安装脚本) + jq (解析 JSON) + 已安装节点
+    if [ -z "${NODEHUB_URL:-}" ]; then
+        log debug "端口被墙检测: NODEHUB_URL 未设置, 跳过"
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        log warn "端口被墙检测: jq 不可用, 跳过"
+        return 0
+    fi
+    if ! command -v wget >/dev/null 2>&1; then
+        log warn "端口被墙检测: wget 不可用, 跳过"
+        return 0
+    fi
+    if [ ! -f ~/node.json ]; then
+        log debug "端口被墙检测: ~/node.json 不存在 (节点未安装?), 跳过"
+        return 0
+    fi
+
+    # 当日调度: done=1 → 已有定论; attempts ≥ 3 → 当日不再试 (探测服务异常止损)
+    _pbc_today=$(date '+%Y%m%d')
+    _pbc_sdate=$(_PortCheckStateGet date)
+    _pbc_satt=$(_PortCheckStateGet attempts)
+    if [ "$_pbc_sdate" != "$_pbc_today" ]; then
+        _pbc_sdate="$_pbc_today"; _pbc_satt=1
+        _PortCheckStateSet date "$_pbc_sdate"
+        _PortCheckStateSet attempts 1
+        _PortCheckStateSet done 0   # 新一天首跑: 清除昨日 done=1, 否则今日无定论时的重试会被昨日残留标记吞掉
+    else
+        case "$_pbc_satt" in ''|*[!0-9]*) _pbc_satt=0 ;; esac
+        if [ "$(_PortCheckStateGet "done")" = "1" ] || [ "$_pbc_satt" -ge 3 ]; then
+            return 0
+        fi
+        _pbc_satt=$((_pbc_satt + 1))
+        _PortCheckStateSet attempts "$_pbc_satt"
+    fi
+
+    # 下载诊断脚本 (与 SelfUpdate 同源; --no-notify 抑制其自带 TG, 由本函数统一通知)
+    if ! ( cd /tmp && wget -N -T 30 -t 1 "${NODEHUB_URL}/proxyDiagnose.sh" 2>/dev/null ); then
+        log warn "端口被墙检测: 下载 proxyDiagnose.sh 失败 — ${NODEHUB_URL}/proxyDiagnose.sh (下个周期重试)"
+        return 0
+    fi
+    if [ ! -s /tmp/proxyDiagnose.sh ] || ! head -c 2 /tmp/proxyDiagnose.sh 2>/dev/null | grep -q '#!'; then
+        log warn "端口被墙检测: proxyDiagnose.sh 校验失败 (空文件或非脚本), 跳过"
+        return 0
+    fi
+
+    # 运行 net 诊断 (含 NW10 主测 + 随机端口交叉验证; stderr 留给 ~/nodeLogs 排障)
+    log info "端口被墙检测: 运行 proxyDiagnose --target net (今日第 ${_pbc_satt} 次, 需 1-3 分钟)"
+    _pbc_json=""
+    if command -v timeout >/dev/null 2>&1; then
+        _pbc_json=$(timeout 600 sh /tmp/proxyDiagnose.sh --target net --json --quiet --no-notify) || true
+    else
+        _pbc_json=$(sh /tmp/proxyDiagnose.sh --target net --json --quiet --no-notify) || true
+    fi
+    if [ -z "$_pbc_json" ] || ! printf '%s' "$_pbc_json" | jq -e '.results' >/dev/null 2>&1; then
+        log warn "端口被墙检测: 诊断无有效 JSON 输出 (tcp.ping.pe 异常?), 下个周期重试"
+        return 0
+    fi
+
+    # 解析结果码 (语义见 proxyDiagnose.sh _check_node_port_cn_tcping):
+    #   NODE_PORT_CN_BLOCKED     FAIL  三网+云厂全断, 海外正常 (端口或 IP 被墙)
+    #   NODE_PORT_CN_XCHECK_PORT PASS  交叉验证新端口大陆可达 → 端口级封锁, IP 未被墙 ★重装前提
+    #   NODE_PORT_CN_IP_BLOCKED  FAIL  交叉验证新端口大陆亦全断 → IP 级被墙, 换端口无效
+    _pbc_codes=$(printf '%s' "$_pbc_json" | jq -r '.results[]?.code' 2>/dev/null) || true
+    _pbc_blocked=0; _pbc_xcport=0; _pbc_xcip=0
+    for _c in $_pbc_codes; do
+        case "$_c" in
+            NODE_PORT_CN_BLOCKED)     _pbc_blocked=1 ;;
+            NODE_PORT_CN_XCHECK_PORT) _pbc_xcport=1 ;;
+            NODE_PORT_CN_IP_BLOCKED)  _pbc_xcip=1 ;;
+        esac
+    done
+
+    # 未检出三网全断 (含未被墙/单网部分被墙/纯 UDP 端口跳过) → 定论, 当日收工
+    if [ "$_pbc_blocked" = "0" ]; then
+        log debug "端口被墙检测: NODE_PORT 未被三网全断 (未检出封锁), 明日复测"
+        _PortCheckStateSet "done" 1
+        return 0
+    fi
+
+    _pbc_cur_port=$(_PbcReadNodePort)
+    _pbc_blk_title=$(printf '%s' "$_pbc_json" | jq -r '.results[]? | select(.code=="NODE_PORT_CN_BLOCKED") | .title' 2>/dev/null | head -1)
+    _pbc_xc_title=$(printf '%s' "$_pbc_json" | jq -r '.results[]? | select(.code=="NODE_PORT_CN_XCHECK_PORT") | .title' 2>/dev/null | head -1)
+
+    # ---- 检出三网+云厂全断, 按交叉验证结论分流 ----
+
+    # 情形 A: IP 级被墙 — 换端口救不了, 只通知不重装 (must: 仅 IP 未被墙才重装)
+    if [ "$_pbc_xcip" = "1" ]; then
+        _PortCheckStateSet "done" 1
+        log info "端口被墙检测: NODE_PORT=${_pbc_cur_port} 三网全断且交叉验证判定【IP 级被墙】— 换端口无效, 不重装"
+        _PbcNotify "■ 被墙情况: NODE_PORT=${_pbc_cur_port} 三网+云厂全断, 海外正常
+  ${_pbc_blk_title}
+■ 交叉验证: 随机新端口大陆亦全断 → IP 级被墙
+■ 处置: 未自动重装 (换端口无效)
+■ 建议: 套 CDN / 中转 / 联系机房换 IP; 人工复核 https://tcp.ping.pe/$(_TgNodeIp):${_pbc_cur_port}"
+        return 0
+    fi
+
+    # 情形 B: 未能确认端口级封锁 (交叉验证无定论/混合/被跳过) — 不满足重装前提, 稍后重试
+    if [ "$_pbc_xcport" != "1" ]; then
+        log info "端口被墙检测: NODE_PORT=${_pbc_cur_port} 三网全断, 但交叉验证未确认端口级封锁 — 暂不重装, 稍后重试"
+        _PbcNotify "■ 被墙情况: NODE_PORT=${_pbc_cur_port} 三网+云厂全断, 海外正常
+  ${_pbc_blk_title}
+■ 交叉验证: 未能确认端口级封锁 (探测点不足 / 临时端口被安全组拦 / 混合封锁 / NODE_CN_TCPING_XCHECK=0)
+■ 处置: 未自动重装 (不满足「IP 未被墙 + 端口级封锁」前提), 将自动重试 (当日最多 3 次)
+■ 建议: 人工复核 https://tcp.ping.pe/$(_TgNodeIp):${_pbc_cur_port}"
+        return 0
+    fi
+
+    # 情形 C: IP 未被墙 + 端口三网全屏蔽 (交叉验证新端口大陆可达) → 随机端口重装
+    # 冷却: 距上次换端口 < NODE_PORT_SWAP_COOLDOWN 秒 → 只通知不重装 (防频繁重装)
+    _pbc_cool=$(printf '%s' "${NODE_PORT_SWAP_COOLDOWN:-72000}" | sed 's/^0*//')
+    case "$_pbc_cool" in ''|*[!0-9]*) _pbc_cool=72000 ;; esac
+    _pbc_lswap=$(_PortCheckStateGet last_swap)
+    case "$_pbc_lswap" in ''|*[!0-9]*) _pbc_lswap=0 ;; esac
+    _pbc_since=$(( $(date +%s) - _pbc_lswap ))
+    if [ "$_pbc_since" -lt "$_pbc_cool" ]; then
+        _PortCheckStateSet "done" 1
+        log info "端口被墙检测: 端口级封锁确认, 但距上次换端口仅 $((_pbc_since / 3600))h (冷却期) — 跳过重装"
+        _PbcNotify "■ 被墙情况: NODE_PORT=${_pbc_cur_port} 三网+云厂全断, 海外正常
+  ${_pbc_blk_title}
+■ 交叉验证: ${_pbc_xc_title}
+■ 处置: 未自动重装 — 距上次换端口仅 $((_pbc_since / 3600))h, 处于冷却期 (NODE_PORT_SWAP_COOLDOWN=${_pbc_cool}s), 避免频繁重装
+■ 建议: 冷却期满后自动处置, 或人工重跑安装脚本换端口"
+        return 0
+    fi
+
+    _pbc_new_port=$(_PbcRandomPort "$_pbc_cur_port") || {
+        log error "端口被墙检测: 随机端口选择失败 (30 次均冲突?), 放弃本次重装"
+        return 0
+    }
+
+    log info "端口被墙自愈: IP 未被墙 + NODE_PORT=${_pbc_cur_port} 三网全屏蔽 → 换随机端口 ${_pbc_new_port} 重装 proxyInstall.sh"
+    _PortCheckStateSet "done" 1
+    _PortCheckStateSet last_swap "$(date +%s)"
+
+    # 重装: NODE_PORT 环境变量在 proxyInstall.sh 四层优先级中最高 → 覆盖旧端口;
+    # 安装脚本注册时会将新端口上报面板并持久化到 ~/node.json / ~/node.env
+    _pbc_ok=0
+    if ( cd /tmp && wget -N -T 60 -t 3 "${NODEHUB_URL}/proxyInstall.sh" 2>/dev/null \
+         && [ -s proxyInstall.sh ] \
+         && NODE_PORT="$_pbc_new_port" sh proxyInstall.sh ); then
+        _pbc_ok=1
+    fi
+
+    # 重装后实际端口 (面板回传值优先; 与请求的随机端口不一致时以实际为准)
+    _pbc_final_port=$(_PbcReadNodePort)
+    printf '%s 换端口 %s -> %s (请求随机 %s) 重装=%s\n' \
+        "$(date '+%F %T')" "$_pbc_cur_port" "$_pbc_final_port" "$_pbc_new_port" "$_pbc_ok" \
+        >> ~/nodeAgent.portswap.log 2>/dev/null || true
+
+    if [ "$_pbc_ok" = "1" ]; then
+        log info "端口被墙自愈: 重装完成, 端口 ${_pbc_cur_port} → ${_pbc_final_port}; 次日复测新端口"
+    else
+        log error "端口被墙自愈: proxyInstall.sh 重装失败 — 请查看 ~/nodeLogs 排障"
+    fi
+
+    _PbcNotify "■ 被墙情况: NODE_PORT=${_pbc_cur_port} 三网+云厂全断 (大陆探测点全超时), 海外正常
+  ${_pbc_blk_title}
+■ 交叉验证: 随机新端口大陆可达 → IP 未被墙, 端口级封锁
+  ${_pbc_xc_title}
+■ 处置: 已自动重装 proxyInstall.sh, 端口 ${_pbc_cur_port} → ${_pbc_final_port} (随机)
+■ 重装结果: $([ "$_pbc_ok" = 1 ] && echo '✅ 成功 (新端口已生效并同步面板)' || echo '❌ 失败 (请查看 ~/nodeLogs 排障, 必要时人工重跑安装脚本)')"
+    return 0
+}
+
+# ============================================================
 # 一次性补丁 (2026-07-09): ayjx.top 域名失效, 检测后重装
 # 约束: 仅在 2026-07-09 当天运行, 且仅运行一次
 # ============================================================
@@ -790,6 +1070,7 @@ Main() {
     SubmitStatus
     SelfUpdate
     SyncSSL
+    DailyPortBlockCheck
     RunPatches
     trap - EXIT   # 成功完成, 清除错误捕获, 避免误触发 NotifyTG
 }

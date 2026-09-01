@@ -50,6 +50,8 @@
 #   ./proxyDiagnose.sh --target outbound    # 只查出站连通性 (IPv4/IPv6 web + domainStrategy)
 #   ./proxyDiagnose.sh --target traffic     # 只查本周期流量 (vnstat tx, 自上一个 NODE_TRAFFIC_RESETDAY)
 #   ./proxyDiagnose.sh --json               # 输出 JSON (供程序解析)
+#   ./proxyDiagnose.sh --no-notify           # 抑制 Telegram 推送 (供 nodeAgent 程序化调度,
+#                                            #   由调用方自行组织通知, 避免双重告警)
 #   ./proxyDiagnose.sh --quiet              # 只输出 FAIL/WARN, 不输出 PASS
 #   ./proxyDiagnose.sh --no-color           # 关闭颜色
 #   ./proxyDiagnose.sh --host root@1.2.3.4  # 远程诊断 (ssh 执行, 本地无需登录)
@@ -94,11 +96,13 @@ JSON_OUTPUT=0
 QUIET=0
 USE_COLOR=1
 REMOTE_HOST=""
+NO_NOTIFY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --target) TARGET="$2"; shift 2 ;;
         --json)   JSON_OUTPUT=1; USE_COLOR=0; shift ;;
+        --no-notify) NO_NOTIFY=1; shift ;;
         --quiet)  QUIET=1; shift ;;
         --no-color) USE_COLOR=0; shift ;;
         --host)   REMOTE_HOST="$2"; shift 2 ;;
@@ -126,11 +130,12 @@ if [ -n "$REMOTE_HOST" ]; then
     # 通过 ssh 执行自身 (stdin 传入脚本内容, 远程用 sh 跑; 剥离 --host 避免递归)
     # 远程为非 TTY, 颜色由 [ -t 1 ] 自动关闭, 无需转发 --no-color
     # TARGET 虽已经入口白名单校验, 仍以单引号包裹传递 (纵深防御, 保证只作为单个 argv)。
+    # --no-notify 必须转发: 否则远端仍会推送 TG, 与调用方自行组织的通知双重告警
     # StrictHostKeyChecking=accept-new (OpenSSH>=7.6): 首次连接记录主机密钥、之后
     #   指纹变化即拒绝 — 比 =no 抗 DNS 劫持/中间人; 本脚本以登录身份在远端执行,
     #   信道可信度重要。老版 OpenSSH 不识别 accept-new 时可 DIAG_SSH_STRICT=no 回退。
     ssh -o "StrictHostKeyChecking=${DIAG_SSH_STRICT:-accept-new}" -o ConnectTimeout=10 "$REMOTE_HOST" \
-        "sh -s -- --target '$TARGET' $( [ "$JSON_OUTPUT" = 1 ] && echo --json ) $( [ "$QUIET" = 1 ] && echo --quiet )" \
+        "sh -s -- --target '$TARGET' $( [ "$JSON_OUTPUT" = 1 ] && echo --json ) $( [ "$QUIET" = 1 ] && echo --quiet ) $( [ "$NO_NOTIFY" = 1 ] && echo --no-notify )" \
         < "$0"
     exit $?
 fi
@@ -188,8 +193,11 @@ say() {  # say <header text>
 
 # ============================================================
 # Telegram 通知 — 复用 nodeAgent.sh 的节流推送 (仅 FAIL 时推送)
+#   --no-notify 时全部抑制: 供 nodeAgent 等程序化调度使用,
+#   由调用方按自身语义组织通知 (避免一次事件双重告警刷屏)
 # ============================================================
 _NotifyTG() {
+    [ "$NO_NOTIFY" = 1 ] && return 0
     [ "$_FAIL" = 0 ] && return 0   # 无失败不推送
     _token="${TELEGRAM_BOT_TOKEN:-${TG_BOT_TOKEN:-}}"
     _chat="${TELEGRAM_CHAT_ID:-${TG_CHAT_ID:-}}"
@@ -207,6 +215,7 @@ $(grep '^FAIL' "$_RESULTS_FILE" | head -8 | cut -f3 | sed 's/^/• /')"
 # 直接发送一条 Telegram (不依赖 _FAIL 计数, 供单项检查中途即时告警)
 # 用法: _TgSend <message>
 _TgSend() {
+    [ "$NO_NOTIFY" = 1 ] && return 0
     _token="${TELEGRAM_BOT_TOKEN:-${TG_BOT_TOKEN:-}}"
     _chat="${TELEGRAM_CHAT_ID:-${TG_CHAT_ID:-}}"
     { [ -z "$_token" ] || [ -z "$_chat" ]; } && return 0
