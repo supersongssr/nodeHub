@@ -24,9 +24,14 @@
 | `NODE_PORT_CN_IP_BLOCKED` | FAIL | 交叉验证: 新端口大陆亦全断 → IP 级被墙 |
 | `NODE_PORT_CN_XCHECK_IP / MIXED` | WARN | 网级 / 混合封锁 |
 | `CN_XCHECK_INCONCLUSIVE` | WARN | 无法判定 (临时端口被安全组拦等) |
+| `CN_XCHECK_SELFTEST_OK` | PASS | 自检: 原端口大陆全通时, 随机新端口亦大陆可达 → 「新端口被墙测试」逻辑可信 |
+| `CN_XCHECK_SELFTEST_CONFLICT` | WARN | 自检: 原端口大陆全通但随机新端口大陆断 → 结果自相矛盾 (高端口段被 IDC/中间设备拦截, 或测试代码有问题); 不参与处置 |
 
-交叉验证由 proxyDiagnose 自动完成: 检出封锁时本机随机开一个临时 TCP 端口
-再测一轮 —— 新端口大陆通 = 端口级; 新端口大陆也断 = IP 级。
+交叉验证由 proxyDiagnose 自动完成, 两种触发场景: ① 检出封锁时本机随机开一个临时
+TCP 端口再测一轮 —— 新端口大陆通 = 端口级; 新端口大陆也断 = IP 级; ② 原端口
+大陆全通 (`NODE_PORT_CN_OK`) 时也照测一轮自检 —— 随机新端口未被业务使用、
+理应同样可达, 测出矛盾 (`SELFTEST_CONFLICT`) 即提示测试逻辑存疑。自检结果码
+不影响本方案处置矩阵 (nodeAgent 只识别 BLOCKED / XCHECK_PORT / IP_BLOCKED)。
 
 ## 3. 处置矩阵 (must 约束)
 
@@ -73,6 +78,7 @@
 | `NODE_PORT_CHECK_HOUR` | 5 | 每日最早执行小时 (0-23) |
 | `NODE_PORT_SWAP_COOLDOWN` | 72000 | 换端口冷却秒数 |
 | `NODE_CN_TCPING` (proxyDiagnose 侧) | 1 | 0 = 关闭大陆 tcping → 本检测随之失效 |
+| `NODE_CN_TCPING_XCHECK` (proxyDiagnose 侧) | 1 | 0 = 关闭交叉验证 (封锁判定 + 全通自检均不再跑, 每日检测约省 1 分钟) |
 
 ## 7. 通知示例
 
