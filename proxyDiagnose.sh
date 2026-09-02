@@ -976,9 +976,15 @@ check_net() {
         _ct_pct=0
         [ "$_ct_max" -gt 0 ] && _ct_pct=$(( _ct_count * 100 / _ct_max ))
         if [ "$_ct_max" -lt 65536 ]; then
-            result FAIL "NET_CONNTRACK_TOO_SMALL" \
-                "nf_conntrack_max=${_ct_max} 过小 (<代理建议 65536), 当前占用 ${_ct_count} (${_ct_pct}%)" \
-                "代理多用户高并发下默认 8192 秒级打满 → 海量丢包 → 内存耗尽硬死锁 (本次 103.173.155.212 死机根因)。修复: /etc/sysctl.d/99-nodehub-proxy.conf 写 net.netfilter.nf_conntrack_max=262144 (proxyInstall.sh 的 TuneKernelForProxy 已自动处理)"
+            if [ "$_ct_pct" -ge 50 ]; then
+                result FAIL "NET_CONNTRACK_TOO_SMALL" \
+                    "nf_conntrack_max=${_ct_max} 过小 (<代理建议 65536), 当前占用已 ${_ct_pct}% (${_ct_count})" \
+                    "表小且占用过半, 多用户高并发下随时秒级打满 → 海量丢包 → 内存耗尽硬死锁 (本次 103.173.155.212 死机根因)。修复: /etc/sysctl.d/99-nodehub-proxy.conf 写 net.netfilter.nf_conntrack_max=262144 (proxyInstall.sh 的 TuneKernelForProxy 已自动处理)"
+            else
+                result WARN "NET_CONNTRACK_SMALL" \
+                    "nf_conntrack_max=${_ct_max} 低于代理建议 65536, 当前占用 ${_ct_count} (${_ct_pct}%) 尚低" \
+                    "暂无打满风险; 建议空闲时抬高到 262144 防患高并发 (proxyInstall.sh 的 TuneKernelForProxy 已自动处理)"
+            fi
         elif [ "$_ct_pct" -ge 85 ]; then
             result WARN "NET_CONNTRACK_HIGH" "conntrack 占用 ${_ct_pct}% (${_ct_count}/${_ct_max})" "逼近上限, 检查是否有异常连接暴增; 必要时再抬高 nf_conntrack_max"
         else
