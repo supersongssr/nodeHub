@@ -45,7 +45,8 @@
 #   ./proxyDiagnose.sh --target nginx       # 只查 nginx
 #   ./proxyDiagnose.sh --target env         # 只查安装环境 (磁盘/内存/DNS/依赖/锁)
 #   ./proxyDiagnose.sh --target net         # 只查网络与防火墙 (含 NODE_PORT 对外可达性 + 大陆 tcping 被墙检测,
-#                                            #   检出封锁时自动随机开临时端口交叉验证 端口级/IP级 被墙)
+#                                            #   自动随机开临时端口交叉验证: 检出封锁时区分 端口级/IP级 被墙;
+#                                            #   原端口大陆全通时也测新端口一轮, 自检"新端口被墙测试"逻辑可信度)
 #   ./proxyDiagnose.sh --target cert        # 只查 TLS 证书 (root_domain + nginx .conf 引用证书)
 #   ./proxyDiagnose.sh --target outbound    # 只查出站连通性 (IPv4/IPv6 web + domainStrategy)
 #   ./proxyDiagnose.sh --target traffic     # 只查本周期流量 (vnstat tx, 自上一个 NODE_TRAFFIC_RESETDAY)
@@ -1102,14 +1103,18 @@ _check_node_port_external() {
 #     · 大陆全部成功              → PASS NODE_PORT_CN_OK
 #   全球探测点全失败 → 不是大陆方向问题 (端口未开/安全组, 交给 NW9 判定), 不误报被墙。
 #
-# 交叉验证 (xcheck): 主测判出封锁 (三网全断, 或单网全挂) 时, 本机随机开一个临时 TCP
-#   端口 (20000-60000, python3 优先 / socat 退路, timeout 240s 兜底自灭) 再测一轮,
-#   区分【端口被墙】vs【IP 整段被墙】(处置完全不同):
+# 交叉验证 (xcheck): 本机随机开一个临时 TCP 端口 (20000-60000, python3 优先 /
+#   socat 退路, timeout 240s 兜底自灭) 再测一轮。两种触发场景:
+#   A. 主测判出封锁 (三网全断, 或单网全挂) — 区分【端口被墙】vs【IP 整段被墙】(处置完全不同):
 #     · 新端口大陆通 (原断网恢复)  → PASS NODE_PORT_CN_XCHECK_PORT  端口级: 换端口可救, IP 未整段封
 #     · 新端口大陆也全断、海外正常 → FAIL NODE_PORT_CN_IP_BLOCKED  IP 级: 换端口无效, 需 CDN/中转/换 IP
 #     · 部分网恢复/部分网仍断     → WARN NODE_PORT_CN_XCHECK_MIXED / XCHECK_IP (网级封锁)
 #     · 新端口全球全断            → WARN CN_XCHECK_INCONCLUSIVE: 防火墙/云安全组拦了临时端口,
 #                                   无法判定 (绝不据此误报 IP 被墙; 海外作对照的同款逻辑)
+#   B. 主测大陆全通 (NODE_PORT_CN_OK) — 自检模式: 新开的随机端口未被业务使用、理应
+#     同样可达; 若测出"新端口大陆断而原端口通"则结果自相矛盾 → WARN
+#     CN_XCHECK_SELFTEST_CONFLICT (高端口段被 IDC/中间设备拦截, 或【新端口被墙测试】
+#     代码本身有问题), 用于验证该测试逻辑可信度; 一致则 PASS CN_XCHECK_SELFTEST_OK。
 #   开关: NODE_CN_TCPING=0 关整个被墙检测; NODE_CN_TCPING_XCHECK=0 只关交叉验证 (省 ~60s)。
 #
 # 端口来源: _resolve_node_port (NODE_PORT 环境变量 > ~/.env > ~/node.json 的 node_port
@@ -1133,7 +1138,7 @@ _check_node_port_external() {
 #     命名空间, 纯 UDP 端口 tcping 全失败属正常, 不能判被墙 (同 NW9 的协议感知注意)。
 #   · 依赖 tcp.ping.pe 可达 (大陆探测点由其代测, 节点本机只与其 HTTPS 通信);
 #     服务不可达/繁忙时 WARN 跳过, 绝不误报。
-#   · 耗时: 单轮 ~15-60s, 触发交叉验证时翻倍 (~2min)。
+#   · 耗时: 单轮 ~15-60s; 交叉验证 (封锁判定或原端口通的自检) 再加一轮 (总计 ~2min)。
 #
 # 远程用法 (在第三方服务器上测【别的】节点, 无需登录目标机):
 #   NODE_TARGET_IP=1.2.3.4 NODE_PORT=443 ./proxyDiagnose.sh --target net
@@ -1397,8 +1402,12 @@ _check_node_port_cn_tcping() {
     [ -n "$_pe_car_s" ] && _pe_title="${_pe_title} [${_pe_car_s}]"
     result "$_pe_lvl" "$_pe_code" "$_pe_title" "$_pe_detail"
 
-    # 6) 交叉验证 — 随机开临时新端口再测一轮, 区分【端口被墙】vs【IP 整段被墙】
-    #    仅在主测判出封锁时执行: BLOCKED, 或 PARTIAL 且有整网全断 (_pe_dead_main 非空)。
+    # 6) 交叉验证 — 随机开临时新端口再测一轮
+    #    场景 A (封锁判定): 主测 BLOCKED, 或 PARTIAL 且有整网全断 (_pe_dead_main 非空)
+    #      → 区分【端口被墙】vs【IP 整段被墙】。
+    #    场景 B (自检): 主测大陆全通 (NODE_PORT_CN_OK) 也照测 — 新开的随机端口理应
+    #      同样可达; 若测出"新端口大陆断而原端口通"则自相矛盾 → WARN 提示高端口被拦
+    #      或【新端口被墙测试代码】本身有问题 (用于验证该测试逻辑是否可信)。
     #    临时端口可能被本机防火墙/云安全组拦截 (默认只放行业务端口) → 全球全断时判
     #    "无法判定"绝不误报 IP 被墙; 大陆断+海外通 才是封锁特征 (与主测同款海外对照)。
     [ "${NODE_CN_TCPING_XCHECK:-1}" = "0" ] && return 0
@@ -1411,9 +1420,11 @@ _check_node_port_cn_tcping() {
         fi
         return 0
     fi
+    _pe_okmain=0
     case "$_pe_code" in
         NODE_PORT_CN_BLOCKED) ;;
         NODE_PORT_CN_PARTIAL) [ -n "$_pe_dead_main" ] || return 0 ;;
+        NODE_PORT_CN_OK) _pe_okmain=1 ;;   # 自检模式: 原端口通, 仍测新端口验证测试逻辑
         *) return 0 ;;
     esac
 
@@ -1486,6 +1497,19 @@ while True:
         _xc_lvl=WARN; _xc_code=CN_XCHECK_INCONCLUSIVE
         _xc_title="交叉验证无法判定: 新端口 ${_xc_port} 全球 ${_peR_fail}/${_peR_t} 全部失败 → 疑似本机防火墙/云安全组未放行临时端口"
         _xc_detail="云安全组默认只放行业务端口, 临时端口全球不通属预期, 不能据此判 IP 被墙。想精确验证: 控制台临时放行 ${_xc_port}/tcp 后重跑, 或人工 https://tcp.ping.pe/${_xc_tgt} 复核"
+    elif [ "$_pe_okmain" = 1 ]; then
+        # 场景 B 自检模式 (原端口大陆全通): 新开随机端口未被业务使用, 理应同样可达
+        if [ "$_peR_cnfail" -eq 0 ]; then
+            _xc_lvl=PASS; _xc_code=CN_XCHECK_SELFTEST_OK
+            _xc_title="交叉验证自检通过: 原端口 ${_NODE_PORT} 与随机新端口 ${_xc_port} 大陆均可达 (大陆 ${_peR_cnok}/${_peR_cnok}, 海外 ${_peR_ok}/$((_peR_ok + _peR_fail))) → 新端口被墙测试逻辑可信"
+            _xc_detail="新开端口与原端口结论一致, 「新端口测试是否被墙」的代码在本节点工作正常。${_xc_sum}"
+        else
+            _xc_dead=""
+            [ -n "$_xc_dead_new" ] && _xc_dead=" (整网全断: ${_xc_dead_new})"
+            _xc_lvl=WARN; _xc_code=CN_XCHECK_SELFTEST_CONFLICT
+            _xc_title="交叉验证自相矛盾: 原端口 ${_NODE_PORT} 大陆全通, 新开随机端口 ${_xc_port} 却大陆 ${_peR_cnfail}/$((_peR_cnok + _peR_cnfail)) 失败 (海外 ${_peR_ok} 正常)${_xc_dead}"
+            _xc_detail="新开端口未被任何业务使用, 理论上不会被针对性封锁 → 两种可能: ① 随机高端口段恰被 IDC/防火墙/中间设备拦截, 或 ping.pe 大陆探测点抖动误报 ② 【新端口被墙测试】代码本身存在 bug。建议: 换个时段重跑交叉验证, 并人工 https://tcp.ping.pe/${_xc_tgt} 复核对照。${_xc_sum}"
+        fi
     else
         # 逐网对照: 主测全断的网 (_pe_dead_main) 在新端口的表现 → 恢复 / 仍断
         _xc_still=""; _xc_rec=""
@@ -1525,7 +1549,11 @@ while True:
         if [ "$QUIET" != 1 ] || [ "$_xc_lvl" != PASS ]; then
             printf '%b    ┌─ 交叉验证: 随机新端口 %s 分网 tcping 明细 (状态 成功/总数)%b\n' "$_C_DIM" "$_xc_port" "$_C_RESET"
             printf '%b' "$_pe_tbl"
-            printf '%b    └─ 对照上表: 新端口通 → 端口级封锁 (换端口可救); 新端口大陆也断 → IP 级封锁%b\n' "$_C_DIM" "$_C_RESET"
+            if [ "$_pe_okmain" = 1 ]; then
+                printf '%b    └─ 自检: 新端口理应与原端口同样大陆可达; 若新端口断而原端口通 → 测试结果存疑%b\n' "$_C_DIM" "$_C_RESET"
+            else
+                printf '%b    └─ 对照上表: 新端口通 → 端口级封锁 (换端口可救); 新端口大陆也断 → IP 级封锁%b\n' "$_C_DIM" "$_C_RESET"
+            fi
         fi
     fi
     result "$_xc_lvl" "$_xc_code" "$_xc_title" "$_xc_detail"
