@@ -956,10 +956,10 @@ PatchDeprecatedDomainsReinstall() {
 # 一次性流量校准: traffic_reset_day + traffic_used
 #   * traffic_reset_day ← ~/.env NODE_TRAFFIC_RESETDAY (1-31)
 #   * traffic_used      ← vnstat 当前计费周期 tx 总和 (GiB, 面板 gb 类型)
-# 脚本: .patches/fix_traffic_reset_day_and_traffic_used.py
-#   * 从 ${NODEHUB_URL}/.patches/ 用 wget -N 下载到 /tmp, 由 python3 执行
+# 脚本: patches/fix_traffic_reset_day_and_traffic_used.py
+#   * 从 ${NODEHUB_URL}/patches/ 用 wget -N 下载到 /tmp, 由 python3 执行
 #   * wget -N 仅在远程更新时实际拉取; 文件保留在 /tmp 不删除, 供下次 -N 比对
-#     (单文件 wget 按 basename 保存, 不创建 .patches/ 子目录)
+#     (单文件 wget 按 basename 保存, 不创建 patches/ 子目录)
 #   * -N 不可与 -O 同用 (时间戳判定失效), 故用 cd /tmp 让其按原名保存
 #   * 脚本自身解析 ~/.env + ~/node.env, 参考 V2ApiController::edit 上报
 # 约束: 仅运行一次 (标记文件 nodeAgent.fix-traffic-reset-used.patch.done);
@@ -989,7 +989,7 @@ PatchFixTrafficResetDayAndUsed() {
     # 3) wget -N 下载到 /tmp (按 basename 保存; 文件保留不删除)
     #    下载在子 shell 内 cd /tmp, 不污染主流程 cwd (与 PatchXraySighupReloadBug 一致);
     #    执行用绝对路径, 与当前 cwd 解耦
-    _patch_url="${NODEHUB_URL}/.patches/fix_traffic_reset_day_and_traffic_used.py"
+    _patch_url="${NODEHUB_URL}/patches/fix_traffic_reset_day_and_traffic_used.py"
     if ( cd /tmp && wget -N -T 30 "$_patch_url" 2>/dev/null ); then
         # 4) 执行 — 脚本自带 Telegram 通知 (直接读 ~/.env), 失败不阻断 nodeAgent
         #    vnstat 缺失 / 上报失败 均由脚本自身发 Telegram, 此处不再转发信号
@@ -1013,12 +1013,12 @@ PatchFixTrafficResetDayAndUsed() {
 # 触发。脚本自身幂等 + 告警节流, 健康时静默, 仅在命中 bug 时自动修复并发 Telegram
 # (含 IP / node_id / 发现 / 已修复 / 状态)。
 #
-# 覆盖三类问题 (对应 .patches/fix_xray_sighup_reload_bug.sh):
+# 覆盖三类问题 (对应 patches/fix_xray_sighup_reload_bug.sh):
 #   1) xray.service 含致命 ExecReload=/bin/kill -HUP (reload 会杀进程)  → 删除
 #   2) Restart=on-failure/no (被信号杀死不兜底)                       → 升级 always
 #   3) xray 当前未运行 (is-active != active, bug 症状或其它宕机)        → restart + 验证
 #
-# 部署: 从 ${NODEHUB_URL}/.patches/fix_xray_sighup_reload_bug.sh 下载到 /tmp 执行;
+# 部署: 从 ${NODEHUB_URL}/patches/fix_xray_sighup_reload_bug.sh 下载到 /tmp 执行;
 #   各节点独立巡检自身, 经 nodeAgent 调度即覆盖"所有服务器"。脚本亦可手动独立运行。
 # ============================================================
 PatchXraySighupReloadBug() {
@@ -1031,13 +1031,54 @@ PatchXraySighupReloadBug() {
         log debug "PatchXraySighupReloadBug: NODEHUB_URL 未设置, 跳过"
         return 0
     fi
-    _patch_url="${NODEHUB_URL}/.patches/fix_xray_sighup_reload_bug.sh"
+    _patch_url="${NODEHUB_URL}/patches/fix_xray_sighup_reload_bug.sh"
     log info "PatchXraySighupReloadBug: 巡检 xray SIGHUP/reload 静默停机 bug (一次性)"
     # 子 shell 内 cd /tmp, 不污染主流程 cwd; 脚本幂等且恒 exit 0
     if ( cd /tmp && wget -N -T 30 "$_patch_url" 2>/dev/null && sh fix_xray_sighup_reload_bug.sh ); then
         : > "$_marker"   # 成功才落标记 (确保修复确实生效; 失败则下个周期重试)
     else
         log warn "PatchXraySighupReloadBug: 下载/执行失败 — ${_patch_url} (将在下个周期重试)"
+    fi
+    return 0
+}
+
+# ============================================================
+# 一次性补丁 (2026-09-03): npanel vision-curvePreferences 解除 PQ-only 限制
+#
+# 背景: 面板下发 vision-curvePreferences 协议时, xray 配置的
+#   inbounds.streamSettings.tlsSettings.curvePreferences 仅含
+#   "X25519MLKEM768x25519" (PQ-only), 不支持 PQ 的客户端无法握手。
+# 改造: 在 mlkem 条目后追加 "X25519" → 纯 vision, 不带任何限制。
+#
+# 脚本: patches/vision_unrestrict_curve.py (原生 python3, 标准库, 不依赖 jq)
+#   * 目标节点: ~/.env API_PANEL=srp 且 ~/node.json v2_name=vision-curvePreferences
+#     (非目标节点脚本自身静默跳过)
+#   * 幂等: 已含 X25519 / v2_name 已改 / 标记存在 均安全重入
+#   * 自带备份回滚 + xray -test 校验 + 重启验证 + Telegram 通知
+# 约束: 仅 2026-09-03 当天可执行 (脚本内部亦校验日期, 双重防护), 仅一次
+# ============================================================
+PatchVisionUnrestrictCurve() {
+    # 一次性: 成功执行后才写 marker (下载/执行失败时下个周期重试);
+    # 脚本幂等 (已改过/非目标节点直接退出), 无需"先落标记防重入"
+    _marker="${HOME}/nodeAgent.vision-unrestrict.patch.done"
+    [ -f "$_marker" ] && return 0
+
+    if [ -z "${NODEHUB_URL:-}" ]; then
+        log debug "PatchVisionUnrestrictCurve: NODEHUB_URL 未设置, 跳过"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        log warn "python3 不可用, 跳过 vision 解除 PQ-only 限制补丁"
+        return 0
+    fi
+
+    _patch_url="${NODEHUB_URL}/patches/vision_unrestrict_curve.py"
+    log info "PatchVisionUnrestrictCurve: 巡检 vision PQ-only 限制 (仅 srp+vision-curvePreferences 节点)"
+    # 子 shell 内 cd /tmp, 不污染主流程 cwd (与其它 Patch* 一致)
+    if ( cd /tmp && wget -N -T 30 "$_patch_url" 2>/dev/null && python3 vision_unrestrict_curve.py ); then
+        : > "$_marker"   # 成功才落标记 (脚本自身也写同名标记, 双保险)
+    else
+        log warn "PatchVisionUnrestrictCurve: 下载/执行失败 — ${_patch_url} (将在下个周期重试)"
     fi
     return 0
 }
@@ -1056,6 +1097,10 @@ RunPatches() {
 
     # 一次性 (2026-08-08 前): xray SIGHUP/reload 静默停机 bug 全节点巡检 + 自动修复 + Telegram 告警
     [ "$_today_num" -lt 20260808 ] && PatchXraySighupReloadBug
+
+    # 一次性 (仅 2026-09-03 当天): srp 面板 vision-curvePreferences 节点解除 PQ-only
+    # 限制 (curvePreferences 追加 X25519 + v2_name → vision + 重启 xray)
+    [ "$_today" = "2026-09-03" ] && PatchVisionUnrestrictCurve
 
     return 0
 }

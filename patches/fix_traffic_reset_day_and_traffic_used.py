@@ -18,7 +18,7 @@ fix_traffic_reset_day_and_traffic_used — 一次性流量校准补丁
 
 调用方:
   nodeAgent.sh RunPatches → PatchFixTrafficResetDayAndUsed
-  本脚本由 nodeAgent.sh 从 ${NODEHUB_URL}/.patches/ 用 wget -N 下载到 /tmp 后执行;
+  本脚本由 nodeAgent.sh 从 ${NODEHUB_URL}/patches/ 用 wget -N 下载到 /tmp 后执行;
   亦可独立运行 (自带 Telegram 通知: 直接读 ~/.env 的 TG 配置, 不依赖 shell 转发).
 
 参考:

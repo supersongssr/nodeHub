@@ -18,7 +18,7 @@
 #   5) 健康巡检节流: 同一持续故障 6h 内只告警一次 (避免每小时刷屏); 故障消除后自动解除
 #
 # 部署模型: 由 nodeAgent.sh :: PatchXraySighupReloadBug 从
-#   ${NODEHUB_URL}/.patches/fix_xray_sighup_reload_bug.sh 下载到 /tmp 后执行;
+#   ${NODEHUB_URL}/patches/fix_xray_sighup_reload_bug.sh 下载到 /tmp 后执行;
 #   亦可手动 `sh fix_xray_sighup_reload_bug.sh` 在任意节点独立运行 (自读 ~/.env 发 TG)。
 #   各节点独立巡检自身 xray, 经 nodeAgent 调度即可覆盖"所有服务器"。
 #

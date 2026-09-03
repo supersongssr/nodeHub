@@ -1,13 +1,17 @@
-# .patches/
+# patches/
 
 一次性补丁脚本目录. 由 `nodeAgent.sh` 的 `RunPatches` 调度执行.
+
+> 2026-09-03 起由 `.patches/` 迁移到 `patches/` (无前导点):
+> `.patches/` 不随 prod.deploy 的 rsync (--exclude-from=.gitignore) 同步到生产环境,
+> 之后的补丁一律放本目录, 不再使用 `.patches/`.
 
 ## 约定
 
 - **运行一次**: 每个 Patch 在节点上首次执行后写标记文件 (`~/nodeAgent.<name>.patch.done`),
   再次执行直接跳过, 保证全节点只跑一次.
 - **按需下发**: 节点本地不持有仓库, 补丁脚本由 `nodeAgent.sh` 从
-  `${NODEHUB_URL}/.patches/<脚本名>` 下载到临时文件后用对应解释器执行
+  `${NODEHUB_URL}/patches/<脚本名>` 下载到临时文件后用对应解释器执行
   (与现有 patch 下载 `proxyInstall.sh` 的模式一致).
 - **调度入口**: 新增补丁只需在 `nodeAgent.sh :: RunPatches` 追加一行日期触发,
   无需改动 `Main`. 过时补丁直接注释整行.
@@ -19,3 +23,4 @@
 | --- | --- | --- |
 | `fix_traffic_reset_day_and_traffic_used.py` | 2026-08-08 前, 一次 | 读 `~/.env` 的 `NODE_TRAFFIC_RESETDAY` 仅用于确定计费周期起点, 用 vnstat 汇总当前周期 tx 流量, 经 `POST /api/node/edit` **仅上报 `traffic_used`(GiB)**; `traffic_reset_day` 不再上报 (仅作为周期锚点, 不写回面板)。注意: 与 sighup 补丁相反, 本补丁标记【先于执行】落盘 — 即便 NODEHUB_URL/python3 缺失或下载/执行失败也绝不重试 (校准非幂等, 重复上报会污染计费数据); 未跑成的节点由人工另写一次性脚本处理 |
 | `fix_xray_sighup_reload_bug.sh` | 2026-08-08 前, 一次 | 巡检本机 xray 是否中招 SIGHUP/reload 静默停机 bug (含致命 `ExecReload=...-HUP` 配置 / `Restart` 兜底不足 / xray 未运行) → 自动修复 (删 ExecReload、Restart→always、restart) 并发 Telegram (含 服务器IP / node_id / 发现 / 已修复 / 状态)。幂等, 健康时静默; 同一持续故障 6h 内只告警一次。wrapper 在成功执行后才写 marker (失败则下周期重试) |
+| `vision_unrestrict_curve.py` | 仅 2026-09-03, 一次 | npanel `vision-curvePreferences` 节点 (srp 面板) 解除 PQ-only 限制: 在 `/usr/local/etc/xray/config.json` 的 `tlsSettings.curvePreferences` 的 mlkem 条目后追加 `"X25519"` → 纯 vision 不带限制; 重启 xray; `~/node.json` `v2_name` → `vision`。原生 python3 标准库, 幂等, 自带备份回滚 + `xray -test` 校验 + Telegram 通知。脚本内部校验日期 (仅 2026-09-03 当天可执行), wrapper 成功后写 marker |

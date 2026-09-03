@@ -20,8 +20,8 @@ node proxy scripts hub — V2「瘦节点、胖面板」架构的代理节点脚
 
 - `configs/` — 服务配置模板（如 `xray/xray.service`）
 - `panels/` — 面板适配脚本（1Panel / 宝塔）
-- `.patches/` — 一次性补丁脚本，由 `nodeAgent.sh::RunPatches` 经 `${NODEHUB_URL}/.patches/` 下发执行（详见 [`./.patches/README.md`](.patches/README.md)）
+- `patches/` — 一次性补丁脚本，由 `nodeAgent.sh::RunPatches` 经 `${NODEHUB_URL}/patches/` 下发执行（详见 [`./patches/README.md`](patches/README.md)）
 - `ssl/` · `geodat/` — 证书 / GeoData，供节点经 `${NODEHUB_URL}` 下载
 - `plans/` · `reports/` — 设计方案与审计报告
 
-节点经 `${NODEHUB_URL}` 拉取本仓库中的脚本与资源（脚本自身、`ssl/`、`panels/`、`geodat/`、`configs/`、`.patches/`）。
+节点经 `${NODEHUB_URL}` 拉取本仓库中的脚本与资源（脚本自身、`ssl/`、`panels/`、`geodat/`、`configs/`、`patches/`）。
