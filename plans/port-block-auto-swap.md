@@ -1,5 +1,12 @@
 # 端口被墙自动换端口自愈 (DailyPortBlockCheck)
 
+> ⚠️ **已废弃 (2026-09-05)**: 节点端换端口自愈已整体移除 —— 单运营商探测点抖动
+> 即可触发破坏性误重装, 处置 (换端口重装等) 移交远程面板基于推送数据统一下发。
+> 现行方案见 [`plans/tcping-check.md`](tcping-check.md): nodeAgent 每周期 (小时) 后台
+> 经 `tcpingCheck.py` 检测并推送 `POST /ingest/tcping`, 不再本地重装 proxyInstall.sh;
+> `NODE_PORT_CHECK_HOUR` / `NODE_PORT_SWAP_COOLDOWN` / `nodeAgent.portswap.log` 等已删除,
+> Telegram 通知收敛为【被墙状态迁移】时发一次。下文仅作历史方案存档。
+
 > 实施: nodeAgent.sh · 依赖: proxyDiagnose.sh NW10 大陆 tcping 检测 · 2026-09-01
 
 ## 1. 背景与目标
