@@ -25,6 +25,8 @@
 #           (详见 _check_node_port_external)
 #         · NODE_PORT 大陆方向被墙 — 本机监听/证书/海外访问全正常, 唯大陆方向 TCP
 #           握手全部超时 (借 tcp.ping.pe 大陆探测点 tcping, 与海外探测点对照判定,
+#           [自动化正典路径已移至 tcpingCheck.py 模块 (nodeAgent 每小时复用); 本处保留
+#            sh 实现供人工诊断, 两处需同步维护, 见 plans/tcping-check.md §4],
 #            详见 _check_node_port_cn_tcping)
 #         · conntrack 连接跟踪表打满 → 海量丢包 → 内存耗尽【硬死锁】
 #           (nf_conntrack_max 默认 8192 在多用户代理下秒级打满; 常因 /etc/sysctl.conf
