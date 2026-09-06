@@ -15,7 +15,7 @@
 load 'test_helper'
 
 AGENT_SRC="${PROJECT_ROOT}/nodeAgent.sh"
-DIAG_SRC="${PROJECT_ROOT}/proxyDiagnose.sh"
+DIAG_SRC="${PROJECT_ROOT}/proxyDiagnose.py"
 STUB_BIN=""      # 注入 PATH 的 stub bin
 FIXTURE=""       # wget stub 的"源站"
 TG_LOG=""        # curl stub 记录的 TG 调用
@@ -427,7 +427,7 @@ exit 0
 EOF
     chmod +x "${STUB_BIN}/ssh"
 
-    run sh "$DIAG_SRC" --host "root@1.2.3.4" --target net --json --no-notify
+    run python3 "$DIAG_SRC" --host "root@1.2.3.4" --target net --json --no-notify
     [ "$status" -eq 0 ]
     grep -q -- "--target 'net'" "$sshlog"
     grep -q -- "--json" "$sshlog"
@@ -443,7 +443,7 @@ exit 0
 EOF
     chmod +x "${STUB_BIN}/ssh"
 
-    run sh "$DIAG_SRC" --host "root@1.2.3.4" --target net
+    run python3 "$DIAG_SRC" --host "root@1.2.3.4" --target net
     [ "$status" -eq 0 ]
     ! grep -q -- "--no-notify" "$sshlog"
 }

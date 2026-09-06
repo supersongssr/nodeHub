@@ -3,7 +3,7 @@
 """tcpingCheck.py — NODE_PORT 大陆 tcping 被墙检测 (单文件模块, Python3 原生库).
 
 定位 (nodeHub 节点端 tcping 的唯一正典实现, 见 plans/tcping-check.md):
-  从 proxyDiagnose.sh 的 _check_node_port_cn_tcping (NW10) 提取核心探测逻辑,
+  从 proxyDiagnose.py 的 _check_node_port_cn_tcping (NW10) 提取核心探测逻辑,
   做成独立 Python3 模块 (零第三方依赖, 仅标准库), 供:
     · nodeAgent.sh 每周期 (小时) 调用: 检测本节点 NODE_PORT 是否被墙 +
       推送结果至 ServerStatus-Rust-Moniter (/ingest/tcping);
@@ -19,7 +19,7 @@
   本检测直接对 <用户连接的 IP:PORT> 做 TCP 握手测试 (借 tcp.ping.pe 大陆
   探测点, 分电信/联通/移动/厂商 + 海外对照), 与用户链路同构, 判定即真相.
 
-探测原理 (tcp.ping.pe 接口流程, 与 proxyDiagnose.sh / cn_port_check.py 同源):
+探测原理 (tcp.ping.pe 接口流程, 与 proxyDiagnose.py / cn_port_check.py 同源):
   1) GET  /IP:PORT              → antiflood=<hex> cookie
   2) GET  /IP:PORT?browsercheck=ok -b cookie → taskStartQuery/taskStartToken
   3) POST ajax_startTask_v1.php (query+token, 须带 Origin)  → stream_id
@@ -77,7 +77,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 VERSION = "tcpingCheck.py 1.0 (nodeHub)"
 
-# ── 探测服务参数 (与 proxyDiagnose.sh / cn_port_check.py 同源) ──
+# ── 探测服务参数 (与 proxyDiagnose.py / cn_port_check.py 同源) ──
 TCPING_BASE = "https://tcp.ping.pe"
 TCPING_UA = "Mozilla/5.0 (X11; Linux x86_64) NodeHub-tcpingCheck"
 PAGE_TIMEOUT = 25.0          # 单个 HTTP 请求超时 (秒)
@@ -203,7 +203,7 @@ def tcping(ip: str, port: int) -> Dict[str, Any]:
       · status=ok: 探测完成; groups 为逐组成功/总数
       · status=error: groups 全 0, error 为归类说明 (探测服务侧问题, 不是端口问题)
     """
-    # IPv6 字面量在 URL path 里需方括号包裹 (与 proxyDiagnose.sh 同)
+    # IPv6 字面量在 URL path 里需方括号包裹 (与 proxyDiagnose.py 同)
     tgt = "[%s]:%d" % (ip, port) if ":" in ip else "%s:%d" % (ip, port)
     groups: Dict[str, Dict[str, int]] = {
         g: {"ok": 0, "total": 0} for g in ALL_GROUPS}
@@ -525,7 +525,7 @@ def resolve_target(ip_arg: Optional[str], port_arg: Optional[int],
                     ) -> Tuple[str, int, str, str]:
     """解析检测目标: (ip, port, stat_user, ip_source).
 
-    优先级 (与 proxyDiagnose.sh / proxyInstall.sh 同源):
+    优先级 (与 proxyDiagnose.py / proxyInstall.sh 同源):
       IP   : --ip 参数 > ~/node.json .node_ip > ~/node.env node_ip= > 公网探测
              (★IPv4 优先 — stat_client 三网 ping 双栈优先 v6 是本检测存在的原因)
       PORT : --port 参数 > ~/node.json .node_port > ~/node.env node_port= > 443

@@ -600,7 +600,7 @@ SyncSSL() {
 #
 # 实现 (must: 复用 tcping 测试, 避免代码混乱):
 #   探测逻辑集中在 ${NODEHUB_URL}/tcpingCheck.py (单文件 Python3 原生库模块,
-#   与 proxyDiagnose.sh NW10 / ServerStatus tcping_client.py 同源同步):
+#   与 proxyDiagnose.py NW10 / ServerStatus tcping_client.py 同源同步):
 #     1. 每周期从 ${NODEHUB_URL} 下载 (wget -N, 变更才拉), 完整性双重校验
 #        (非空 + python 编译通过) 后以 --xcheck auto 运行 (~1-3 分钟, timeout 兜底);
 #     2. 结果 JSON 解析 (jq):
