@@ -75,9 +75,10 @@
 - **中央端正典**: `ServerStatus-Rust-Moniter/monitor/core/checks/tcping_client.py`
   (mypy strict 全注解, `cn_port_check.py` 每日中央轮/页面/告警复用)
 
-`proxyDiagnose.sh` NW10 保留 sh 实现 (人工诊断用, 保持零 python3 依赖);
+`proxyDiagnose.py` NW10 保留内置探测实现 (人工诊断用; 已由 proxyDiagnose.sh
+移植为 Python3 单文件, 同样依赖 python3, sh 版已移除);
 自动化路径 (nodeAgent 每小时 / 中央每日轮) 全部走上述 Python 模块.
-**改动接口流程或判定口径时, 两份 Python 实现必须同步修改.**
+**改动接口流程或判定口径时, 上述 Python 实现必须同步修改.**
 
 ## 5. 推送 API 契约
 

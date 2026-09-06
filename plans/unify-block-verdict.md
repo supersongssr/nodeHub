@@ -54,7 +54,7 @@ stat_client 三网数据**降级为「出向质量参考」**, 只展示、不�
 | 1-3 文案 | `public/` 前端 | 三网丢包列改名「出向丢包(参考)」; 被墙列数据源 = cnport |
 | 1-4 文档 | `docs/DEFINITIONS.md` §2.2 | 「被墙」定义替换为入向口径 + 方向性说明 (本文 §1.1) |
 
-**Phase 2 — 入向检测补盲区 (nodeHub, proxyDiagnose.sh + nodeAgent.sh)**
+**Phase 2 — 入向检测补盲区 (nodeHub, proxyDiagnose.py + nodeAgent.sh)**
 
 | 改动 | 内容 |
 |---|---|
