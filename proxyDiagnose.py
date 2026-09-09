@@ -1477,8 +1477,9 @@ def check_node_port_external():
     if external:
         b = ','.join(sorted({f"{l.split()[0]}/{l.split()[4]}" for l in listen if len(l.split()) >= 5}))
         result('PASS', 'NODE_PORT_EXTERNAL',
-               f'NODE_PORT={node_port} 监听在对外地址 [{b}] → 外部可达',
-               'TCP/UDP 任一协议对外监听即视为可达 (Hysteria2 走 UDP)')
+               f'NODE_PORT={node_port} 监听在对外地址 [{b}] (本机视角: 非仅 127.0.0.1)',
+               'TCP/UDP 任一协议对外监听即通过 (Hysteria2 走 UDP); 仅证明本机已对外监听, '
+               '外部(尤其大陆方向)实际可达性由下一条 tcping 分网检测判定, 两者结论可能相反')
     else:
         result('FAIL', 'NODE_PORT_LOCALHOST_ONLY',
                f'NODE_PORT={node_port} 仅监听 127.0.0.1/::1 → 外部无法访问',
@@ -1528,10 +1529,21 @@ def pe_probe(target, label=''):
     """跑一轮 tcp.ping.pe 全球 tcping; 失败自行 emit WARN 并返回 None;
     成功返回 {t, cnok, cnfail, ok, fail, avg, segs[(网, 状态, ok/total), ...]}"""
     # 1) antiflood cookie: 首访响应内嵌 document.cookie 赋值, 提取后携带重访
-    page = http_get(f'{PE_BASE}/{target}', headers={'User-Agent': PE_UA}, timeout=20)
-    m = re.search(r'antiflood=([a-f0-9]+)', page)
+    #    首访对瞬时抖动/限流敏感 (曾一次超时/5xx 即判"服务不可达", 连带放弃交叉验证
+    #    致无法区分端口级/IP级被墙), 故失败重试 3 次 (间隔 3s);
+    #    空响应=网络层失败, 有页面但无 antiflood=疑似限流或接口改版
+    m = None
+    page = ''
+    for _ in range(3):
+        page = http_get(f'{PE_BASE}/{target}', headers={'User-Agent': PE_UA}, timeout=20)
+        m = re.search(r'antiflood=([a-f0-9]+)', page)
+        if m:
+            break
+        time.sleep(3)
     if not m:
-        result('WARN', 'CN_TCPING_SERVICE_DOWN', f'tcp.ping.pe 不可达, 跳过{label} {target} 检测',
+        why = '(空响应: 网络层失败)' if not page else '(有页面但无 antiflood: 疑似限流或接口变更)'
+        result('WARN', 'CN_TCPING_SERVICE_DOWN',
+               f'tcp.ping.pe 不可达 (重试 3 次仍失败 {why}), 跳过{label} {target} 检测',
                f'本检查依赖其大陆探测点代测; 服务恢复后重跑, 或人工在 https://tcp.ping.pe/{target} 复核')
         return None
     cookie = f'antiflood={m.group(1)}'
