@@ -18,6 +18,10 @@ proxyDiagnose.py — 代理服务 (xray / nginx / 代理安装环境) 故障诊�
   · 配置 JSON 语法错误 / 二进制缺失 / 架构不匹配 / systemd mask / 重启风暴
   · TLS 证书缺失/过期/不可读; geo 数据缺失; OOM / 磁盘满 / 包锁
   · 系统时间不同步; 防火墙; DNS; 面板辅助脚本 0 字节空文件 (198.12.124.74 根因)
+  · apt 仓库 Release 文件 Valid-Until 过期 → apt-get update 退出 100, 安装脚本 set -e
+    直接中断 (103.227.224.98 根因: Debian 11 bullseye 于 2026-08-31 结束 LTS,
+    security 套件冻结, Valid-Until=最后更新+7天 过后必然触发) — --fix 自动关闭
+    Acquire::Check-Valid-Until 校验并 apt-get update 验证; 附带包锁残留自动解除
   · 出站 IPv4 web 端口被上游封锁但 freedom 强制 IPv4 → 代理"假活" (38.45.72.223 根因)
   · NODE_PORT 只 bind 127.0.0.1 → 本地"在监听"但外部不可达
   · NODE_PORT 大陆方向被墙 (借 tcp.ping.pe 三网+云厂探测点与海外对照逐网判定,
@@ -27,7 +31,8 @@ proxyDiagnose.py — 代理服务 (xray / nginx / 代理安装环境) 故障诊�
   · 本周期出站流量 (vnstat tx × NODE_TRAFFIC_RESETDAY, 配 LIMIT 时限额提醒)
 
 设计原则:
-  1. 只读诊断, 默认绝不修改系统 (只查询 + 报告)
+  1. 默认只读诊断, 绝不修改系统 (只查询 + 报告); --fix 显式开启自动修复, 仅限两类
+     低风险项 (apt/dpkg 锁解除 + 仓库有效期校验关闭), 每个修复动作以 WARN 结果呈现
   2. 每项检查独立 — 单个检查内部异常被捕获为 INTERNAL_* 结果, 绝不中断其它检查
   3. 输出三级结论: PASS(正常) / WARN(潜在风险) / FAIL(直接故障原因)
   4. --json 机器可读输出, 供面板/nodeAgent 调用
@@ -37,6 +42,8 @@ proxyDiagnose.py — 代理服务 (xray / nginx / 代理安装环境) 故障诊�
   python3 proxyDiagnose.py --target xray|nginx|env|net|cert|outbound|traffic
   python3 proxyDiagnose.py --json               # 输出 JSON (供程序解析)
   python3 proxyDiagnose.py --no-notify          # 抑制 Telegram 推送 (程序化调度用)
+  python3 proxyDiagnose.py --fix                # 自动修复: 解除 apt/dpkg 残留包锁 +
+                                                #   关闭过期仓库有效期校验 (修复动作报 WARN)
   python3 proxyDiagnose.py --quiet              # 只输出 FAIL/WARN
   python3 proxyDiagnose.py --no-color           # 关闭颜色
   python3 proxyDiagnose.py --host root@1.2.3.4  # 远程诊断 (ssh 推送自身, 远端需 python3)
@@ -48,6 +55,7 @@ proxyDiagnose.py — 代理服务 (xray / nginx / 代理安装环境) 故障诊�
 
 import calendar
 import datetime
+import email.utils
 import fnmatch
 import glob
 import json
@@ -86,6 +94,7 @@ USAGE = """\
   python3 proxyDiagnose.py --target traffic     # 只查本周期流量 (vnstat tx)
   python3 proxyDiagnose.py --json               # 输出 JSON (供程序解析)
   python3 proxyDiagnose.py --no-notify          # 抑制 Telegram 推送
+  python3 proxyDiagnose.py --fix                # 自动修复 (apt/dpkg 锁 + 仓库有效期校验)
   python3 proxyDiagnose.py --quiet              # 只输出 FAIL/WARN, 不输出 PASS
   python3 proxyDiagnose.py --no-color           # 关闭颜色
   python3 proxyDiagnose.py --host root@1.2.3.4  # 远程诊断 (ssh 执行, 远端需 python3)
@@ -144,6 +153,7 @@ QUIET = False
 USE_COLOR = True
 REMOTE_HOST = ''
 NO_NOTIFY = False
+FIX = False  # --fix: 显式开启自动修复 (默认只读, 见设计原则 1)
 
 _args = sys.argv[1:]
 _i = 0
@@ -164,6 +174,9 @@ while _i < len(_args):
         _i += 1
     elif _a == '--no-notify':
         NO_NOTIFY = True
+        _i += 1
+    elif _a == '--fix':
+        FIX = True
         _i += 1
     elif _a == '--quiet':
         QUIET = True
@@ -197,6 +210,8 @@ if REMOTE_HOST:
         _flags += ' --quiet'
     if NO_NOTIFY:
         _flags += ' --no-notify'
+    if FIX:
+        _flags += ' --fix'
     _remote_cmd = f"python3 -s - --target '{TARGET}'{_flags}"
     _strict = ENV.get('DIAG_SSH_STRICT') or 'accept-new'
     try:
@@ -447,10 +462,114 @@ def notify_tg():
 
 
 # ============================================================
+# apt 包锁 / 仓库有效期 — 自动修复辅助 (仅 --fix 时调用; 默认只读)
+#   背景: Debian 11 bullseye 于 2026-08-31 结束 LTS, security.debian.org 套件
+#   冻结不再更新, Release 的 Valid-Until (最后更新+7天) 过期后 apt-get update
+#   直接报 'E: Release file ... is expired' 退出 100 → 安装脚本 set -e 中断
+#   (103.227.224.98 实测根因)。archive.debian.org 归档放出前无源可换,
+#   唯一出路 = 关闭 Acquire::Check-Valid-Until 校验 (修复动作以 WARN 提示)。
+# ============================================================
+VALID_UNTIL_CONF = '/etc/apt/apt.conf.d/99check-valid-until'
+
+
+def apt_expired_repos():
+    """扫描 /var/lib/apt/lists 已缓存的 InRelease/Release, 找出 Valid-Until 已过期的仓库。
+    判定与 apt 自身一致 (本地时间 vs Valid-Until), 纯只读不联网。
+    返回 [(仓库名, Valid-Until 原文)], 空列表 = 无过期/无法判定"""
+    expired = []
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for f in (glob.glob('/var/lib/apt/lists/*_InRelease')
+              + glob.glob('/var/lib/apt/lists/*_Release')):
+        vu = ''
+        try:
+            with open(f, 'r', encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    if line.startswith('Valid-Until:'):
+                        vu = line.split(':', 1)[1].strip()
+                        break
+        except OSError:
+            continue
+        if not vu:
+            continue
+        try:
+            dt = email.utils.parsedate_to_datetime(vu)  # RFC 1123 (apt Release 日期格式)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            if dt >= now:
+                continue
+        except (TypeError, ValueError):
+            continue
+        base = os.path.basename(f)
+        for suf in ('_InRelease', '_Release'):
+            if base.endswith(suf):
+                base = base[:-len(suf)]
+                break
+        # security.debian.org_debian-security_dists_bullseye-security →
+        # security.debian.org/debian-security/bullseye-security
+        expired.append((base.replace('_dists_', '/').replace('_', '/'), vu))
+    return expired
+
+
+def fix_apt_valid_until():
+    """写 Acquire::Check-Valid-Until=false 并以 apt-get update 验证。返回 (ok, 说明)。"""
+    already = False
+    try:
+        with open(VALID_UNTIL_CONF, 'r', encoding='utf-8', errors='replace') as fh:
+            already = 'Check-Valid-Until' in fh.read()
+    except OSError:
+        pass
+    if not already:
+        try:
+            with open(VALID_UNTIL_CONF, 'w', encoding='utf-8') as fh:
+                fh.write('Acquire::Check-Valid-Until "false";\n')
+        except OSError as e:
+            return False, f'写入 {VALID_UNTIL_CONF} 失败: {e} (需要 root)'
+    rc, _, err = run(['apt-get', 'update'], timeout=300)
+    if rc == 0:
+        return True, ('配置已存在, ' if already else '') + VALID_UNTIL_CONF
+    tail = ' '.join(err.split())[:160] or f'apt-get update 退出码 {rc}'
+    return False, f'写入配置后 apt-get update 仍失败 (退出码 {rc}): {tail}'
+
+
+def fix_apt_locks(locks):
+    """解除 apt/dpkg 包锁 (与 proxyInstall.sh WaitForAptLock 同策略):
+    停 unattended-upgrades → SIGKILL 残余持锁进程 → 删锁文件 → dpkg --configure -a。
+    返回 (ok, 说明)。"""
+    pids = []
+    for line in run_out(['ps', 'aux']).splitlines():
+        if 'grep' in line or SCRIPT_NAME in line:
+            continue
+        if re.search(r'(unattended-upgr|apt-get|apt |dpkg)', line):
+            parts = line.split()
+            if len(parts) > 10:
+                pids.append((parts[1], ' '.join(parts[10:])))
+    if pids:
+        # 常驻自动升级 (unattended-upgrades) 是锁的主要来源, 先停服务防杀后复活
+        run(['systemctl', 'stop', 'unattended-upgrades'])
+        for pid, cmd in pids:
+            note(f'终止持锁进程 pid={pid} ({cmd[:70]})')
+            run(['kill', '-9', pid])
+        time.sleep(1)
+    for lock in locks:
+        try:
+            os.remove(lock)
+        except OSError:
+            pass
+    rc, _, _err = run(['dpkg', '--configure', '-a'], timeout=300)
+    still = [lk for lk in locks if os.path.exists(lk) and has('fuser')
+             and run(['fuser', lk])[0] == 0]
+    if still:
+        return False, '锁仍被占用: ' + ' '.join(still)
+    if rc != 0:
+        return False, f'dpkg --configure -a 退出码 {rc}, 存在半完成的包配置, 需人工检查'
+    return True, f'终止 {len(pids)} 个持锁进程, 解除 {len(locks)} 把锁'
+
+
+# ============================================================
 # 基础环境检查 (env) — 影响安装能否成功
 # ============================================================
 def check_env():
-    say('基础环境 (磁盘 / 内存 / 时间 / DNS / 依赖 / 包锁)')
+    say('基础环境 (磁盘 / 内存 / 时间 / DNS / 包锁 / 仓库 / 依赖)')
 
     # E1. 磁盘空间 — 根分区使用率
     root_use = 0
@@ -510,6 +629,7 @@ def check_env():
         result('WARN', 'ENV_DNS_UNKNOWN', '无 getent, 跳过 DNS 检测')
 
     # E5. 包管理器锁占用 — apt/dpkg 正在被占用会卡住安装
+    #     --fix: 沿用 proxyInstall.sh WaitForAptLock 策略自动解除, 修复动作以 WARN 呈现
     if has('fuser'):
         locks = []
         for lock in ('/var/lib/dpkg/lock-frontend', '/var/lib/apt/lists/lock',
@@ -519,10 +639,69 @@ def check_env():
                 if rc == 0:
                     locks.append(lock)
         if locks:
-            result('WARN', 'ENV_PKG_LOCK', '包管理器锁被占用: ' + ' '.join(locks),
-                   '可能有 apt/dpkg 正在运行; 若卡死: ps aux | grep apt, 必要时 rm 锁文件并 dpkg --configure -a')
+            if FIX:
+                ok, msg = fix_apt_locks(locks)
+                if ok:
+                    result('WARN', 'ENV_PKG_LOCK_FIXED',
+                           f'包管理器锁被占用, 已自动解除 ({msg}): ' + ' '.join(locks),
+                           '修复动作: 停 unattended-upgrades → 终止持锁 apt/dpkg 进程 → 删锁文件 → dpkg --configure -a。若锁属于一个仍在进行的真实安装, 请重跑该安装')
+                else:
+                    result('WARN', 'ENV_PKG_LOCK',
+                           f'包管理器锁被占用, --fix 自动解除未成功 ({msg})',
+                           '人工处理: ps aux | grep -E "apt|dpkg" 找到卡死进程, 终止后 rm 锁文件并 dpkg --configure -a')
+            else:
+                result('WARN', 'ENV_PKG_LOCK', '包管理器锁被占用: ' + ' '.join(locks),
+                       '可能有 apt/dpkg 正在运行; 若确认卡死: 加 --fix 自动解除, 或手动 rm 锁文件并 dpkg --configure -a')
         else:
             result('PASS', 'ENV_PKG_LOCK_OK', '包管理器锁空闲')
+
+    # E10. apt 仓库 Release 有效期 — Valid-Until 过期 → apt-get update 必失败 (退出 100),
+    #      安装脚本 set -e 直接中断。真实故障 (2026-09-09, 103.227.224.98):
+    #      Debian 11 bullseye 于 2026-08-31 结束 LTS, security 套件冻结,
+    #      InRelease Valid-Until=2026-09-07 一过 apt 即报 'Release file ... is expired'。
+    #      --fix: 写 Acquire::Check-Valid-Until=false 并 apt-get update 验证。
+    _lists = '/var/lib/apt/lists'
+    _has_lists = os.path.isdir(_lists) and (
+        glob.glob(os.path.join(_lists, '*_InRelease'))
+        or glob.glob(os.path.join(_lists, '*_Release')))
+    if has('apt-get') and _has_lists:
+        expired = apt_expired_repos()
+        if expired:
+            names = '; '.join(f'{r} (Valid-Until: {v})' for r, v in expired)
+            if FIX:
+                ok, msg = fix_apt_valid_until()
+                if ok:
+                    result('WARN', 'ENV_REPO_EXPIRED_FIXED',
+                           f'apt 仓库 Release 已过期, 已自动关闭有效期校验: {names}',
+                           f'⚠️ 过期根因是该仓库已停止更新 (OS 停止安全维护), 本修复仅恢复安装能力, 不恢复安全更新。已写入/确认 {VALID_UNTIL_CONF} 并 apt-get update 验证通过')
+                else:
+                    result('FAIL', 'ENV_REPO_EXPIRED_FIX_FAILED',
+                           f'apt 仓库 Release 过期, --fix 自动修复未成功: {names}', msg)
+            else:
+                result('FAIL', 'ENV_REPO_EXPIRED',
+                       f'apt 仓库 Release 已过期 (apt-get update 必报 expired 退出 100): {names}',
+                       '修复: printf \'Acquire::Check-Valid-Until "false";\\n\' > /etc/apt/apt.conf.d/99check-valid-until 后重试安装; 或直接加 --fix 自动修复并验证')
+        else:
+            result('PASS', 'ENV_REPO_FRESH', 'apt 仓库 Release 有效期正常 (无过期仓库)')
+    else:
+        note('E10 跳过: 无 apt-get 或本地无仓库索引 (未跑过 apt update), 无法静态判断 Release 有效期')
+
+    # E11. OS 生命周期 — Debian 10/11 已停止 (LTS) 安全支持, 是 E10 仓库过期的根因。
+    #      检测只提示不修复 (升级 OS 超出诊断脚本职责), 但给出明确路径。
+    _deb_ver = ''
+    try:
+        with open('/etc/debian_version', 'r', encoding='utf-8', errors='replace') as fh:
+            _deb_ver = fh.read().strip()
+    except OSError:
+        pass
+    _major = to_int(re.split(r'[./]', _deb_ver)[0] if _deb_ver else '', 0)
+    if _major in (10, 11):
+        _codename = {10: 'buster', 11: 'bullseye'}.get(_major, '')
+        result('WARN', 'ENV_OS_EOL',
+               f'Debian {_major} ({_codename}) 已结束生命周期 (含 LTS), 不再有任何安全更新',
+               f'当前版本 {_deb_ver}: security 仓库已冻结 (Release 过期后 apt 持续报 expired, 见 E10); 短期: --fix 关闭有效期校验维持安装能力; 长期: 升级 Debian 12 (bookworm)')
+    elif _major >= 12:
+        result('PASS', 'ENV_OS_OK', f'Debian {_deb_ver} 仍在官方支持期内')
 
     # E6. 关键依赖 — 代理安装/运维脚本常用工具
     #   (jq 为 nodeAgent/proxyInstall 等脚本所需; 本脚本自身已用原生 json 解析)
