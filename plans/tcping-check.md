@@ -127,7 +127,7 @@
 | 引擎 | 下载 proxyDiagnose.sh 跑 `--target net` | 下载 tcpingCheck.py (单模块, 快 1-3 分钟) |
 | 端口/IP 区分 | 解析 proxyDiagnose 结果码 | report.block_level (port/ip/unknown) |
 | 推送 | 无 | POST /ingest/tcping (判定主数据源) |
-| 通知 | 每次检测命中即发 | 状态迁移时发一次 (ok↔blocked / 级别变化 / 恢复); 流程日志 info 级不走 TG, portcheck 桶节流兜底 |
+| 通知 | 每次检测命中即发 | 状态迁移时发一次 (ok↔blocked / 级别变化 / 恢复); CDN 节点 (v2_name 含 cdn) 不发被墙通知, 反之恢复可达发解封通知; 流程日志 info 级不走 TG, portcheck 桶节流兜底 |
 | 换端口处置 | 节点端自动 (冷却 20h + 历史端口拉黑 + port-hop 区间/已监听规避) | 移交远程面板统一下发, 节点端不自愈 (must: 防单组误判触发破坏性重装) |
 
 ## 8. 开关 (~/.env)
@@ -157,8 +157,12 @@
 
 ## 10. 已知边界
 
-- 测的是节点真实 IP:PORT (非 CDN/中转入口); CDN 节点 origin 判定无意义
+- 测的是节点真实 IP:PORT (非 CDN/中转入口); CDN 节点 origin 被墙判定无意义
   (中央轮跳过; 节点推送照收, 判定侧按 v2_name 口径过滤).
+- 节点端 TG 同口径: `~/node.json` v2_name 含 cdn (xhttp-cdn / xhttp-cdn-hy2 等)
+  = 已知被墙 (套 CDN 前提就是 IP 被墙), 不发被墙通知 (blocked 是预期);
+  反之 CDN 节点检测到大陆恢复可达 → 发一次解封通知 (提示可换回直连),
+  持续可达不重发; 非直连节点保持 ok↔blocked 迁移通知不变.
 - 单探测点抖动可能造成单组误判 (电信仅 1-2 点) — 告警文案注明人工复核;
   节点端已不自动换端口, 单组误判最多产生一次迁移通知, 不会触发破坏性重装
   (处置决策集中在远程面板, 可结合丢包/连接数等多源证据后再下发).

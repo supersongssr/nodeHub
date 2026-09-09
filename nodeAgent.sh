@@ -6,7 +6,10 @@
 #       tcp.ping.pe 三网+厂商+海外对照, 交叉验证区分端口级/IP级封锁 — 不阻断主流程),
 #       跑完自动上报 ServerStatus (/ingest/tcping, 节点被墙判定主数据源);
 #       被墙处置 (换端口重装等) 由远程面板基于推送数据统一下发, 节点端不自愈换端口 (must),
-#       Telegram 通知仅在【被墙状态迁移】时发送一次 (详见 TcpingPortCheck)
+#       Telegram 通知仅在【被墙状态迁移】时发送一次 (详见 TcpingPortCheck);
+#       CDN 模式节点 (~/node.json v2_name 含 cdn, 如 xhttp-cdn / xhttp-cdn-hy2) 不发被墙通知
+#       (套 CDN 即已知 IP 被墙, IP 被墙则端口必被墙), 反之检测到大陆恢复可达时发一次解封通知
+#       (提示可换回直连, 与监控侧 "非CDN在线节点才判被墙 / CDN 只判解封" 口径对齐)
 # 约束: 严禁在节点端进行流量计算、单位换算或清零操作
 # ============================================================
 
@@ -787,6 +790,13 @@ TcpingPortCheck() {
     _tpc_prev=$(_PortCheckStateGet last_status)
     _tpc_prevlvl=$(_PortCheckStateGet last_notified_level)
 
+    # ── CDN 模式判定 (~/node.json v2_name 含 cdn, 如 xhttp-cdn / xhttp-cdn-hy2) ──
+    #    套 CDN = 已知节点 IP 被墙 (IP 被墙则端口必被墙), blocked 是预期 → 不发被墙 TG;
+    #    反之 CDN 模式下大陆恢复可达 = 解封信号 → 发一次解封通知 (提示可换回直连)
+    _tpc_v2name=$(jq -r '.v2_name // empty' ~/node.json 2>/dev/null || true)
+    _tpc_cdn=0
+    case "$_tpc_v2name" in *cdn*) _tpc_cdn=1 ;; esac
+
     # ── 结果留档 (每周期一行, 排障; 不轮转 — 单行 <200B, 每小时 1 行 ~1年 1.7MB) ──
     printf '%s %s:%s status=%s level=%s [%s]\n' \
         "$(date '+%F %T')" "${_tpc_ip:-?}" "${_tpc_port:-?}" \
@@ -819,32 +829,52 @@ TcpingPortCheck() {
         blocked)
             if [ "$_tpc_prev" != "blocked" ] || [ "$_tpc_prevlvl" != "$_tpc_level" ]; then
                 _PortCheckStateSet last_notified_level "$_tpc_level"
-                case "$_tpc_level" in
-                    port)
-                        log info "tcping 检测: NODE_PORT=${_tpc_port} 端口级封锁 (交叉验证 IP 未被墙) — 已上报面板, 换端口处置由远程统一下发"
-                        _tpc_act="■ 交叉验证: 随机新端口大陆可达 → 端口级封锁, IP 未被墙
+                if [ "$_tpc_cdn" = "1" ]; then
+                    # CDN 模式 = 已知被墙 (套 CDN 前提就是 IP 被墙), blocked 是预期 — 不发 TG
+                    # (与监控侧 block_notify "非CDN在线节点才判被墙" 口径对齐, 见 plans/tcping-check.md §6)
+                    log info "tcping 检测: NODE_PORT=${_tpc_port} 大陆全断, 节点为 CDN 模式 (v2_name=${_tpc_v2name}, 已知被墙) — 不发被墙通知, 恢复可达时发解封通知"
+                else
+                    case "$_tpc_level" in
+                        port)
+                            log info "tcping 检测: NODE_PORT=${_tpc_port} 端口级封锁 (交叉验证 IP 未被墙) — 已上报面板, 换端口处置由远程统一下发"
+                            _tpc_act="■ 交叉验证: 随机新端口大陆可达 → 端口级封锁, IP 未被墙
 ■ 处置: 已上报面板 (节点端不自动重装); 换端口重装由远程面板统一下发"
-                        ;;
-                    ip)
-                        log info "tcping 检测: NODE_PORT=${_tpc_port} 大陆组全断且交叉验证判定【IP 级被墙】— 换端口无效"
-                        _tpc_act="■ 交叉验证: 随机新端口大陆亦全断 → IP 级被墙
+                            ;;
+                        ip)
+                            log info "tcping 检测: NODE_PORT=${_tpc_port} 大陆组全断且交叉验证判定【IP 级被墙】— 换端口无效"
+                            _tpc_act="■ 交叉验证: 随机新端口大陆亦全断 → IP 级被墙
 ■ 处置: 已上报面板 (换端口无效, 建议套 CDN / 中转 / 联系机房换 IP)"
-                        ;;
-                    *)
-                        log info "tcping 检测: NODE_PORT=${_tpc_port} 大陆组全断, 交叉验证无定论 (${_tpc_level}) — 已上报面板, 下周期复验"
-                        _tpc_act="■ 交叉验证: 无定论 (临时端口被安全组拦 / 探测点不足 / NODE_TCPING_XCHECK=0)
+                            ;;
+                        *)
+                            log info "tcping 检测: NODE_PORT=${_tpc_port} 大陆组全断, 交叉验证无定论 (${_tpc_level}) — 已上报面板, 下周期复验"
+                            _tpc_act="■ 交叉验证: 无定论 (临时端口被安全组拦 / 探测点不足 / NODE_TCPING_XCHECK=0)
 ■ 处置: 已上报面板, 下周期自动复验"
-                        ;;
-                esac
-                _TcpingNotify "■ 被墙情况: NODE_PORT=${_tpc_port} 大陆探测存在全断组 (海外对照正常)
+                            ;;
+                    esac
+                    _TcpingNotify "■ 被墙情况: NODE_PORT=${_tpc_port} 大陆探测存在全断组 (海外对照正常)
   分网: ${_tpc_groups}
 ${_tpc_act}
 ■ 建议: 人工复核 https://tcp.ping.pe/${_tpc_ip}:${_tpc_port}"
+                fi
             fi
             ;;
         ok|partial)
-            # 恢复通知: 仅上次确为 blocked 时发一次 (状态迁移)
-            if [ "$_tpc_prev" = "blocked" ]; then
+            if [ "$_tpc_cdn" = "1" ]; then
+                # CDN 模式 + 大陆恢复可达 = 疑似解封: 套 CDN 即已知被墙, 现在通了 → 提示可换回直连
+                # 去重: 持续 ok/partial 不重发 (首次检测即 ok 也发 — CDN 节点理应被墙, 可达即异常信号)
+                case "$_tpc_prev" in
+                    ok|partial) ;;
+                    *)
+                        _PortCheckStateSet last_notified_level ""
+                        log info "tcping 检测: NODE_PORT=${_tpc_port} 大陆恢复可达且节点为 CDN 模式 (v2_name=${_tpc_v2name}) — 疑似解封, 通知换回直连"
+                        _TcpingNotify "🎉 节点疑似解封: NODE_PORT=${_tpc_port} 大陆 tcping 恢复可达 (status=${_tpc_status})
+当前为 CDN 模式 (v2_name=${_tpc_v2name}) — 套 CDN 即此前已知被墙, 现大陆直连恢复
+■ 建议: 可到面板换回直连模式恢复性能 (建议观察 1-2 个周期确认稳定再切换)
+分网: ${_tpc_groups}"
+                        ;;
+                esac
+            elif [ "$_tpc_prev" = "blocked" ]; then
+                # 恢复通知: 仅上次确为 blocked 时发一次 (状态迁移)
                 _PortCheckStateSet last_notified_level ""
                 log info "tcping 检测: NODE_PORT=${_tpc_port} 恢复可达 (status=${_tpc_status})"
                 _TcpingNotify "✅ 端口恢复: NODE_PORT=${_tpc_port} 大陆 tcping 重新可达 (status=${_tpc_status})
