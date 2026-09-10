@@ -136,7 +136,7 @@
 |---|---|---|
 | `NODE_TCPING_CHECK` | 1 | 0 关闭整个检测 (旧名 `NODE_PORT_BLOCK_CHECK=0` 兼容) |
 | `NODE_TCPING_XCHECK` | 1 | 0 关闭交叉验证 (block_level 恒 unknown → 面板无分级依据) |
-| `TCPING_API_URL` | https://probe.freessr.bid | 推送地址 (追加 /ingest/tcping) |
+| `TCPING_API_URL` | https://probe.freessr.bid:8443 | 推送地址 (追加 /ingest/tcping; nginx ingest vhost 仅监听 8443) |
 | `TCPING_PUSH` | 1 | 0 关闭结果推送 (默认开 — 运行完上报是默认行为) |
 | `TCPING_API_TOKEN` | (内置默认) | 推送 token (内置 [probe_ingest] 同款, 开箱即推; 仅换发 token 时覆盖) |
 

@@ -627,7 +627,7 @@ SyncSSL() {
 #   NODE_TCPING_CHECK=0         关闭整个检测 (默认开; 旧名 NODE_PORT_BLOCK_CHECK=0 兼容)
 #   NODE_TCPING_XCHECK=0        关闭交叉验证 (block_level 恒 unknown → 面板无端口级/IP级分级依据)
 #   TCPING_PUSH=0               关闭结果推送 (默认开 — must: 运行完上报 ServerStatus)
-#   TCPING_API_URL=https://probe.freessr.bid   推送 API 地址
+#   TCPING_API_URL=https://probe.freessr.bid:8443   推送 API 地址 (nginx ingest vhost 仅监听 8443)
 #   TCPING_API_TOKEN=...        推送 token (默认内置 [probe_ingest] 同款; 覆盖用)
 #
 # 状态: ~/nodeAgent.portcheck.state (key=value 行)
@@ -671,7 +671,9 @@ $1"
 _TCPING_DEF_TOKEN="9516f25b77c72cb3a757586ba28d78442fe87ccf32034f83"
 _TcpingPushOnce() {  # $1 = report JSON (单行); 成功 return 0
     _tp_tok="${TCPING_API_TOKEN:-${_TCPING_DEF_TOKEN}}"
-    _tp_url="${TCPING_API_URL:-https://probe.freessr.bid}/ingest/tcping"
+    # nginx probe-ingest vhost 仅监听 8443 (443 无 /ingest/ 路由 → 404):
+    #   https://probe.freessr.bid:8443/ingest/tcping
+    _tp_url="${TCPING_API_URL:-https://probe.freessr.bid:8443}/ingest/tcping"
     _tp_body=$(printf '{"token":"%s","node_id":"%s","report":%s}' \
         "$_tp_tok" "${node_id:-${NODE_ID:-}}" "$1")
     _tp_out=""

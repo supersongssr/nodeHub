@@ -1662,13 +1662,16 @@ def check_node_port_cn_tcping():
     node_port = resolve_node_port()
 
     # 目标 IP: NODE_TARGET_IP (第三方服务器上测别的节点; 最高优先, 不被 ~/.env 覆盖)
-    #   > 已加载的 node_ip > ~/node.json .node_ip > 公网探测 (探测的就是运行机自己)
+    #   > 已加载的 node_ip > ~/node.json .ip (注册响应原键; 兼容旧 .node_ip)
+    #   > 公网探测 (探测的就是运行机自己)
     from_detect = False
     host = (ENV.get('NODE_TARGET_IP') or '').strip() or (ENV.get('node_ip') or '').strip()
     if not host:
         nj = load_json_file(os.path.join(HOME, 'node.json'))
-        if isinstance(nj, dict) and nj.get('node_ip'):
-            host = str(nj['node_ip'])
+        if isinstance(nj, dict):
+            # node.json 为面板 /api/node/register 响应原文, IP 键名为 "ip";
+            # 兼容旧 .node_ip 键 (与 tcpingCheck.py resolve_target 同步修)
+            host = str(nj.get('ip') or nj.get('node_ip') or '').strip()
     if not host:
         host = _detect_public_ipv4()
         from_detect = bool(host)

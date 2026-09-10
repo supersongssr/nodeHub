@@ -526,7 +526,8 @@ def resolve_target(ip_arg: Optional[str], port_arg: Optional[int],
     """解析检测目标: (ip, port, stat_user, ip_source).
 
     优先级 (与 proxyDiagnose.py / proxyInstall.sh 同源):
-      IP   : --ip 参数 > ~/node.json .node_ip > ~/node.env node_ip= > 公网探测
+      IP   : --ip 参数 > ~/node.json .ip (面板注册响应原键; 兼容旧 .node_ip)
+             > ~/node.env node_ip= > 公网探测 (仅 IPv4)
              (★IPv4 优先 — stat_client 三网 ping 双栈优先 v6 是本检测存在的原因)
       PORT : --port 参数 > ~/node.json .node_port > ~/node.env node_port= > 443
       stat_user (推送/匹配身份): --stat-user 参数 > ~/node.stat_user >
@@ -539,7 +540,10 @@ def resolve_target(ip_arg: Optional[str], port_arg: Optional[int],
     ip = _norm_ip(ip_arg or "")
     ip_source = "arg"
     if not ip:
-        ip = _norm_ip(str(nj.get("node_ip") or ""))
+        # ~/node.json 是面板 /api/node/register 的响应原文, IP 键名为 "ip";
+        # 兼容旧部署可能残留的 .node_ip 键 (2026-09-10 前误读 node_ip 恒空,
+        # 双栈 v6 优先节点公网探测又只认 IPv4 → status=error 不推送, 面板无数据)
+        ip = _norm_ip(str(nj.get("ip") or nj.get("node_ip") or ""))
         ip_source = "node.json"
     if not ip:
         ip = _norm_ip(ne.get("node_ip") or "")
@@ -694,7 +698,7 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description="NODE_PORT 大陆 tcping 被墙检测 (tcp.ping.pe, 分三网+厂商+海外对照; "
                     "blocked 时交叉验证区分端口级/IP 级). 输出 JSON 到 stdout.")
-    p.add_argument("--ip", help="目标 IP (默认: ~/node.json node_ip > node.env > 公网探测, IPv4 优先)")
+    p.add_argument("--ip", help="目标 IP (默认: ~/node.json .ip > node.env node_ip= > 公网探测, IPv4 优先)")
     p.add_argument("--port", type=int, help="目标端口 (默认: ~/node.json node_port > 443)")
     p.add_argument("--stat-user", help="覆盖 stat_user (默认: ~/node.stat_user > node.json > md5(ip))")
     p.add_argument("--xcheck", choices=["auto", "always", "never"], default="auto",
