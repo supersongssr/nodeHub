@@ -1464,6 +1464,54 @@ def _read_proc(path):
 # NODE_PORT 对外可达性 — 端口监听 ≠ 外部可访问
 #   端口若只 bind 127.0.0.1/::1, 本地 ss 显示"在监听"但外部客户端永远连不上。
 # ============================================================
+def _ephemeral_port_range():
+    """内核临时端口段 (出站 UDP 会话 socket 的本地端口分布区间)"""
+    try:
+        with open('/proc/sys/net/ipv4/ip_local_port_range') as fh:
+            lo, hi = fh.read().split()[:2]
+            return int(lo), int(hi)
+    except (OSError, ValueError, IndexError):
+        return 32768, 60999
+
+
+def _udp_session_socket(line, declared_udp):
+    """判断 ss 行是否为 xray/nginx 的【出站 UDP 会话 socket】而非服务监听。
+    背景: ss 对 UDP 无 LISTEN 语义 (一律 UNCONN) —— xray freedom/XUDP 为每个用户
+    UDP 流 (DNS/NTP/QUIC 转发) 开一个本地 socket, 端口由内核从临时端口段随机分配,
+    随流量开关漂移; `ss -tulnp` 会把它们一并列出, 极易误读成"监听了几十个端口"。
+    判定: udp UNCONN + 属主 xray/nginx + 本地端口在临时端口段内 + 不在配置声明端口中。"""
+    parts = line.split()
+    if len(parts) < 5 or parts[0] != 'udp' or parts[1] != 'UNCONN':
+        return False
+    if not re.search(r'users:.+"(xray|nginx)"', line):
+        return False
+    port = parts[4].rsplit(':', 1)[-1]
+    if not port.isdigit():
+        return False
+    lo, hi = _ephemeral_port_range()
+    return lo <= int(port) <= hi and int(port) not in declared_udp
+
+
+def _xray_nginx_public_listen(proto_filter=None):
+    """xray/nginx 对外 (非环回) 真实监听地址列表 — 剔除出站 UDP 会话 socket。
+    proto_filter: None=全部 | 'tcp'=仅 TCP LISTEN (服务端口, 喂给 tcping 前置提示)"""
+    declared = xray_declared_proto_ports() | nginx_declared_proto_ports()
+    declared_udp = {p for proto, p in declared if proto == 'udp'}
+    out = []
+    for line in ss_lines():
+        if not re.search(r'users:.+"(xray|nginx)"', line) \
+           or re.search(r'127\.0\.0\.1|::1', line):
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        if proto_filter == 'tcp' and not (parts[0] == 'tcp' and parts[1] == 'LISTEN'):
+            continue
+        if not _udp_session_socket(line, declared_udp):
+            out.append(parts[4])
+    return out
+
+
 def check_node_port_external():
     node_port = resolve_node_port()
     target_ip = (ENV.get('NODE_TARGET_IP') or '').strip()
@@ -1471,26 +1519,41 @@ def check_node_port_external():
         NET_PROBE['listen'] = 'skip'
         note(f'远程目标模式: NODE_TARGET_IP={target_ip} 非本机, 跳过 NODE_PORT 本机监听检查 (ss 只能看本机)')
         return
-    # 协议感知: NODE_PORT 可能承载 TCP 也可能 UDP (Hysteria2 直听), 双协议同查
+    # 协议感知: NODE_PORT 可能承载 TCP 也可能 UDP (Hysteria2 直听), 双协议同查。
+    # UDP 侧须剔除出站会话 socket (见 _udp_session_socket): 否则既会刷出几十个假
+    # "监听端口", 也可能在 node_port 恰落入临时端口段 (如 59424) 时被会话 socket 误判 PASS。
+    declared = xray_declared_proto_ports() | nginx_declared_proto_ports()
+    declared_udp = {p for proto, p in declared if proto == 'udp'}
     pat = re.compile(rf'[:.]{re.escape(node_port)}([^0-9]|$)')
-    listen = [l for l in ss_lines() if pat.search(l)]
+    listen = [l for l in ss_lines() if pat.search(l) and not _udp_session_socket(l, declared_udp)]
     if not listen:
-        actual = []
+        actual = []          # 真实对外监听 (TCP LISTEN / 非临时段或在配置中声明的 UDP)
+        udp_sessions = 0     # 出站 UDP 会话 socket 数量 (仅计数, 不列为监听端口)
         for line in ss_lines():
-            if re.search(r'users:.+"(xray|nginx)"', line) \
-               and not re.search(r'127\.0\.0\.1|::1', line):
-                parts = line.split()
-                if len(parts) >= 5:
-                    actual.append(parts[4])
+            if not re.search(r'users:.+"(xray|nginx)"', line) \
+               or re.search(r'127\.0\.0\.1|::1', line):
+                continue
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            if _udp_session_socket(line, declared_udp):
+                udp_sessions += 1
+            else:
+                actual.append(parts[4])
+        hints = []
         if actual:
-            hint = (f'实际对外监听端口: [{",".join(actual)}] —— ~/.env 的 NODE_PORT={node_port} '
-                    '疑似过期, 与实际不符 (重跑安装脚本会读到错误端口搞坏代理)')
-        else:
-            hint = 'xray/nginx 均未监听任何对外端口, 检查服务是否启动'
+            hints.append(f'实际对外监听端口: [{",".join(actual)}] —— ~/.env 的 NODE_PORT={node_port} '
+                         '疑似过期, 与实际不符 (重跑安装脚本会读到错误端口搞坏代理)')
+        elif udp_sessions == 0:
+            hints.append('xray/nginx 均未监听任何对外端口, 检查服务是否启动')
+        if udp_sessions:
+            hints.append(f'另检测到 {udp_sessions} 个 xray 出站 UDP 会话 socket (用户 DNS/NTP/QUIC 流量转发, '
+                         f'端口为内核临时段 {"-".join(map(str, _ephemeral_port_range()))} 随机分配、随时开关) '
+                         '—— 非服务监听, 勿当作端口配置依据')
         NET_PROBE['listen'] = 'fail'
         result('FAIL', 'NODE_PORT_NOT_LISTENING',
                f'NODE_PORT={node_port} (TCP/UDP 均无监听) → 外部无法连接',
-               hint + '。核对 ~/.env / node.json / node.env 的 NODE_PORT 与实际配置一致')
+               '。'.join(hints) + '。核对 ~/.env / node.json / node.env 的 NODE_PORT 与实际配置一致')
         return
     # 外部可达 = 存在非环回监听地址 (* / 0.0.0.0 / [::] / 公网IP)
     external = next((l.split()[4] for l in listen
@@ -1711,9 +1774,17 @@ def check_node_port_cn_tcping():
     # 前置 (仅本机目标): NODE_PORT 必须有 TCP 监听 (纯 UDP 端口 tcping 无意义;
     #   远程目标无法 ss, 端口实际未开时海外探测点也会失败 → PORT_UNREACHABLE 兜底)
     if is_local and not port_listening(node_port, tcp_only=True):
-        result('WARN', 'CN_TCPING_UDP_ONLY',
-               f'NODE_PORT={node_port} 无 TCP 监听 (疑似纯 UDP: Hysteria2 直听), 跳过大陆 tcping 被墙检测',
-               'tcping 只能测 TCP; UDP 端口的封锁需用户侧实测/抓包判断 (probeTask.sh 采集方向)')
+        tcp_ports = _xray_nginx_public_listen('tcp')
+        if tcp_ports:
+            result('WARN', 'CN_TCPING_UDP_ONLY',
+                   f'NODE_PORT={node_port} 无 TCP 监听, 跳过大陆 tcping 被墙检测',
+                   f'本机 xray/nginx 实际对外 TCP 监听: [{",".join(tcp_ports)}] —— NODE_PORT={node_port} '
+                   '疑似过期 (先核对 ~/.env / node.json / node.env); 若确为纯 UDP 端口 (Hysteria2 直听), '
+                   '其封锁需用户侧实测/抓包判断 (probeTask.sh 采集方向)')
+        else:
+            result('WARN', 'CN_TCPING_UDP_ONLY',
+                   f'NODE_PORT={node_port} 无 TCP 监听 (疑似纯 UDP: Hysteria2 直听), 跳过大陆 tcping 被墙检测',
+                   'tcping 只能测 TCP; UDP 端口的封锁需用户侧实测/抓包判断 (probeTask.sh 采集方向)')
         return
 
     tgt = f'[{host}]:{node_port}' if ':' in host else f'{host}:{node_port}'
