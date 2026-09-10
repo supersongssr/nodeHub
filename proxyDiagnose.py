@@ -1319,6 +1319,12 @@ def check_nginx():
 # ============================================================
 # 网络与防火墙 (net)
 # ============================================================
+# NW9/NW10 实测结论暂存 — 供 NW11 云安全组分级提示 (代替原 NW5 无条件 WARN):
+#   listen:   'ok'=对外监听正常 / 'fail'=本地未监听或仅环回 / 'skip'=远程目标模式 / None=未跑
+#   external: 'reachable'=全球探测点有通 / 'unreachable'=全球探测点全断 / None=跳过或服务不可用
+NET_PROBE = {'listen': None, 'external': None}
+
+
 def check_net():
     say('网络与防火墙 (iptables / ufw / firewalld / SELinux / conntrack / sysctl / NODE_PORT 对外可达与大陆 tcping)')
 
@@ -1359,9 +1365,8 @@ def check_net():
         elif se in ('Permissive', 'Disabled'):
             result('PASS', 'NET_SELINUX_OK', f'SELinux: {se}')
 
-    # NW5. 提示云安全组 (本地无法检测)
-    result('WARN', 'NET_SG_REMINDER', '云厂商安全组 (AWS SG / 阿里云安全组 / GCP 防火墙) 需在控制台单独放行端口',
-           '若本地端口监听正常但外部连不上, 99% 是云安全组未放行')
+    # NW5. 云安全组 — 原为无条件 WARN 提醒; 本地读不到云控制台, 无证据不该报警。
+    #   现按 NW9/NW10 实测结论分级, 判定逻辑移至本函数末尾 NW11。
 
     # NW6. conntrack 连接跟踪表 — 代理高并发的生命线
     #   真实故障 (2026-08-08, 103.173.155.212): nf_conntrack_max 默认 8192 多用户下
@@ -1432,6 +1437,20 @@ def check_net():
     # NW10. NODE_PORT 大陆 tcping 被墙检测
     check_node_port_cn_tcping()
 
+    # NW11. 云安全组分级提示 (接管原 NW5 的无条件 WARN):
+    #   只有「本地对外监听正常 (NW9) + 全球探测点含海外全断 (NW10)」才是安全组未放行
+    #   的实锤特征 → 升级 WARN; 其余 (外部可达 / 检测跳过 / 本地未监听另有 FAIL) 仅信息行。
+    if NET_PROBE['external'] == 'unreachable' and NET_PROBE['listen'] != 'fail':
+        result('WARN', 'NET_SG_SUSPECT',
+               '本地端口对外监听正常, 但全球探测点 (含海外) 全部连不上 → 高度疑似云安全组未放行',
+               '云厂商安全组 (AWS SG / 阿里云安全组 / GCP 防火墙) 需在控制台单独放行 NODE_PORT 对应端口; '
+               '本机侧再依次核对 NW1-NW3 (iptables/ufw/firewalld)')
+    elif NET_PROBE['external'] == 'reachable':
+        note('云安全组备忘: NODE_PORT 外部探测点可达 → 安全组已放行 (仅大陆不通属被墙, 与安全组无关, 见上方判定)')
+    else:
+        note('云安全组备忘: 云厂商安全组 (AWS SG / 阿里云安全组 / GCP 防火墙) 需在控制台单独放行端口; '
+             '本地无法检测, 本次无外部探测证据 (跳过/服务不可用), 不计 WARN')
+
 
 def _read_proc(path):
     try:
@@ -1449,6 +1468,7 @@ def check_node_port_external():
     node_port = resolve_node_port()
     target_ip = (ENV.get('NODE_TARGET_IP') or '').strip()
     if target_ip and f' {target_ip} ' not in f' {host_ips()} ':
+        NET_PROBE['listen'] = 'skip'
         note(f'远程目标模式: NODE_TARGET_IP={target_ip} 非本机, 跳过 NODE_PORT 本机监听检查 (ss 只能看本机)')
         return
     # 协议感知: NODE_PORT 可能承载 TCP 也可能 UDP (Hysteria2 直听), 双协议同查
@@ -1467,6 +1487,7 @@ def check_node_port_external():
                     '疑似过期, 与实际不符 (重跑安装脚本会读到错误端口搞坏代理)')
         else:
             hint = 'xray/nginx 均未监听任何对外端口, 检查服务是否启动'
+        NET_PROBE['listen'] = 'fail'
         result('FAIL', 'NODE_PORT_NOT_LISTENING',
                f'NODE_PORT={node_port} (TCP/UDP 均无监听) → 外部无法连接',
                hint + '。核对 ~/.env / node.json / node.env 的 NODE_PORT 与实际配置一致')
@@ -1476,11 +1497,13 @@ def check_node_port_external():
                      if len(l.split()) >= 5 and not re.match(r'^(127\.|\[?::1\])', l.split()[4])), '')
     if external:
         b = ','.join(sorted({f"{l.split()[0]}/{l.split()[4]}" for l in listen if len(l.split()) >= 5}))
+        NET_PROBE['listen'] = 'ok'
         result('PASS', 'NODE_PORT_EXTERNAL',
                f'NODE_PORT={node_port} 监听在对外地址 [{b}] (本机视角: 非仅 127.0.0.1)',
                'TCP/UDP 任一协议对外监听即通过 (Hysteria2 走 UDP); 仅证明本机已对外监听, '
                '外部(尤其大陆方向)实际可达性由下一条 tcping 分网检测判定, 两者结论可能相反')
     else:
+        NET_PROBE['listen'] = 'fail'
         result('FAIL', 'NODE_PORT_LOCALHOST_ONLY',
                f'NODE_PORT={node_port} 仅监听 127.0.0.1/::1 → 外部无法访问',
                'xray inbound 的 listen 留空或设 0.0.0.0; nginx listen 行去掉 127.0.0.1: 前缀')
@@ -1717,10 +1740,10 @@ def check_node_port_cn_tcping():
         return
 
     # 5) 判定 — 逐网展示阻断状态, 不笼统汇总
-    if ost > 0 and ok == 0:
+    if ok == 0 and cnok == 0:
         lvl, code = 'WARN', 'CN_TCPING_PORT_UNREACHABLE'
         title = f'{tgt} 端口本身不可达: 全球 {t} 个探测点全部失败'
-        detail = '全球 (含海外) 全断不是被墙的特征 → 先看 NW9 NODE_PORT_NOT_LISTENING / 云安全组 / 本机防火墙'
+        detail = '全球 (含海外) 全断不是被墙的特征 → 先看 NW9 NODE_PORT_NOT_LISTENING / 云安全组 / 本机防火墙 (下方 NW11 自动判定安全组嫌疑)'
     elif cnok == 0:
         lvl, code = 'FAIL', 'NODE_PORT_CN_BLOCKED'
         title = (f'NODE_PORT={node_port} 疑似被墙: 三网+云厂全断 (大陆 {cnfail}/{cn_cnt}), '
@@ -1745,6 +1768,9 @@ def check_node_port_cn_tcping():
         lvl, code = 'PASS', 'NODE_PORT_CN_OK'
         title = f'NODE_PORT={node_port} 未被墙: 三网+云厂全通 (大陆 {cn_cnt}/{cn_cnt}, 平均 {avg}ms)'
         detail = '大陆方向未被墙; 海外为对照 (海外正常 + 大陆全断 = 被墙特征)'
+
+    # 结论暂存供 NW11: 全球探测点 (含海外) 一个通的都没有 = 端口外部不可达
+    NET_PROBE['external'] = 'unreachable' if (ok == 0 and cnok == 0) else 'reachable'
 
     if not JSON_OUTPUT and (not QUIET or lvl != 'PASS'):
         print(f'{C_DIM}    ┌─ NODE_PORT={node_port} 分网 tcping 阻断明细 (状态 成功/总数){C_RESET}')
