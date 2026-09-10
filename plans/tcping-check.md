@@ -45,6 +45,16 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+检测目标 `<IP:PORT>` 解析优先级 (tcpingCheck.py `resolve_target`, 与 proxyDiagnose.py
+同源; nodeAgent 调用不带 `--ip/--port`, 全靠此默认链 — `~/node.json` 为面板
+`/api/node/register` 响应原文):
+
+- IP: `--ip` 参数 > `~/node.json` `.ip` (面板注册响应原键, 兼容旧部署残留
+  `.node_ip`) > `~/node.env` `node_ip=` > 公网探测 (仅 IPv4; ★IPv4 优先)
+- PORT: `--port` 参数 > `~/node.json` `.node_port` > `~/node.env` `node_port=` > 443
+- stat_user: `--stat-user` 参数 > 本地持久化 `stat_user` (`node.json` / `node.env` /
+  `~/node.stat_user`) > `md5(ip)` 兜底 (契约见 [`stat-ip-identity.md`](stat-ip-identity.md))
+
 ## 3. 判定口径 (与中央侧 cn_port_check.py 一致, 宁可漏报不可误报)
 
 | status | 条件 |
