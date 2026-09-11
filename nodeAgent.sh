@@ -1148,6 +1148,47 @@ PatchVisionUnrestrictCurve() {
     return 0
 }
 
+# ============================================================
+# 一次性补丁 (2026-09-11): tiktok 解锁出站密码更换
+#
+# 背景: tiktok 解锁中转站 (unlocktiktok.freessr.bid) 更换了 shadowsocks 密码,
+#   节点 outbounds 中该域名的出站仍持旧密码 fbiopenthedoor, 解锁链路失效。
+# 改造: /usr/local/etc/xray/config.json outbounds 中 address=unlocktiktok.freessr.bid
+#   出站 (settings.servers, 兼容 vnext/users) 的 password:
+#   fbiopenthedoor → aiopenthedoor, 重启 xray 生效。
+#
+# 脚本: patches/fix_tiktok_outbound_password.py (原生 python3, 标准库, 不依赖 jq)
+#   * 无该出站的节点脚本自身静默跳过并落标记
+#   * 幂等: 已是新密码 / 无目标出站 / 标记存在 均安全重入
+#   * 自带备份回滚 + xray -test 校验 + 重启验证 + Telegram 通知
+# 约束: 仅 2026-09-11 当天可执行 (脚本内部亦校验日期, 双重防护), 仅一次
+# ============================================================
+PatchTiktokOutboundPassword() {
+    # 一次性: 成功执行后才写 marker (下载/执行失败时下个周期重试);
+    # 脚本幂等 (已改过/无目标出站直接退出), 无需"先落标记防重入"
+    _marker="${HOME}/nodeAgent.tiktok-outbound-password.patch.done"
+    [ -f "$_marker" ] && return 0
+
+    if [ -z "${NODEHUB_URL:-}" ]; then
+        log debug "PatchTiktokOutboundPassword: NODEHUB_URL 未设置, 跳过"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        log warn "python3 不可用, 跳过 tiktok 出站密码更换补丁"
+        return 0
+    fi
+
+    _patch_url="${NODEHUB_URL}/patches/fix_tiktok_outbound_password.py"
+    log info "PatchTiktokOutboundPassword: 巡检 tiktok 解锁出站密码 (unlocktiktok.freessr.bid)"
+    # 子 shell 内 cd /tmp, 不污染主流程 cwd (与其它 Patch* 一致)
+    if ( cd /tmp && wget -N -T 30 "$_patch_url" 2>/dev/null && python3 fix_tiktok_outbound_password.py ); then
+        : > "$_marker"   # 成功才落标记 (脚本自身也写同名标记, 双保险)
+    else
+        log warn "PatchTiktokOutboundPassword: 下载/执行失败 — ${_patch_url} (将在下个周期重试)"
+    fi
+    return 0
+}
+
 RunPatches() {
     _today=$(date '+%Y-%m-%d')
     _today_num=$(date '+%Y%m%d')
@@ -1166,6 +1207,10 @@ RunPatches() {
     # 一次性 (仅 2026-09-03 当天): srp 面板 vision-curvePreferences 节点解除 PQ-only
     # 限制 (curvePreferences 追加 X25519 + v2_name → vision + 重启 xray)
     [ "$_today" = "2026-09-03" ] && PatchVisionUnrestrictCurve
+
+    # 一次性 (仅 2026-09-11 当天): tiktok 解锁出站 (unlocktiktok.freessr.bid)
+    # shadowsocks password: fbiopenthedoor → aiopenthedoor + 重启 xray
+    [ "$_today" = "2026-09-11" ] && PatchTiktokOutboundPassword
 
     return 0
 }
