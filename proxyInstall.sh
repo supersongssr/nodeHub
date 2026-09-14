@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.9.1-20260817"
+VERSION="v2.9.3-20260913"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -133,6 +133,9 @@ die() {
 # ============================================================
 OnError() {
     _exit_code=$?
+    # 安装器退出 (异常路径) — 清除运行标记, 通知 unlockCheck 可开始刷新配置
+    # (正常路径在 Main 收尾处清理; 标记残留也无害: PID 已死 → unlockCheck 直接继续)
+    rm -f /tmp/.nodehub_installer.running 2>/dev/null || true
     # die() 已通过 log error 推送过通知, 这里只负责退出, 不重复推送
     if [ -n "${_LAST_DIE_MSG:-}" ]; then
         exit "$_exit_code"
@@ -2191,15 +2194,77 @@ Step4_DeployCrontab() {
 }
 
 # ============================================================
+# Step 2.6: 缓存命中时同步补报解锁数据 (重装单次拉取优化)
+# 背景: 重装时 /tmp 下四份检测缓存若仍在, unlockCheck 无需重新探测
+#       (解析+上报仅数秒)。此时在 Step3 拉取 config 之前同步补报,
+#       面板先恢复 node_unlock, Step3 一次拉到含解锁路由的最终配置,
+#       无需 Step4.5 的二次拉取+重启 — 避免 config.json 拉两遍。
+# 缓存不完整 (全新安装) → 跳过, 走 Step4.5 异步闭环
+#   (bootstrap + closure 两次拉取, 非阻塞设计的固有代价)。
+# 三重回退 (均安全降级到异步闭环, 只是多拉一次):
+#   ① 下载失败  ② 脚本执行失败  ③ 上报响应无 "updated":[..."] 非空数组
+#   (防缓存存在但解析为空 → 面板 node_unlock 仍空 → 单次拉取丢失解锁路由)
+# 副作用: 置 _unlock_synced=true, 供 Step4_5 跳过异步闭环
+# ============================================================
+Step2_6_PreSyncUnlock() {
+    log info "Step 2.6: 检查解锁检测缓存 (命中则同步补报, 避免二次拉取配置)"
+
+    _all_cached=true
+    for _f in /tmp/media_unlock_clean.txt /tmp/media_check_clean.txt \
+              /tmp/check_google_scholar_unlock.json /tmp/notebooklm_check_result.json; do
+        [ -s "$_f" ] || { _all_cached=false; break; }
+    done
+
+    if [ "$_all_cached" != "true" ]; then
+        log info "解锁检测缓存不完整 (全新安装), 走 Step4.5 异步闭环"
+        return 0
+    fi
+
+    wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/unlockCheck.sh" \
+        || { log warn "unlockCheck.sh 下载失败, 回退 Step4.5 异步闭环"; return 0; }
+    chmod +x /tmp/unlockCheck.sh
+
+    log info "缓存命中, 同步补报解锁数据 (仅解析+上报, 数秒)..."
+    if ! UC_REPORT_ONLY=1 sh /tmp/unlockCheck.sh > /tmp/unlockCheck.out 2>&1; then
+        log warn "同步补报执行失败, 回退 Step4.5 异步闭环"
+        return 0
+    fi
+
+    # 校验上报确实携带了解锁数据 (响应含非空 updated 数组);
+    # 失败/空数据 → 面板 node_unlock 仍为空, 必须回退异步闭环重新拉取
+    if ! grep -q '"updated":\["' /tmp/unlockCheck.out; then
+        log warn "同步补报未携带解锁数据 (缓存可能已失效), 回退 Step4.5 异步闭环"
+        return 0
+    fi
+
+    _unlock_synced=true
+    log info "解锁数据已同步补报 — Step3 将一次拉到含解锁路由的最终配置 (单次拉取)"
+}
+
+# ============================================================
 # Step 4.5: 下载并后台启动 unlockCheck.sh
+# (缓存命中的重装已由 Step 2.6 同步补报, 此处跳过 — config.json 仅拉取一次)
 # ============================================================
 Step4_5_LaunchUnlockCheck() {
+    # Step 2.6 已同步补报 (缓存命中) → 无需异步闭环, 跳过二次拉取+重启
+    if [ "${_unlock_synced:-}" = "true" ]; then
+        log info "Step 4.5: 解锁数据已由 Step 2.6 同步补报, 跳过异步 unlockCheck (config.json 仅拉取一次)"
+        return 0
+    fi
+
     log info "Step 4.5: 下载并后台启动 unlockCheck.sh"
 
     wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/unlockCheck.sh" \
         || { log error "unlockCheck.sh 下载失败"; return 1; }
     chmod +x /tmp/unlockCheck.sh
     log info "unlockCheck.sh 已下载到 /tmp/"
+
+    # 安装器运行标记 — 必须在 nohup 之前写入 (避免 unlockCheck 启动瞬间读到"无标记")
+    # unlockCheck.sh 的 RefreshXrayConfig 会轮询本标记+PID, 等安装器完全退出后
+    # 才重拉 config/restart xray — 消除缓存命中秒级完成时与安装收尾
+    # (服务状态检查 systemctl is-active xray) 的竞态, 避免 Telegram 假警报。
+    # 清理: 正常路径 Main 收尾处 / 异常路径 OnError trap; 残留无害 (PID 已死)。
+    echo $$ > /tmp/.nodehub_installer.running
 
     nohup sh /tmp/unlockCheck.sh > /tmp/unlockCheck.out 2>&1 &
     _pid=$!
@@ -2292,6 +2357,7 @@ Main() {
     Step0_5_InstallServerStatus
     Step1_5_DownloadSSL
     Step2_5_InstallAriaNg
+    Step2_6_PreSyncUnlock
     Step3_InstallNginx
     Step3_InstallXray
     Step3_5_SetupHy2PortHop
@@ -2340,6 +2406,10 @@ Main() {
         [ "$_nginx_status" != "active" ] && log error "服务状态: nginx=${_nginx_status}"
         [ "$_stat_status" != "active" ]  && log error "服务状态: stat_client=${_stat_status}"
     fi
+
+    # 安装器即将正常退出 — 清除运行标记, 通知 unlockCheck 可开始刷新配置
+    # (异常路径由 OnError trap 兜底; 标记残留无害: unlockCheck 见死 PID 直接继续)
+    rm -f /tmp/.nodehub_installer.running 2>/dev/null || true
 
     # 安装成功，清除 EXIT trap
     trap - EXIT
