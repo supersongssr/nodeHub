@@ -27,7 +27,7 @@
 │      └ 交叉验证(blocked时): 本机随机开临时端口再测一轮          │
 │           → block_level = port(端口级,IP未墙)★ / ip(IP级) /     │
 │                         unknown(无定论,绝不误判)   (must)      │
-│ 3. 推送 POST /ingest/tcping (token 内置默认开箱即推, 失败重试 │
+│ 3. 推送 POST /api/v1/status/tcping (MONITOR_URL/KEY Bearer, 失败重试 │
 │    1 次; must: 运行完上报是默认行为)                          │
 │ 4. 处置: 节点端不自愈 — 换端口重装等由远程面板基于推送数据      │
 │    统一下发 (must: 决策集中在远程, 防单组误判触发破坏性重装)    │
@@ -36,7 +36,7 @@
 └────────────────────────┬───────────────────────────────────────┘
                          ▼
 ┌─ ServerStatus-Rust-Moniter ────────────────────────────────────┐
-│ POST /ingest/tcping  接收+校验+入库 tcping_report 表            │
+│ POST /api/v1/status/tcping  接收+校验+入库 tcping_report 表      │
 │   匹配: stat_user(=md5(IP), nodes_meta.name) > ip(ip_to_name)   │
 │ 判定 (must: tcping 为主, stats.json 丢包为辅, 并集取被墙):      │
 │   被墙 = tcping.status==blocked ∪ 三网丢包全部>70%              │
@@ -92,23 +92,24 @@
 
 ## 5. 推送 API 契约
 
-`POST /ingest/tcping` (ServerStatus-Rust-Moniter, token 鉴权, 不走 JWT):
+`POST ${MONITOR_URL}/api/v1/status/tcping` (ServerStatus-Rust-Moniter, Bearer 鉴权 —
+`Authorization: Bearer ${MONITOR_KEY}`, 地址/密钥取 ~/.env `MONITOR_URL`/`MONITOR_KEY`;
+旧 `/ingest/tcping` body-token 垫片已 deprecated [Sunset 2026-09-29], 详见 docs/BLOCK_API.md):
 
 ```json
-{"token": "...", "node_id": "42",
- "report": {"ts": 1690000000, "ip": "1.2.3.4", "port": 443,
+{"report": {"ts": 1690000000, "ip": "1.2.3.4", "port": 443,
             "stat_user": "<md5(ip) 32hex 或固定 STAT_USER>",
             "status": "blocked", "block_level": "port",
             "blocked_isps": ["ct","cu","cm","vendor"],
             "groups": {"ct": {"ok":0,"total":2}, "...": {}, "os": {"ok":149,"total":150}},
-            "agent": "tcpingCheck.py 1.0 (nodeHub)"}}}
+            "agent": "tcpingCheck.py 1.0 (nodeHub)"}}
 ```
 
 - **匹配** (must: STAT_USER 或 IP): ① `stat_user` → `nodes_meta.name` 精确
   (动态节点 stats.json name = stat_user); ② `ip` → `build_ip_to_name_map()`
   (nodes_meta.ip + admin ip_info.query).
-- **鉴权**: `token` = `[probe_ingest].token` (静态) 或 api_tokens
-  (scope=ingest/tcping); 节点侧经 `~/.env` 的 `TCPING_API_TOKEN` 配置.
+- **鉴权**: `Authorization: Bearer <MONITOR_KEY>` (monitor `[api.tokens]`,
+  有效即全权); 节点侧经 `~/.env` 的 `MONITOR_URL`/`MONITOR_KEY` 配置.
 - **防滥用**: 同 stat_user 60s 内重复上报去重; nginx limit_req (probe 域名)
   复用 ingest 限流; 字段白名单校验 (ip/port/枚举/非负整数).
 - **落库**: `tcping_report` 表 (PK stat_user+ts), 保留 30 天;
@@ -146,9 +147,9 @@
 |---|---|---|
 | `NODE_TCPING_CHECK` | 1 | 0 关闭整个检测 (旧名 `NODE_PORT_BLOCK_CHECK=0` 兼容) |
 | `NODE_TCPING_XCHECK` | 1 | 0 关闭交叉验证 (block_level 恒 unknown → 面板无分级依据) |
-| `TCPING_API_URL` | https://probe.freessr.bid:8443 | 推送地址 (追加 /ingest/tcping; nginx ingest vhost 仅监听 8443) |
+| `MONITOR_URL` | (无 → 回退旧 /ingest/tcping) | 推送地址 (追加 /api/v1/status/tcping) |
 | `TCPING_PUSH` | 1 | 0 关闭结果推送 (默认开 — 运行完上报是默认行为) |
-| `TCPING_API_TOKEN` | (内置默认) | 推送 token (内置 [probe_ingest] 同款, 开箱即推; 仅换发 token 时覆盖) |
+| `MONITOR_KEY` | (无 → 回退旧垫片) | 推送 Bearer 密钥 (monitor [api.tokens]; 与 MONITOR_URL 齐备才走新路径) |
 
 ## 9. 部署 / 灰度步骤
 
@@ -158,9 +159,9 @@
    或 `./run token-create --scopes tcping` 另发.
 2. **nodeHub → NODEHUB_URL 主机**: 上传 `nodeAgent.sh` + `tcpingCheck.py`
    (节点 SelfUpdate 自动拉新 nodeAgent; tcpingCheck.py 每周期 wget -N).
-3. **节点 ~/.env 无需必改**: 推送 token 内置默认 (与 ServerStatus
-   [probe_ingest].token 同款), 上传脚本后即开即推; 仅 ServerStatus 侧换发
-   token 时才需在 ~/.env 覆盖 TCPING_API_TOKEN (或 TCPING_PUSH=0 关闭推送).
+3. **节点 ~/.env**: 配置 `MONITOR_URL` + `MONITOR_KEY` 即走新路径
+   (Bearer 鉴权); 未配置的节点自动回退旧 /ingest/tcping 垫片 (内置默认
+   token, Sunset 2026-09-29 前可用), 迁完删垫片 (或 TCPING_PUSH=0 关闭推送).
 4. 灰度验证: 首个节点跑 `sh ~/nodeAgent.sh` 后看 `~/nodeAgent.tcping.log` +
    监控侧 `GET /api/v1/cn-port-block` 的 `node_reports` + 页面 /cnport.html
    第二张表; `./run tcping <ip:port>` 可从监控侧独立复核.

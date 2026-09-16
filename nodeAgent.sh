@@ -4,7 +4,7 @@
 # 职责: 采集网卡原始 rx/tx 字节数 + 服务器运行时间 + vnstat 7日流量历史，上报至面板;
 #       每周期 (小时) 后台异步检测 node_port 大陆 tcping 是否被墙 (借 tcpingCheck.py 模块,
 #       tcp.ping.pe 三网+厂商+海外对照, 交叉验证区分端口级/IP级封锁 — 不阻断主流程),
-#       跑完自动上报 ServerStatus (/ingest/tcping, 节点被墙判定主数据源);
+#       跑完自动上报 ServerStatus (POST /api/v1/status/tcping, 节点被墙判定主数据源);
 #       被墙处置 (换端口重装等) 由远程面板基于推送数据统一下发, 节点端不自愈换端口 (must),
 #       Telegram 通知仅在【被墙状态迁移】时发送一次 (详见 TcpingPortCheck);
 #       CDN 模式节点 (~/node.json v2_name 含 cdn, 如 xhttp-cdn / xhttp-cdn-hy2) 不发被墙通知
@@ -612,8 +612,8 @@ SyncSSL() {
 #          block_level 端口级(port) / IP级(ip) / unknown / none —— 交叉验证:
 #                      本机随机开临时端口再测一轮 (仅节点端能做), 区分
 #                      【仅端口被墙(换端口可救)】vs【IP 整段被墙(换端口无效)】(must)
-#     3. 结果推送 ServerStatus-Rust-Moniter POST /ingest/tcping (token 鉴权, 开箱即推;
-#          ~/.env TCPING_API_TOKEN 可覆盖内置默认; 通过 stat_user (md5(IP) 契约,
+#     3. 结果推送 ServerStatus-Rust-Moniter POST /api/v1/status/tcping (Bearer 鉴权;
+#          地址/密钥取 ~/.env MONITOR_URL / MONITOR_KEY; 通过 stat_user (md5(IP) 契约,
 #          见 plans/stat-ip-identity.md) 或 ip 匹配节点; TCPING_PUSH=0 可关闭);
 #     4. 被墙处置 (换端口重装等) 不在节点端执行 (must: 处置决策与执行集中在
 #          远程面板, 基于推送数据统一下发; 节点端检测/推送/通知后即收工 —
@@ -627,8 +627,9 @@ SyncSSL() {
 #   NODE_TCPING_CHECK=0         关闭整个检测 (默认开; 旧名 NODE_PORT_BLOCK_CHECK=0 兼容)
 #   NODE_TCPING_XCHECK=0        关闭交叉验证 (block_level 恒 unknown → 面板无端口级/IP级分级依据)
 #   TCPING_PUSH=0               关闭结果推送 (默认开 — must: 运行完上报 ServerStatus)
-#   TCPING_API_URL=https://probe.freessr.bid:8443   推送 API 地址 (nginx ingest vhost 仅监听 8443)
-#   TCPING_API_TOKEN=...        推送 token (默认内置 [probe_ingest] 同款; 覆盖用)
+#   MONITOR_URL=https://monitor.freessr.bid:8443  推送 API 地址 (monitor FastAPI, Bearer 鉴权)
+#   MONITOR_KEY=ssr_live_...   推送 Bearer 密钥 (monitor [api.tokens]); 两者未配置时
+#                               回退旧 /ingest/tcping body-token 垫片 [Sunset 2026-09-29]
 #
 # 状态: ~/nodeAgent.portcheck.state (key=value 行)
 #   date/attempts   探测服务 (tcp.ping.pe) 连续异常止损 — 当日 ≥3 次则当日收工
@@ -662,35 +663,64 @@ IP: $(_TgNodeIp)
 $1"
 }
 
-# ---- 检测结果推送 ServerStatus-Rust-Moniter (POST /ingest/tcping) ----
-# payload: {"token": ..., "node_id": ..., "report": <tcpingCheck.py 输出>}
-# 鉴权 token 优先级: ~/.env TCPING_API_TOKEN > 内置默认 (与 ServerStatus
-#   [probe_ingest].token 一致 — 开箱即推, must: 运行完上报是默认行为;
-#   ServerStatus 侧换发 token 时改 ~/.env 覆盖即可, 无需更新脚本)
+# ---- 检测结果推送 ServerStatus-Rust-Moniter (POST /api/v1/status/tcping) ----
+# 新路径 (稳定契约, 见 ServerStatus-Rust-Moniter docs/BLOCK_API.md):
+#   * 地址:  ${MONITOR_URL}/api/v1/status/tcping  (~/.env MONITOR_URL)
+#   * 鉴权: Authorization: Bearer ${MONITOR_KEY}  (~/.env MONITOR_KEY —
+#     monitor [api.tokens] 台账 token, 有效即全权, 见 docs/AUTH.md)
+#   * body: {"report": <tcpingCheck.py 输出>} — 不再携带 token/node_id 字段;
+#     节点匹配走 report 内 stat_user (md5(IP) 契约) > ip, 与旧接口一致
+#   * 响应 {"ok":true,...}; 同节点 60s 内重复上报去重 (deduped=true 亦为成功)
+#   * TLS: monitor 8443 服务内部自签证书 (issuer CN=ca-CN, 非公开 CA) →
+#     curl -k / wget --no-check-certificate 跳过链校验 (传输仍加密;
+#     身份鉴别由 Bearer key 应用层鉴权承担, 与仓库内其它内网端点同口径)
+# 兼容回退: ~/.env 未配置 MONITOR_URL/MONITOR_KEY 时走旧 /ingest/tcping 垫片
+#   (body token 自鉴权: TCPING_API_TOKEN > 内置默认; monitor 侧已 deprecated,
+#    Sunset 2026-09-29 — 节点 ~/.env 补上两键即自动切新路径, 迁完删垫片)
 # 开关: TCPING_PUSH=0 整体关闭推送 (本地检测/通知不受影响)
 _TCPING_DEF_TOKEN="9516f25b77c72cb3a757586ba28d78442fe87ccf32034f83"
 _TcpingPushOnce() {  # $1 = report JSON (单行); 成功 return 0
-    _tp_tok="${TCPING_API_TOKEN:-${_TCPING_DEF_TOKEN}}"
-    # nginx probe-ingest vhost 仅监听 8443 (443 无 /ingest/ 路由 → 404):
-    #   https://probe.freessr.bid:8443/ingest/tcping
-    _tp_url="${TCPING_API_URL:-https://probe.freessr.bid:8443}/ingest/tcping"
-    _tp_body=$(printf '{"token":"%s","node_id":"%s","report":%s}' \
-        "$_tp_tok" "${node_id:-${NODE_ID:-}}" "$1")
     _tp_out=""
-    if command -v curl >/dev/null 2>&1; then
-        _tp_out=$(curl -sS -m 20 -H 'Content-Type: application/json' \
-            -d "$_tp_body" "$_tp_url" 2>/dev/null) || true
-    elif command -v wget >/dev/null 2>&1; then
-        _tp_out=$(wget -qO- -T 20 \
-            --header='Content-Type: application/json' \
-            --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || true
+    if [ -n "${MONITOR_URL:-}" ] && [ -n "${MONITOR_KEY:-}" ]; then
+        # 新路径: Bearer 头鉴权, body 仅 {"report": ...}
+        _tp_url="${MONITOR_URL%/}/api/v1/status/tcping"
+        _tp_body=$(printf '{"report":%s}' "$1")
+        if command -v curl >/dev/null 2>&1; then
+            _tp_out=$(curl -sS -m 20 -k \
+                -H 'Content-Type: application/json' \
+                -H "Authorization: Bearer ${MONITOR_KEY}" \
+                -d "$_tp_body" "$_tp_url" 2>/dev/null) || true
+        elif command -v wget >/dev/null 2>&1; then
+            _tp_out=$(wget -qO- -T 20 --no-check-certificate \
+                --header='Content-Type: application/json' \
+                --header="Authorization: Bearer ${MONITOR_KEY}" \
+                --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || true
+        else
+            return 1
+        fi
     else
-        return 1
+        # 旧路径垫片 (deprecated, Sunset 2026-09-29): body token 自鉴权
+        _tp_tok="${TCPING_API_TOKEN:-${_TCPING_DEF_TOKEN}}"
+        # nginx probe-ingest vhost 仅监听 8443 (443 无 /ingest/ 路由 → 404):
+        #   https://probe.freessr.bid:8443/ingest/tcping
+        _tp_url="${TCPING_API_URL:-https://probe.freessr.bid:8443}/ingest/tcping"
+        _tp_body=$(printf '{"token":"%s","node_id":"%s","report":%s}' \
+            "$_tp_tok" "${node_id:-${NODE_ID:-}}" "$1")
+        if command -v curl >/dev/null 2>&1; then
+            _tp_out=$(curl -sS -m 20 -H 'Content-Type: application/json' \
+                -d "$_tp_body" "$_tp_url" 2>/dev/null) || true
+        elif command -v wget >/dev/null 2>&1; then
+            _tp_out=$(wget -qO- -T 20 \
+                --header='Content-Type: application/json' \
+                --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || true
+        else
+            return 1
+        fi
     fi
     case "$_tp_out" in
         *'"ok":true'*) return 0 ;;
         '') return 1 ;;
-        *)  log debug "tcping 推送响应异常: $(printf '%s' "$_tp_out" | head -c 160)"
+        *)  log debug "tcping 推送响应异常 (${_tp_url}): $(printf '%s' "$_tp_out" | head -c 160)"
             return 1 ;;
     esac
 }
@@ -904,7 +934,7 @@ ${_tpc_act}
 #   RunPatches 等后续步骤被阻塞)。
 # 做法: 检测整体丢进后台 subshell (输出仍落 ~/nodeLogs), 主流程立即返回;
 #   SubmitStatus 状态上报等主任务先行完成, 检测在后台跑完后自行上报
-#   ServerStatus (/ingest/tcping) 并发被墙状态迁移通知。
+#   ServerStatus (/api/v1/status/tcping) 并发被墙状态迁移通知。
 # 并发防护 (pid 锁 ~/nodeAgent.tcping.pid):
 #   · 上一轮仍在运行 (pid 存活 且 锁文件 <30min) → 本轮跳过
 #     (防状态文件并发写; 正常一轮 ≤7min << 1h 周期, 仅探测挂死叠加时触发)
