@@ -1687,8 +1687,8 @@ Step3_InstallXray() {
 
     xray_bin_name=""
     case "${API_PANEL}" in
-        ssp) xray_bin_name="xray-plugin-ssp-v26.6.27" ;;
-        srp) xray_bin_name="xray-plugin-srp-v26.6.27" ;;
+        ssp) xray_bin_name="xray-plugin-api-v26.8.21" ;;
+        srp) xray_bin_name="xray-plugin-api-v26.8.21" ;;
     esac
     xray_bin_path="/usr/local/bin/xray"
 
