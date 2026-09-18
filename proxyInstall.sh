@@ -1457,7 +1457,9 @@ Step0_5_InstallServerStatus() {
         _stat_svc=/etc/systemd/system/stat_client.service
         _stat_idem=true
         grep -q -- "-u ${_stat_u} " "$_stat_svc" 2>/dev/null || _stat_idem=false
-        grep -q -- "--alias ${node_name}" "$_stat_svc" 2>/dev/null || _stat_idem=false
+        # --alias 尾随空格锚定 (alias 后必跟 " --interval"): 防新名是旧名子串时误判未变化
+        # (旧值 --alias us-2 会被无锚定的 "--alias us" 命中, 改名不生效)
+        grep -q -- "--alias ${node_name} " "$_stat_svc" 2>/dev/null || _stat_idem=false
         if [ -n "${STAT_GID:-}" ]; then
             # group 模式: service 必须携带当前 -g ${STAT_GID}
             grep -q -- "-g ${STAT_GID} " "$_stat_svc" 2>/dev/null || _stat_idem=false

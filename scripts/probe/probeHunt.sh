@@ -29,7 +29,14 @@ plog() {
     printf '%s [hunt] %s\n' "$_ts" "$*"
 }
 
+# 动态节点判定 — 与 probeTask.sh IsDynamicNode 同规则:
+#   node_class 字段存在 → 按值权威判定; 缺失时兕底 stat_client -g 标记
+#   ★固定节点 (node_class=static) 即使 service 残留 -g 也不采集
 IsDynamicNode() {
+    if [ -f ~/node.env ] && grep -q '^node_class=' ~/node.env 2>/dev/null; then
+        grep -q '^node_class="*dynamic"*' ~/node.env 2>/dev/null && return 0
+        return 1
+    fi
     _svc=/etc/systemd/system/stat_client.service
     [ -f "$_svc" ] || return 1
     grep -qE -- '( -g |--group )' "$_svc" 2>/dev/null
