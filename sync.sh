@@ -11,6 +11,10 @@
 # [必填] Telegram 通知
 #   TG_BOT_TOKEN  — Telegram Bot Token
 #   TG_CHAT_ID    — Telegram Chat ID
+# [可选] 监控 CA 同步源 (nodeAgent tcping 推送 TLS 验证用)
+#   MONITOR_CA_URL — 监控内部 CA PEM 下载地址; 配置后自动拉取到
+#                   ${NODEHUB_DIR}/certs/monitor-ca.pem 供节点拉取验证,
+#                   未配置时需人工放置该文件 (缺失则节点推送门禁拒推)
 # ============================================================
 
 set -eu
@@ -71,6 +75,7 @@ Init() {
     Log "=== 初始化 ==="
     mkdir -p "${NODEHUB_DIR}/geodat"
     mkdir -p "${NODEHUB_DIR}/xray"
+    mkdir -p "${NODEHUB_DIR}/certs"
     mkdir -p "${NODEHUB_DIR}/logs"
 
     # 安装 crontab: 每晚 03:00 运行自身 (幂等: 先删旧条目再追加)。
@@ -156,6 +161,36 @@ SyncXray() {
 }
 
 # ============================================================
+# Step 3: 监控 CA 证书同步 (nodeAgent tcping 推送 TLS 验证用)
+# 说明: monitor 8443 内部自签 CA (issuer CN=ca-CN, 非公开 CA); 节点端每
+#       周期从 ${NODEHUB_URL}/certs/monitor-ca.pem 拉取做 --cacert 链校验.
+#       来源二选一: .env MONITOR_CA_URL (本步骤自动拉取) 或人工将 PEM 放
+#       到 ${NODEHUB_DIR}/certs/monitor-ca.pem. 两者皆无时仅记日志跳过
+#       (不置败 — 不阻断 GeoData/Xray 同步; 节点端门禁会自行 TG 告警).
+# ============================================================
+SyncMonitorCa() {
+    Log "=== 同步监控 CA 证书 ==="
+    mkdir -p "${NODEHUB_DIR}/certs"
+    if [ -n "${MONITOR_CA_URL:-}" ]; then
+        _ca_tmp="${NODEHUB_DIR}/certs/monitor-ca.pem.tmp.$$"
+        if wget -q -T 120 -O "${_ca_tmp}" "${MONITOR_CA_URL}" \
+           && [ "$(head -n 1 "${_ca_tmp}" 2>/dev/null)" = "-----BEGIN CERTIFICATE-----" ]; then
+            mv -f "${_ca_tmp}" "${NODEHUB_DIR}/certs/monitor-ca.pem"
+            Log "监控 CA: 已同步 → ${NODEHUB_DIR}/certs/monitor-ca.pem"
+        else
+            rm -f "${_ca_tmp}"
+            Log "监控 CA: 下载失败或非 PEM (${MONITOR_CA_URL})"
+            _sync_ok=0
+        fi
+    fi
+    if [ -s "${NODEHUB_DIR}/certs/monitor-ca.pem" ]; then
+        Log "监控 CA: ${NODEHUB_DIR}/certs/monitor-ca.pem 就绪 (节点端可验证推送 TLS)"
+    else
+        Log "监控 CA: ${NODEHUB_DIR}/certs/monitor-ca.pem 不存在且未配 MONITOR_CA_URL — 跳过 (节点推送将因 CA 缺失被门禁拒推)"
+    fi
+}
+
+# ============================================================
 # 主流程
 # ============================================================
 # _sync_ok: 跨步骤成败汇总标志 (1=全部成功), SyncGeoData / SyncXray 任一失败置 0
@@ -164,6 +199,7 @@ _sync_ok=1
 Init
 SyncGeoData
 SyncXray
+SyncMonitorCa
 if [ "$_sync_ok" -eq 1 ]; then
     NotifyTG "sync 完成"
 else

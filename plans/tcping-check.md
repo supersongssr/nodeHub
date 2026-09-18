@@ -110,6 +110,13 @@
   (nodes_meta.ip + admin ip_info.query).
 - **鉴权**: `Authorization: Bearer <MONITOR_KEY>` (monitor `[api.tokens]`,
   有效即全权); 节点侧经 `~/.env` 的 `MONITOR_URL`/`MONITOR_KEY` 配置.
+- **传输** (must: https + CA 验证): `MONITOR_URL` 强制 `https://` — 非 https
+  门禁拒推 + TG 告警 (curl/wget 对无 scheme URL 默认按明文 HTTP 处理, 全权
+  Bearer 密钥禁止裸奔上链路); TLS 证书经监控内部 CA (issuer CN=ca-CN) 验证
+  (`curl --cacert` / `wget --ca-certificate`, 不再 `-k` 跳过校验 — 否则 MITM
+  可自签证书截获全权密钥/伪造被墙报告触发误重装). CA 取 `~/.env MONITOR_CA`
+  显式路径, 缺省每周期自 `${NODEHUB_URL}/certs/monitor-ca.pem` 自动拉取
+  (wget -N); CA 缺失/不可读/校验失败 → 同门禁拒推 (迁移时 TG 告警一次).
 - **防滥用**: 同 stat_user 60s 内重复上报去重; nginx limit_req (probe 域名)
   复用 ingest 限流; 字段白名单校验 (ip/port/枚举/非负整数).
 - **落库**: `tcping_report` 表 (PK stat_user+ts), 保留 30 天;
@@ -147,25 +154,33 @@
 |---|---|---|
 | `NODE_TCPING_CHECK` | 1 | 0 关闭整个检测 (旧名 `NODE_PORT_BLOCK_CHECK=0` 兼容) |
 | `NODE_TCPING_XCHECK` | 1 | 0 关闭交叉验证 (block_level 恒 unknown → 面板无分级依据) |
-| `MONITOR_URL` | (无 → 不推送) | 推送地址 (追加 /api/v1/status/tcping) |
+| `MONITOR_URL` | (无 → 不推送) | 推送地址 (追加 /api/v1/status/tcping; **必须 `https://` 开头** — 非 https 门禁拒推 + TG 告警) |
 | `TCPING_PUSH` | 1 | 0 关闭结果推送 (默认开 — 运行完上报是默认行为) |
 | `MONITOR_KEY` | (必配, 缺一不推送) | 推送 Bearer 密钥 (monitor [api.tokens]; 与 MONITOR_URL 齐备才推送) |
+| `MONITOR_CA` | (自动拉取) | 监控内部 CA pem 路径 (推送 TLS 验证); 缺省每周期自 `${NODEHUB_URL}/certs/monitor-ca.pem` 拉取 (wget -N), 不可用时门禁拒推 + TG 告警 |
 
 ## 9. 部署 / 灰度步骤
 
-1. **ServerStatus-Rust-Moniter** (监控侧): 拉取本变更 → `./run restart`
-   (新表 tcping_report 由 init_db 自动建; `POST /ingest/tcping` 即刻可用;
-   block_notify 并集判定随 cron 生效). token 复用既有 `[probe_ingest].token`
-   或 `./run token-create --scopes tcping` 另发.
-2. **nodeHub → NODEHUB_URL 主机**: 上传 `nodeAgent.sh` + `tcpingCheck.py`
+1. **ServerStatus-Rust-Moniter** (监控侧): 暴露 `POST /api/v1/status/tcping`
+   (稳定契约, 见 docs/BLOCK_API.md; `Authorization: Bearer` 取 `[api.tokens]`
+   台账); 在 `[api.tokens]` 为节点签发 `MONITOR_KEY` (有效即全权, 仅经安全
+   通道分发, 勿入库/入仓); `tcping_report` 表由 init_db 自动建,
+   block_notify 并集判定随 cron 生效.
+2. **监控 CA 上架** (must: 先于新 nodeAgent 发布 — CA 缺失时节点推送门禁
+   拒推): 从监控侧导出内部 CA PEM (issuer CN=ca-CN, 首行
+   `-----BEGIN CERTIFICATE-----`) → 放到 NODEHUB_URL 主机
+   `${NODEHUB_DIR}/certs/monitor-ca.pem`; 或在该机 `.env` 配 `MONITOR_CA_URL`
+   由 sync.sh 每晚自动拉取.
+3. **nodeHub → NODEHUB_URL 主机**: 上传 `nodeAgent.sh` + `tcpingCheck.py`
    (节点 SelfUpdate 自动拉新 nodeAgent; tcpingCheck.py 每周期 wget -N).
-3. **节点 ~/.env**: 配置 `MONITOR_URL` + `MONITOR_KEY` (Bearer 鉴权, 缺一不推送);
-   未配置的节点跳过推送 (info 日志提示), 补齐两键后下周期自动生效.
-   旧 /ingest/tcping 共享 token 垫片已于 2026-09-16 从 nodeAgent 删除
-   (共享 token 随脚本分发等于公开, 且监控侧 token 已轮换作废).
-4. 灰度验证: 首个节点跑 `sh ~/nodeAgent.sh` 后看 `~/nodeAgent.tcping.log` +
+4. **节点 ~/.env**: 配置 `MONITOR_URL` (必须 `https://` 开头) + `MONITOR_KEY`
+   (缺一不推送, 补齐后下周期自动生效); 特殊场景可用 `MONITOR_CA` 指定本机
+   CA pem 路径覆盖自动拉取. 旧 /ingest/tcping 共享 token 垫片已于 2026-09-16
+   从 nodeAgent 删除 (共享 token 随脚本分发等于公开, 且监控侧 token 已轮换作废).
+5. 灰度验证: 首个节点跑 `sh ~/nodeAgent.sh` 后看 `~/nodeAgent.tcping.log` +
    监控侧 `GET /api/v1/cn-port-block` 的 `node_reports` + 页面 /cnport.html
-   第二张表; `./run tcping <ip:port>` 可从监控侧独立复核.
+   第二张表; `./run tcping <ip:port>` 可从监控侧独立复核. 门禁拦截见
+   `~/nodeLogs` (info) 与 TG 告警 (门禁状态迁移时一次).
 
 ## 10. 已知边界
 
