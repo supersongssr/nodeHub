@@ -15,7 +15,7 @@
 
 set -eu
 
-SCRIPT_VERSION="v1.3.0-$(date '+%Y%m%d')"
+SCRIPT_VERSION="v1.3.1-$(date '+%Y%m%d')"
 
 # ============================================================
 # 日志
@@ -228,7 +228,9 @@ RefreshXrayConfig() {
     # 容错: 无标记 / PID 已死 (含安装器被 kill -9 后残留) / 超时 → 均立即继续;
     #       等待只是消除交叠, 不是刷新的前置条件 (安装器收尾本就不写 config/xray)
     # 可调: UC_INSTALLER_WAIT_MAX 覆盖等待上限秒数 (默认 120, 主要供测试)
-    _inst_marker=/tmp/.nodehub_installer.running
+    # 标记位于 /run/nodehub/ (root 专属目录, 非 root 不可写) — 不用 /tmp 固定路径,
+    # 避免读取本地用户预置的符号链接/伪造内容 (不安全临时文件); /run 重启自清
+    _inst_marker=/run/nodehub/installer.marker
     if [ -f "$_inst_marker" ]; then
         _inst_pid=$(cat "$_inst_marker" 2>/dev/null | tr -dc '0-9' || true)
         if [ -n "$_inst_pid" ] && kill -0 "$_inst_pid" 2>/dev/null; then
@@ -320,8 +322,25 @@ RefreshXrayConfig() {
         rm -f "$_tmp_conf"
         return 1
     }
-    mkdir -p "$_xray_conf_dir"
-    cp -f "$_home_conf" "$_xray_conf"
+    # 双写校验: xray.service 实际加载 $_xray_conf (ExecStart -config 指向它),
+    # mkdir/cp 任一失败都必须中止并回退 ~/config.json — 否则 xray 重启后跑的仍是
+    # 旧配置, 而变更检测以 ~/config.json 为基准, 后续运行会命中"无变化"永久跳过,
+    # 解锁路由静默失效 (正是本闭环要根治的症状)
+    if ! mkdir -p "$_xray_conf_dir" 2>/dev/null; then
+        log error "创建 ${_xray_conf_dir} 失败, 放弃更新 (保留现有配置)"
+        _UndoHomeConfWrite "$_backup"
+        return 1
+    fi
+    if ! cp -f "$_home_conf" "$_xray_conf" 2>/dev/null; then
+        log error "同步 ${_xray_conf} 失败, 放弃更新 (xray 继续运行现有配置)"
+        # cp 失败可能已截断/部分写入目标 — 尽力以备份恢复 xray 目录配置
+        if [ -n "$_backup" ] && [ -f "$_backup" ]; then
+            cp -f "$_backup" "$_xray_conf" 2>/dev/null \
+                || log error "备份恢复 ${_xray_conf} 亦失败, 请人工检查: ls -l ${_xray_conf}"
+        fi
+        _UndoHomeConfWrite "$_backup"
+        return 1
+    fi
     log info "新配置已落盘: ${_home_conf} + ${_xray_conf}"
 
     # ---- 6. 重启 xray + 健康验证 ----
@@ -370,6 +389,23 @@ _RollbackXrayConfig() {
         log error "已回滚到备份配置并重启: ${_rb_backup}"
     else
         log error "无备份可回滚 (首次部署?), 保留新配置; 请手动检查: systemctl status xray"
+    fi
+    return 0
+}
+
+# 回退本次对 ~/config.json 的写入 — 供 RefreshXrayConfig 落盘/同步失败路径调用
+# (依赖调用方已设置的 _home_conf / _xray_conf 全局变量)
+# why: 变更检测以 ~/config.json 为基准 — 残留"新内容"会让后续运行命中
+#      "配置无变化, 跳过重启", 本次失败被永久掩盖 (解锁路由静默不生效)
+# 有备份 → 备份移回原位 (还原旧配置); 无备份 (首次部署/备份失败) →
+# 移除本次新写入的文件, 还原到更新前状态, 保证下次运行能重试
+_UndoHomeConfWrite() {
+    _u_backup="$1"
+    if [ -n "$_u_backup" ] && [ -f "$_u_backup" ]; then
+        mv -f "$_u_backup" "$_home_conf" 2>/dev/null \
+            || log error "回退 ${_home_conf} 失败, 请人工检查 (变更检测基准失真, 下次运行可能误判'无变化')"
+    else
+        rm -f "$_home_conf" 2>/dev/null || true
     fi
     return 0
 }

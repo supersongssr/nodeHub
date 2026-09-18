@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.9.3-20260913"
+VERSION="v2.9.4-20260918"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -135,7 +135,7 @@ OnError() {
     _exit_code=$?
     # 安装器退出 (异常路径) — 清除运行标记, 通知 unlockCheck 可开始刷新配置
     # (正常路径在 Main 收尾处清理; 标记残留也无害: PID 已死 → unlockCheck 直接继续)
-    rm -f /tmp/.nodehub_installer.running 2>/dev/null || true
+    rm -f /run/nodehub/installer.marker 2>/dev/null || true
     # die() 已通过 log error 推送过通知, 这里只负责退出, 不重复推送
     if [ -n "${_LAST_DIE_MSG:-}" ]; then
         exit "$_exit_code"
@@ -2346,8 +2346,17 @@ Step4_5_LaunchUnlockCheck() {
     # unlockCheck.sh 的 RefreshXrayConfig 会轮询本标记+PID, 等安装器完全退出后
     # 才重拉 config/restart xray — 消除缓存命中秒级完成时与安装收尾
     # (服务状态检查 systemctl is-active xray) 的竞态, 避免 Telegram 假警报。
-    # 清理: 正常路径 Main 收尾处 / 异常路径 OnError trap; 残留无害 (PID 已死)。
-    echo $$ > /tmp/.nodehub_installer.running
+    # 路径: /run/nodehub/ 为 root 专属目录 (非 root 不可写), 不用 /tmp 固定路径 —
+    #       root 的 "echo $$ > /tmp/固定路径" 会跟随本地用户预置的符号链接截断任意文件
+    #       (不安全临时文件); /run 重启自清, 亦免除跨重启 PID 复用误判。
+    # 容错: 标记写入失败仅告警不中断 (握手只是消除交叠, unlockCheck 见无标记直接继续)。
+    # 清理: 正常路径 Main 收尾处 / 异常路径 OnError trap; 残留亦无害 (PID 已死)。
+    if mkdir -p /run/nodehub 2>/dev/null \
+        && echo $$ > /run/nodehub/installer.marker 2>/dev/null; then
+        :
+    else
+        log warn "安装器运行标记写入失败 (/run/nodehub/installer.marker), 跳过与 unlockCheck 的退出握手"
+    fi
 
     nohup sh /tmp/unlockCheck.sh > /tmp/unlockCheck.out 2>&1 &
     _pid=$!
@@ -2502,7 +2511,7 @@ Main() {
 
     # 安装器即将正常退出 — 清除运行标记, 通知 unlockCheck 可开始刷新配置
     # (异常路径由 OnError trap 兜底; 标记残留无害: unlockCheck 见死 PID 直接继续)
-    rm -f /tmp/.nodehub_installer.running 2>/dev/null || true
+    rm -f /run/nodehub/installer.marker 2>/dev/null || true
 
     # 安装成功，清除 EXIT trap
     trap - EXIT
