@@ -94,7 +94,7 @@
 
 `POST ${MONITOR_URL}/api/v1/status/tcping` (ServerStatus-Rust-Moniter, Bearer 鉴权 —
 `Authorization: Bearer ${MONITOR_KEY}`, 地址/密钥取 ~/.env `MONITOR_URL`/`MONITOR_KEY`;
-旧 `/ingest/tcping` body-token 垫片已 deprecated [Sunset 2026-09-29], 详见 docs/BLOCK_API.md):
+旧 `/ingest/tcping` body-token 垫片已从节点端删除 (2026-09-16, 不再回退), 详见 docs/BLOCK_API.md):
 
 ```json
 {"report": {"ts": 1690000000, "ip": "1.2.3.4", "port": 443,
@@ -137,7 +137,7 @@
 | 执行方式 | 同步阻塞 (拖慢整个 cron 周期) | **后台 subshell + pid 锁, 不阻断主流程 (must)** |
 | 引擎 | 下载 proxyDiagnose.sh 跑 `--target net` | 下载 tcpingCheck.py (单模块, 快 1-3 分钟) |
 | 端口/IP 区分 | 解析 proxyDiagnose 结果码 | report.block_level (port/ip/unknown) |
-| 推送 | 无 | POST /ingest/tcping (判定主数据源) |
+| 推送 | 无 | POST /api/v1/status/tcping (判定主数据源) |
 | 通知 | 每次检测命中即发 | 状态迁移时发一次 (ok↔blocked / 级别变化 / 恢复); CDN 节点 (v2_name 含 cdn) 不发被墙通知, 反之恢复可达发解封通知; 流程日志 info 级不走 TG, portcheck 桶节流兜底 |
 | 换端口处置 | 节点端自动 (冷却 20h + 历史端口拉黑 + port-hop 区间/已监听规避) | 移交远程面板统一下发, 节点端不自愈 (must: 防单组误判触发破坏性重装) |
 
@@ -147,9 +147,9 @@
 |---|---|---|
 | `NODE_TCPING_CHECK` | 1 | 0 关闭整个检测 (旧名 `NODE_PORT_BLOCK_CHECK=0` 兼容) |
 | `NODE_TCPING_XCHECK` | 1 | 0 关闭交叉验证 (block_level 恒 unknown → 面板无分级依据) |
-| `MONITOR_URL` | (无 → 回退旧 /ingest/tcping) | 推送地址 (追加 /api/v1/status/tcping) |
+| `MONITOR_URL` | (无 → 不推送) | 推送地址 (追加 /api/v1/status/tcping) |
 | `TCPING_PUSH` | 1 | 0 关闭结果推送 (默认开 — 运行完上报是默认行为) |
-| `MONITOR_KEY` | (无 → 回退旧垫片) | 推送 Bearer 密钥 (monitor [api.tokens]; 与 MONITOR_URL 齐备才走新路径) |
+| `MONITOR_KEY` | (必配, 缺一不推送) | 推送 Bearer 密钥 (monitor [api.tokens]; 与 MONITOR_URL 齐备才推送) |
 
 ## 9. 部署 / 灰度步骤
 
@@ -159,9 +159,10 @@
    或 `./run token-create --scopes tcping` 另发.
 2. **nodeHub → NODEHUB_URL 主机**: 上传 `nodeAgent.sh` + `tcpingCheck.py`
    (节点 SelfUpdate 自动拉新 nodeAgent; tcpingCheck.py 每周期 wget -N).
-3. **节点 ~/.env**: 配置 `MONITOR_URL` + `MONITOR_KEY` 即走新路径
-   (Bearer 鉴权); 未配置的节点自动回退旧 /ingest/tcping 垫片 (内置默认
-   token, Sunset 2026-09-29 前可用), 迁完删垫片 (或 TCPING_PUSH=0 关闭推送).
+3. **节点 ~/.env**: 配置 `MONITOR_URL` + `MONITOR_KEY` (Bearer 鉴权, 缺一不推送);
+   未配置的节点跳过推送 (info 日志提示), 补齐两键后下周期自动生效.
+   旧 /ingest/tcping 共享 token 垫片已于 2026-09-16 从 nodeAgent 删除
+   (共享 token 随脚本分发等于公开, 且监控侧 token 已轮换作废).
 4. 灰度验证: 首个节点跑 `sh ~/nodeAgent.sh` 后看 `~/nodeAgent.tcping.log` +
    监控侧 `GET /api/v1/cn-port-block` 的 `node_reports` + 页面 /cnport.html
    第二张表; `./run tcping <ip:port>` 可从监控侧独立复核.

@@ -6,7 +6,7 @@
   从 proxyDiagnose.py 的 _check_node_port_cn_tcping (NW10) 提取核心探测逻辑,
   做成独立 Python3 模块 (零第三方依赖, 仅标准库), 供:
     · nodeAgent.sh 每周期 (小时) 调用: 检测本节点 NODE_PORT 是否被墙 +
-      推送结果至 ServerStatus-Rust-Moniter (/ingest/tcping);
+      推送结果至 ServerStatus-Rust-Moniter (POST /api/v1/status/tcping);
       被墙处置 (换端口重装等) 由远程面板基于推送数据统一下发, 节点端
       不自动换端口 (block_level 供面板区分端口级/IP级处置依据)
     · 人工排障: python3 tcpingCheck.py --ip 1.2.3.4 --port 443 [--xcheck always]

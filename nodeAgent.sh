@@ -628,8 +628,8 @@ SyncSSL() {
 #   NODE_TCPING_XCHECK=0        关闭交叉验证 (block_level 恒 unknown → 面板无端口级/IP级分级依据)
 #   TCPING_PUSH=0               关闭结果推送 (默认开 — must: 运行完上报 ServerStatus)
 #   MONITOR_URL=https://monitor.freessr.bid:8443  推送 API 地址 (monitor FastAPI, Bearer 鉴权)
-#   MONITOR_KEY=ssr_live_...   推送 Bearer 密钥 (monitor [api.tokens]); 两者未配置时
-#                               回退旧 /ingest/tcping body-token 垫片 [Sunset 2026-09-29]
+#   MONITOR_KEY=ssr_live_...   推送 Bearer 密钥 (monitor [api.tokens]); 两者为推送必配,
+#                               未配置时不推送 (info 日志提示, 本地检测/通知不受影响)
 #
 # 状态: ~/nodeAgent.portcheck.state (key=value 行)
 #   date/attempts   探测服务 (tcp.ping.pe) 连续异常止损 — 当日 ≥3 次则当日收工
@@ -664,58 +664,36 @@ $1"
 }
 
 # ---- 检测结果推送 ServerStatus-Rust-Moniter (POST /api/v1/status/tcping) ----
-# 新路径 (稳定契约, 见 ServerStatus-Rust-Moniter docs/BLOCK_API.md):
+# 唯一路径 (稳定契约, 见 ServerStatus-Rust-Moniter docs/BLOCK_API.md):
 #   * 地址:  ${MONITOR_URL}/api/v1/status/tcping  (~/.env MONITOR_URL)
 #   * 鉴权: Authorization: Bearer ${MONITOR_KEY}  (~/.env MONITOR_KEY —
 #     monitor [api.tokens] 台账 token, 有效即全权, 见 docs/AUTH.md)
-#   * body: {"report": <tcpingCheck.py 输出>} — 不再携带 token/node_id 字段;
-#     节点匹配走 report 内 stat_user (md5(IP) 契约) > ip, 与旧接口一致
+#   * body: {"report": <tcpingCheck.py 输出>} — 不携带 token/node_id 字段;
+#     节点匹配走 report 内 stat_user (md5(IP) 契约) > ip
 #   * 响应 {"ok":true,...}; 同节点 60s 内重复上报去重 (deduped=true 亦为成功)
 #   * TLS: monitor 8443 服务内部自签证书 (issuer CN=ca-CN, 非公开 CA) →
 #     curl -k / wget --no-check-certificate 跳过链校验 (传输仍加密;
 #     身份鉴别由 Bearer key 应用层鉴权承担, 与仓库内其它内网端点同口径)
-# 兼容回退: ~/.env 未配置 MONITOR_URL/MONITOR_KEY 时走旧 /ingest/tcping 垫片
-#   (body token 自鉴权: TCPING_API_TOKEN > 内置默认; monitor 侧已 deprecated,
-#    Sunset 2026-09-29 — 节点 ~/.env 补上两键即自动切新路径, 迁完删垫片)
+# 旧 /ingest/tcping body-token 垫片已删除 (2026-09-16): 共享 token 随脚本分发到
+#   每台节点等于公开, 持脚本者可伪造任意节点上报 (监控侧 token 亦已轮换作废);
+#   必须逐节点配置 MONITOR_URL/MONITOR_KEY, 未配置时直接跳过推送, 不再回退。
 # 开关: TCPING_PUSH=0 整体关闭推送 (本地检测/通知不受影响)
-_TCPING_DEF_TOKEN="9516f25b77c72cb3a757586ba28d78442fe87ccf32034f83"
-_TcpingPushOnce() {  # $1 = report JSON (单行); 成功 return 0
+_TcpingPushOnce() {  # $1 = report JSON (单行); 成功 return 0 (前置: MONITOR_* 已配置)
+    _tp_url="${MONITOR_URL%/}/api/v1/status/tcping"
+    _tp_body=$(printf '{"report":%s}' "$1")
     _tp_out=""
-    if [ -n "${MONITOR_URL:-}" ] && [ -n "${MONITOR_KEY:-}" ]; then
-        # 新路径: Bearer 头鉴权, body 仅 {"report": ...}
-        _tp_url="${MONITOR_URL%/}/api/v1/status/tcping"
-        _tp_body=$(printf '{"report":%s}' "$1")
-        if command -v curl >/dev/null 2>&1; then
-            _tp_out=$(curl -sS -m 20 -k \
-                -H 'Content-Type: application/json' \
-                -H "Authorization: Bearer ${MONITOR_KEY}" \
-                -d "$_tp_body" "$_tp_url" 2>/dev/null) || true
-        elif command -v wget >/dev/null 2>&1; then
-            _tp_out=$(wget -qO- -T 20 --no-check-certificate \
-                --header='Content-Type: application/json' \
-                --header="Authorization: Bearer ${MONITOR_KEY}" \
-                --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || true
-        else
-            return 1
-        fi
+    if command -v curl >/dev/null 2>&1; then
+        _tp_out=$(curl -sS -m 20 -k \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer ${MONITOR_KEY}" \
+            -d "$_tp_body" "$_tp_url" 2>/dev/null) || true
+    elif command -v wget >/dev/null 2>&1; then
+        _tp_out=$(wget -qO- -T 20 --no-check-certificate \
+            --header='Content-Type: application/json' \
+            --header="Authorization: Bearer ${MONITOR_KEY}" \
+            --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || true
     else
-        # 旧路径垫片 (deprecated, Sunset 2026-09-29): body token 自鉴权
-        _tp_tok="${TCPING_API_TOKEN:-${_TCPING_DEF_TOKEN}}"
-        # nginx probe-ingest vhost 仅监听 8443 (443 无 /ingest/ 路由 → 404):
-        #   https://probe.freessr.bid:8443/ingest/tcping
-        _tp_url="${TCPING_API_URL:-https://probe.freessr.bid:8443}/ingest/tcping"
-        _tp_body=$(printf '{"token":"%s","node_id":"%s","report":%s}' \
-            "$_tp_tok" "${node_id:-${NODE_ID:-}}" "$1")
-        if command -v curl >/dev/null 2>&1; then
-            _tp_out=$(curl -sS -m 20 -H 'Content-Type: application/json' \
-                -d "$_tp_body" "$_tp_url" 2>/dev/null) || true
-        elif command -v wget >/dev/null 2>&1; then
-            _tp_out=$(wget -qO- -T 20 \
-                --header='Content-Type: application/json' \
-                --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || true
-        else
-            return 1
-        fi
+        return 1
     fi
     case "$_tp_out" in
         *'"ok":true'*) return 0 ;;
@@ -727,6 +705,10 @@ _TcpingPushOnce() {  # $1 = report JSON (单行); 成功 return 0
 
 _TcpingPush() {  # $1 = report JSON; 失败 5s 后重试一次 (网络抖动容错)
     [ "${TCPING_PUSH:-1}" = "0" ] && return 1
+    if [ -z "${MONITOR_URL:-}" ] || [ -z "${MONITOR_KEY:-}" ]; then
+        log info "tcping 推送: MONITOR_URL/MONITOR_KEY 未配置, 跳过推送 (仅本地检测/通知; 配置后下周期自动生效)"
+        return 0
+    fi
     _TcpingPushOnce "$1" && return 0
     sleep 5
     _TcpingPushOnce "$1"
@@ -922,7 +904,12 @@ ${_tpc_act}
             ;;
     esac
 
-    _PortCheckStateSet last_status "$_tpc_status"
+    # 无法判定的读数 (unreachable / not_listening 等非定论状态) 不覆盖 last_status:
+    # 保留上一次有效判定 — 否则 blocked → (重装期间端口短暂关闭) unreachable → ok
+    # 会被判成 prev=unreachable 而吞掉「端口恢复」通知 (error 已在上方提前 return)
+    case "$_tpc_status" in
+        blocked|ok|partial) _PortCheckStateSet last_status "$_tpc_status" ;;
+    esac
     return 0
 }
 
@@ -1153,6 +1140,9 @@ PatchXraySighupReloadBug() {
 # 约束: 仅 2026-09-03 当天可执行 (脚本内部亦校验日期, 双重防护), 仅一次
 # ============================================================
 PatchVisionUnrestrictCurve() {
+    # 备注 (2026-09-16 周期复审, won't fix): 已知问题 — 节点重装回退 PQ-only 后,
+    #   marker + 单日日期门 (仅 2026-09-03) 使补丁无法重打 — 裁定不修: 本补丁为
+    #   一次性且日期窗口早已过期, 本函数不再有实际执行路径, 仅作历史调度记录保留。
     # 一次性: 成功执行后才写 marker (下载/执行失败时下个周期重试);
     # 脚本幂等 (已改过/非目标节点直接退出), 无需"先落标记防重入"
     _marker="${HOME}/nodeAgent.vision-unrestrict.patch.done"
