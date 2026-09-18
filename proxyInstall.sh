@@ -1394,7 +1394,10 @@ Step0_ApplyId() {
 #     无 -g → probeTask 判定为固定节点, 跳过采集
 #     --alias 同上; 如需可读展示名可另设 NODE_NAME
 #   两者均有值 → 配置冲突: log warn (推 Telegram) 警告 + 跳过 stat 安装, 其余步骤照常
-#   两者均无值 → 跳过 stat client 安装 (不装监控, 其余步骤照常)
+#                (本机已有 stat_client 时追加 warn: 旧客户端保持运行, 不会被改动)
+#   两者均无值 → 按本机是否已有监控分流 (原则上所有节点都应装监控):
+#                已装且运行中 → info "保持现有监控" (已装过, 无需重装)
+#                未装/未运行  → log error 告警 (推 Telegram), 不中断安装
 # 派生失败 (IP 空/md5sum 缺失) 回退 USER=node_name, 仅告警不中断
 # ============================================================
 Step0_5_InstallServerStatus() {
@@ -1417,10 +1420,22 @@ Step0_5_InstallServerStatus() {
     # ⚠ group 模式 (-g) 是"动态节点"的判定标记 (probeTask.sh IsDynamicNode 检测 -g)
     if [ -n "${STAT_GID:-}" ] && [ -n "${STAT_USER:-}" ]; then
         log warn "STAT_GID 与 STAT_USER 同时设置 (STAT_GID=${STAT_GID} STAT_USER=${STAT_USER}) — 配置冲突, 跳过 stat client 安装。group 模式请清空 STAT_USER; 固定 user 模式请清空 STAT_GID"
+        # 本机已有 stat_client 时明确提示: 跳过安装不会改动它 — 旧客户端继续以旧身份/旧分组上报
+        if [ -f /etc/systemd/system/stat_client.service ]; then
+            log warn "检测到已有 stat_client 服务, 本次跳过不会停用或修改它 — 旧客户端将继续上报 (旧身份/旧分组); 如需停用请执行: systemctl disable --now stat_client"
+        fi
         return 0
     fi
     if [ -z "${STAT_GID:-}" ] && [ -z "${STAT_USER:-}" ]; then
-        log info "STAT_GID / STAT_USER 均未指定 → 跳过 stat client 安装 (不装监控, 代理功能不受影响; 需要监控请显式设置 STAT_GID 或 STAT_USER 二选一)"
+        # 原则上所有节点都应安装监控 — 均空时按"本机是否已有监控"分流:
+        #   a) stat_client 已在运行 → 已装过监控, 无需重装, 保持现状
+        #   b) 没有运行中的监控   → 配置缺失, 告警 (推 Telegram) 但不中断安装
+        if [ -f /etc/systemd/system/stat_client.service ] \
+           && systemctl is-active stat_client >/dev/null 2>&1; then
+            log info "STAT_GID / STAT_USER 均未指定, 但本机 stat_client 已安装且运行中 → 保持现有监控, 跳过安装 (如需停用: systemctl disable --now stat_client)"
+        else
+            log error "STAT_GID / STAT_USER 均未指定, 且本机没有运行中的监控 — 原则上所有节点都应安装监控, 该节点将以无监控状态运行 (代理功能不受影响)。请在 ~/.env 设置 STAT_GID 或 STAT_USER (二选一) 后重跑"
+        fi
         return 0
     fi
 
@@ -1435,14 +1450,26 @@ Step0_5_InstallServerStatus() {
         [ -z "${stat_user:-}" ] && log warn "stat_user 未派生 (IP 缺失?) — USER 回退 node_name, 外部项目将无法按 IP 检索"
     fi
 
-    # 幂等检测: 已安装且 -u USER 与 --alias 均未变 → 跳过; 任一变化 (换 IP/改名) → 重写 service
+    # 幂等检测: 已安装且 -u USER / --alias / 分组模式 均未变 → 跳过; 任一变化 (换 IP/改名/换组/切模式) → 重写 service
+    # 分组/模式必须纳入比对: STAT_GID 是分组首要选择器, 仅改 STAT_GID 时 IP/节点 ID 不变
+    # → -u 与 --alias 均命中, 不比对 -g 会误判"无变化"→ service 残留旧 GID, 节点停留旧分组
     if [ -f /opt/ServerStatus/client/stat_client ]; then
-        if grep -q -- "-u ${_stat_u} " /etc/systemd/system/stat_client.service 2>/dev/null \
-           && grep -q -- "--alias ${node_name}" /etc/systemd/system/stat_client.service 2>/dev/null; then
-            log info "stat_client 已存在且 USER=${_stat_u} / alias=${node_name} 均未变化，跳过安装"
+        _stat_svc=/etc/systemd/system/stat_client.service
+        _stat_idem=true
+        grep -q -- "-u ${_stat_u} " "$_stat_svc" 2>/dev/null || _stat_idem=false
+        grep -q -- "--alias ${node_name}" "$_stat_svc" 2>/dev/null || _stat_idem=false
+        if [ -n "${STAT_GID:-}" ]; then
+            # group 模式: service 必须携带当前 -g ${STAT_GID}
+            grep -q -- "-g ${STAT_GID} " "$_stat_svc" 2>/dev/null || _stat_idem=false
+        elif grep -qE -- '( -g |--group )' "$_stat_svc" 2>/dev/null; then
+            # 固定 user 模式: service 不得残留 -g/--group (group→user 切换场景)
+            _stat_idem=false
+        fi
+        if [ "$_stat_idem" = "true" ]; then
+            log info "stat_client 已存在且 USER=${_stat_u} / alias=${node_name} / 分组配置 均未变化，跳过安装"
             return 0
         fi
-        log info "stat_client 已存在但 USER/alias 变化 → 重写 systemd 配置 (USER=${_stat_u} alias=${node_name})"
+        log info "stat_client 已存在但 USER/alias/分组 变化 → 重写 systemd 配置 (USER=${_stat_u} alias=${node_name})"
     fi
 
     # 下载安装子脚本 (置于模式/幂等校验之后 — 冲突/均空/幂等跳过路径不发起网络请求)
@@ -2201,6 +2228,9 @@ Step4_DeployCrontab() {
 #       无需 Step4.5 的二次拉取+重启 — 避免 config.json 拉两遍。
 # 缓存不完整 (全新安装) → 跳过, 走 Step4.5 异步闭环
 #   (bootstrap + closure 两次拉取, 非阻塞设计的固有代价)。
+#   空文件 (0 字节, 上次检测中途失败的重定向残留) 会先被删除 —
+#   unlockCheck RunUnlockCheck 仅按 -f 判断是否跳过探测, 空文件不删则
+#   异步路径同样不重新探测 → 上报缺整块字段 → 解锁路由丢失。
 # 三重回退 (均安全降级到异步闭环, 只是多拉一次):
 #   ① 下载失败  ② 脚本执行失败  ③ 上报响应无 "updated":[..."] 非空数组
 #   (防缓存存在但解析为空 → 面板 node_unlock 仍空 → 单次拉取丢失解锁路由)
@@ -2212,11 +2242,23 @@ Step2_6_PreSyncUnlock() {
     _all_cached=true
     for _f in /tmp/media_unlock_clean.txt /tmp/media_check_clean.txt \
               /tmp/check_google_scholar_unlock.json /tmp/notebooklm_check_result.json; do
-        [ -s "$_f" ] || { _all_cached=false; break; }
+        if [ -s "$_f" ]; then
+            continue
+        fi
+        _all_cached=false
+        if [ ! -f "$_f" ]; then
+            # 缺失 = 全新安装, 异步路径 (RunUnlockCheck 按 -f 判断) 会重新探测
+            continue
+        fi
+        # 存在但为空 (0 字节): 上次检测中途失败, shell 重定向先建文件后失败留下的残留。
+        # 不删除的话异步路径会把它当作"已缓存"跳过探测 → 同步/异步两条路都不重探
+        # → 上报缺整块字段 → 面板 node_unlock 不全 → config 丢失解锁路由。
+        log warn "检测缓存为空文件 (上次检测可能中途失败): ${_f} — 已删除, 让 Step4.5 重新探测"
+        rm -f "$_f"
     done
 
     if [ "$_all_cached" != "true" ]; then
-        log info "解锁检测缓存不完整 (全新安装), 走 Step4.5 异步闭环"
+        log info "解锁检测缓存不完整 (全新安装或上次检测失败), 走 Step4.5 异步闭环"
         return 0
     fi
 
@@ -2391,10 +2433,16 @@ Main() {
     # 服务状态 — 异常时红色标注
     _xray_status=$(systemctl is-active xray 2>/dev/null) || true
     _nginx_status=$(systemctl is-active nginx 2>/dev/null) || true
-    _stat_status=$(systemctl is-active stat_client 2>/dev/null) || true
+    # stat_client: 先检测是否安装 (unit 文件存在), 未安装直接标"未安装" —
+    # 区别于 "inactive" (装了没跑); 无监控告警语义见 Step0_5 (原则上所有节点都应装监控)
+    if [ -f /etc/systemd/system/stat_client.service ]; then
+        _stat_status=$(systemctl is-active stat_client 2>/dev/null) || true
+    else
+        _stat_status="未安装"
+    fi
     [ -z "$_xray_status" ]  && _xray_status="未知"
     [ -z "$_nginx_status" ] && _nginx_status="未知"
-    [ -z "$_stat_status" ]  && _stat_status="未安装"
+    [ -z "$_stat_status" ]  && _stat_status="未知"
 
     # 面板模式下 nginx 状态不做异常判断 (由面板管理)
     if [ -n "${_PANEL_DETECTED:-}" ]; then
