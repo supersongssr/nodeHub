@@ -277,6 +277,9 @@ PersistNodeName() {
 # stat 身份派生 (stat_user) — 外部项目"只知 IP"即可在公开 stat 数据中
 # 定位本节点那一行: 检索主键 = -u (username 字段)
 #   stat_user = md5(IP)  全量 32 位小写 hex ★IPv4 优先 (无 v4 用 v6), 零密钥
+# 适用范围: 仅动态节点 (STAT_USER 未显式指定); 固定节点 (显式 STAT_USER) 的
+#   真实 -u 是人工命名的 STAT_USER, md5(IP) 永远匹配不上 — 按 IP 检索契约
+#   不适用 (plans/node-name-identity.md §1), 本函数直接跳过并清理历史残留
 # 设计:
 #   * 纯函数: 外部项目 hashlib.md5(IP) 一行代码即得 → 匹配公开数据的
 #     username 字段命中本节点; 无需 pepper / NODE_ID / 面板信息
@@ -285,6 +288,8 @@ PersistNodeName() {
 #     服务端旧条目转 offline 待清理
 #   * 已知取舍: md5(IPv4) 可被现成彩虹表反查 (代理 IP 本就是公开地址);
 #     IP 不能从 stat 数据被"直接读出" — username 是 md5 值, 非明文 IP
+#     ★复核备注 (f-9330d858, owner 裁定): 不视为问题 — 威胁模型未变, 维持现状;
+#       若威胁模型变化, 按 plans/stat-ip-identity.md §7 演进 (HMAC / 面板下发)
 #   * 零依赖: md5sum 属 coreutils (Debian 默认有), 无需 openssl
 # IP 选择: node_ip (IPv4) 优先, 无则 node_ipv6; 归一化: 去空白/小写/去 %zone
 #   (消费端必须用同样归一化与优先级, 见 plans/stat-ip-identity.md)
@@ -292,8 +297,40 @@ PersistNodeName() {
 # 失败策略: IP 为空 / md5sum 不可用 → 置空并告警, 不中断安装
 #           (Step0_5 回退 USER=node_name, 代价: 外部无法按 IP 检索)
 # ============================================================
+# 清理历史动态安装残留的 stat_user 持久化 — 固定节点 (显式 STAT_USER) 切换用
+# (node.env stat_user= 行 | ~/node.stat_user | ~/node.json .stat_user 字段;
+#  消费端 tcpingCheck/proxyDiagnose 均有 md5(ip) 运行时兜底, 清理不影响行为)
+# ============================================================
+CleanupStaleStatUser() {
+    _stale=0
+    if grep -q '^stat_user=' ~/node.env 2>/dev/null; then
+        flock /tmp/nodeEnv.lock sed -i '/^stat_user=/d' ~/node.env 2>/dev/null || true
+        _stale=1
+    fi
+    if [ -f ~/node.stat_user ]; then
+        rm -f ~/node.stat_user
+        _stale=1
+    fi
+    if [ -f ~/node.json ] && grep -q '"stat_user"' ~/node.json 2>/dev/null; then
+        _tmp_cj=$(jq 'del(.stat_user)' ~/node.json 2>/dev/null) \
+            && printf '%s\n' "$_tmp_cj" > ~/node.json \
+            || log warn "~/node.json 清理 stat_user 字段失败, 跳过"
+        _stale=1
+    fi
+    [ "${_stale}" = 1 ] && log info "已清理历史动态安装残留的 stat_user (node.env / node.stat_user / node.json)"
+    return 0
+}
+
 DeriveStatIdentity() {
     stat_user=""
+
+    # 固定节点 (显式 STAT_USER): 按 IP 检索契约不适用 — 不派生/不持久化 md5(IP),
+    # 并清理历史残留, 避免发布与实际 -u (STAT_USER) 不符的误导性检索键 (f-0727fb17)
+    if [ -n "${STAT_USER:-}" ]; then
+        log info "固定节点 (STAT_USER 显式) — 跳过 stat_user 派生 (按 IP 检索契约不适用, stat 检索键 = STAT_USER)"
+        CleanupStaleStatUser
+        return 0
+    fi
 
     _ident_ip="${node_ip:-${node_ipv6:-}}"
     [ -z "$_ident_ip" ] && { log error "DeriveStatIdentity: node_ip/node_ipv6 均为空, 跳过"; return 0; }
@@ -1456,13 +1493,15 @@ Step0_5_InstallServerStatus() {
     if [ -f /opt/ServerStatus/client/stat_client ]; then
         _stat_svc=/etc/systemd/system/stat_client.service
         _stat_idem=true
-        grep -q -- "-u ${_stat_u} " "$_stat_svc" 2>/dev/null || _stat_idem=false
+        # -F 固定字符串 + 尾随空格锚定: STAT_USER/STAT_GID 来自 ~/.env 未消毒,
+        # 含 BRE 元字符 (如 a.c) 时按正则解释会误命中 → 误判"未变化"跳过重写 (f-4d647ec6)
+        grep -qF -- "-u ${_stat_u} " "$_stat_svc" 2>/dev/null || _stat_idem=false
         # --alias 尾随空格锚定 (alias 后必跟 " --interval"): 防新名是旧名子串时误判未变化
         # (旧值 --alias us-2 会被无锚定的 "--alias us" 命中, 改名不生效)
-        grep -q -- "--alias ${node_name} " "$_stat_svc" 2>/dev/null || _stat_idem=false
+        grep -qF -- "--alias ${node_name} " "$_stat_svc" 2>/dev/null || _stat_idem=false
         if [ -n "${STAT_GID:-}" ]; then
             # group 模式: service 必须携带当前 -g ${STAT_GID}
-            grep -q -- "-g ${STAT_GID} " "$_stat_svc" 2>/dev/null || _stat_idem=false
+            grep -qF -- "-g ${STAT_GID} " "$_stat_svc" 2>/dev/null || _stat_idem=false
         elif grep -qE -- '( -g |--group )' "$_stat_svc" 2>/dev/null; then
             # 固定 user 模式: service 不得残留 -g/--group (group→user 切换场景)
             _stat_idem=false
@@ -2414,7 +2453,11 @@ Main() {
     log info "===== 安装完成 ====="
     log info "node_id=${NODE_ID}"
     log info "node_name=${node_name:-无} (= node_id, alias 展示名); 读取: cat ~/node.name | grep node_name ~/node.env | jq -r .node_name ~/node.json"
-    log info "stat_user=${stat_user:-未派生} = md5(IP) (IPv4 优先) — 外部项目按 IP 算 md5 匹配 username 即可检索; 读取: grep stat_user ~/node.env | cat ~/node.stat_user"
+    if [ -n "${STAT_USER:-}" ]; then
+        log info "固定节点 (node_class=static): stat 检索键 = STAT_USER (人工命名) — 按 IP 算 md5 的检索契约不适用于本节点"
+    else
+        log info "stat_user=${stat_user:-未派生} = md5(IP) (IPv4 优先) — 外部项目按 IP 算 md5 匹配 username 即可检索; 读取: grep stat_user ~/node.env | cat ~/node.stat_user"
+    fi
     log info "node_ids=${node_ids:-无}"
     log info "node_port=${node_port}"
     log info "API_PANEL=${API_PANEL}"

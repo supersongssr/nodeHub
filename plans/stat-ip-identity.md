@@ -25,6 +25,9 @@ stat_user = md5( ip )        # 全量 32 位小写 hex, 无前缀无域
   服务端旧条目转 offline 待清理。
 - **已知取舍**: md5(IPv4) 可被现成彩虹表反查 — 代理 IP 本就是公开地址,
   以此换取"最简、零配置"的检索体验; 如未来需真保密, 见 §7。
+- **复核备注 (f-9330d858, owner 裁定)**: 彩虹表可反查一节**不视为问题** —
+  威胁模型未变 (代理 IP 本就是公开地址), 属已接受取舍, 维持现状;
+  若威胁模型变化再按 §7 演进 (HMAC / 面板下发)。
 
 ## 3. stat 行的字段分工 (仅动态节点; 固定节点人工设 STAT_USER 命名, 不适用本契约)
 
@@ -76,11 +79,15 @@ stat_user=$(printf '%s' "1.2.3.4" | md5sum | awk '{print $1}')
 - `Step0_5` 模式判定 (`STAT_GID` / `STAT_USER` 互斥二选一): 只设 `STAT_GID` → group 模式
   (`-g ${STAT_GID}`, 动态节点); 只设 `STAT_USER` → 固定 user 模式 (无 `-g`);
   均设 = 配置冲突, 告警并跳过安装; 均不设 = 跳过 stat client 安装 (不装监控)。
-- `DeriveStatIdentity()` (Step1_Register 后): IPv4 优先选 IP → 归一化 → md5 →
-  写入 `-u`; 失败 (IP 空 / md5sum 缺失) 回退 USER=node_name 并告警, 不中断安装。
+- `DeriveStatIdentity()` (Step1_Register 后): 仅动态节点执行 — IPv4 优先选 IP →
+  归一化 → md5 → 写入 `-u`; 固定节点 (显式 `STAT_USER`) 直接跳过并清理
+  历史残留 (契约不适用, 不发布误导性检索键, f-0727fb17); 失败 (IP 空 /
+  md5sum 缺失) 回退 USER=node_name 并告警, 不中断安装。
 - 持久化 (仅为可读, 每次重算覆盖): `~/node.env` (`stat_user=`)、`~/node.stat_user`、
   `~/node.json` (`.stat_user`)。
-- 幂等: unit 中 `-u` 或 `--alias` 任一变化 → 自动重写 systemd 配置并重启。
+- 幂等: unit 中 `-u` / `--alias` / `-g`(分组/模式) 任一变化 → 自动重写 systemd
+  配置并重启; 比对用 `grep -qF` 固定字符串 + 尾随空格锚定 (防前缀碰撞与
+  正则元字符误判"未变化", f-4d647ec6)。
 - node_name = node_id (v2.9 归位): alias 展示面板节点 ID, 与面板侧对齐;
   检索职能完全由 stat_user (md5(IP)) 承担, 职责单一。
 
