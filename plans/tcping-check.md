@@ -116,7 +116,16 @@
   (`curl --cacert` / `wget --ca-certificate`, 不再 `-k` 跳过校验 — 否则 MITM
   可自签证书截获全权密钥/伪造被墙报告触发误重装). CA 取 `~/.env MONITOR_CA`
   显式路径, 缺省每周期自 `${NODEHUB_URL}/certs/monitor-ca.pem` 自动拉取
-  (wget -N); CA 缺失/不可读/校验失败 → 同门禁拒推 (迁移时 TG 告警一次).
+  (wget -N). 安全门禁覆盖三类, 均拒推并经 `last_push_gate` 状态迁移 TG 告警一次
+  (推送真正成功后自动清除并通知恢复):
+  ① `MONITOR_URL` 非 https、② CA 缺失/不可读 (前置检查)、③ 推送时证书校验
+  失败 (curl 51/60/77 / wget 5 — 证书与 CA 不匹配, 轮换未同步或疑似劫持;
+  确定性失败不重试).
+- **CA 分发链路** (must): `NODEHUB_URL` 非 `https://` 时 (含无 scheme —
+  wget/curl 一律按 `http://` 处理, CA 信任锚走明文可被链路替换, 之后推送
+  验证形同虚设) nodeAgent `LoadEnv` warn+TG 告警: 无 scheme 自动补全
+  `https://` (与 manage.sh / unlockCheck.sh / proxyInstall.sh 同口径), 显式
+  `http://` 尊重运维选择仅告警 (标记文件去重, 修复后自动解除).
 - **防滥用**: 同 stat_user 60s 内重复上报去重; nginx limit_req (probe 域名)
   复用 ingest 限流; 字段白名单校验 (ip/port/枚举/非负整数).
 - **落库**: `tcping_report` 表 (PK stat_user+ts), 保留 30 天;
@@ -195,3 +204,8 @@
   (处置决策集中在远程面板, 可结合丢包/连接数等多源证据后再下发).
 - tcp.ping.pe 为免费第三方, 接口变更 (interface_changed) 时节点端自动跳过
   并止损 (当日 ≥3 次), 恢复后自动续跑.
+- 监控 CA 信任锚存于 `/tmp/monitor-ca.pem` 固定路径: 多用户机器上理论上存在
+  本地攻击面 (预置假 CA / 符号链接, `wget -N` 见本地更新即跳过下载). 裁定
+  won't fix (2026-09-20 复审): 本 fleet 节点均为 root 独占 VPS, 无本地多用户;
+  `/tmp` sticky bit 亦阻止他人替换 root 已创建文件; 与 tcpingCheck.py 的
+  /tmp 分发模式保持一致.

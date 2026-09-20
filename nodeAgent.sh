@@ -183,6 +183,33 @@ LoadEnv() {
         *) API_URL="https://${API_URL}" ;;
     esac
 
+    # NODEHUB_URL 传输安全 (must: 资源/CA 分发链路禁止静默走明文 HTTP — 2026-09-20 复审 fix):
+    #   本脚本经 NODEHUB_URL 下载自更新/tcpingCheck.py/监控 CA 等资源, curl/wget
+    #   对无 scheme 的 URL 一律按 http:// 处理 — CA 信任锚走明文被链路替换后,
+    #   推送 TLS 验证形同虚设, MONITOR_KEY (全权) 可被截获.
+    #   无 scheme → 自动补全 https:// (与 manage.sh / unlockCheck.sh / proxyInstall.sh
+    #   同口径); 显式 http:// → 尊重运维选择仅告警. 非 https 一律 log warn (→ TG),
+    #   标记文件去重 (修复后自动解除, 再次失配可重新告警; 防每小时刷屏)
+    _hub_marker=~/nodeAgent.huburl-warned
+    if [ -n "${NODEHUB_URL:-}" ]; then
+        case "$NODEHUB_URL" in
+            https://*)
+                rm -f "$_hub_marker" 2>/dev/null || true
+                ;;
+            *)
+                _hub_orig="${NODEHUB_URL}"
+                case "$NODEHUB_URL" in
+                    http*) ;;
+                    *) NODEHUB_URL="https://${NODEHUB_URL}" ;;
+                esac
+                if [ ! -f "$_hub_marker" ]; then
+                    : > "$_hub_marker" 2>/dev/null || true
+                    log warn "NODEHUB_URL 非 https:// (原值: ${_hub_orig}) — 脚本/探测模块/监控 CA 等资源下载将走明文 HTTP, 可被链路篡改替换 (CA 信任锚被换会危及 MONITOR_KEY 推送安全); 无 scheme 已自动补全为 ${NODEHUB_URL}, 显式 http:// 请人工改为 https:// 开头 (修复后告警自动解除, 期间不重复发)"
+                fi
+                ;;
+        esac
+    fi
+
     # 默认网卡
     net_card="${net_card:-eth0}"
 }
@@ -634,6 +661,8 @@ SyncSSL() {
 #                               未配置时不推送 (info 日志提示, 本地检测/通知不受影响)
 #   MONITOR_CA=/path/ca.pem   监控内部 CA 证书 (推送 TLS 验证用); 缺省时每周期自
 #                               ${NODEHUB_URL}/certs/monitor-ca.pem 自动拉取 (wget -N)
+#   NODEHUB_URL                  资源下载地址 (自更新/tcpingCheck/监控 CA); 非 https:// 时
+#                               warn+TG 告警 (无 scheme 自动补全, 显式 http:// 仅告警)
 #
 # 状态: ~/nodeAgent.portcheck.state (key=value 行)
 #   date/attempts   探测服务 (tcp.ping.pe) 连续异常止损 — 当日 ≥3 次则当日收工
@@ -682,8 +711,9 @@ $1"
 #     (不再 -k 盲信任意证书 — 否则 MITM 可自签截获全权密钥/伪造被墙报告);
 #     CA 来源: ~/.env MONITOR_CA 显式路径 > 每周期自 ${NODEHUB_URL}/certs/
 #     monitor-ca.pem 自动拉取 (wget -N, 与 tcpingCheck.py 同模式).
-#     MONITOR_URL 非 https:// / CA 不可用 → 安全门禁拒推 (本地检测/通知
-#     不受影响), 门禁状态迁移时 TG 告警一次 (state: last_push_gate)
+#     MONITOR_URL 非 https:// / CA 不可用 / 推送时证书校验失败 (证书与 CA 不匹配 —
+#     轮换未同步或疑似劫持) → 安全门禁拒推 (本地检测/通知不受影响), 门禁状态
+#     迁移时 TG 告警一次 (state: last_push_gate; 推送成功后自动清除并通知恢复)
 # 旧 /ingest/tcping body-token 垫片已删除 (2026-09-16): 共享 token 随脚本分发到
 #   每台节点等于公开, 持脚本者可伪造任意节点上报 (监控侧 token 亦已轮换作废);
 #   必须逐节点配置 MONITOR_URL/MONITOR_KEY, 未配置时直接跳过推送, 不再回退。
@@ -692,6 +722,10 @@ $1"
 # 优先级: ~/.env MONITOR_CA 显式路径 (须可读且首行 PEM 头) > /tmp/monitor-ca.pem
 #   (每周期自 ${NODEHUB_URL}/certs/monitor-ca.pem wget -N 拉取, 见 TcpingPortCheck)
 # 输出: 可用 CA 文件路径; 无输出 = 不可用 (调用方按门禁拒推处理)
+# 备注 (2026-09-20 复审, owner 裁定 won't fix): CA 存 /tmp 固定路径在多用户机器上
+#   理论上可被本地用户预置假 CA/符号链接劫持 (wget -N 见本地更新即跳过下载) —
+#   本 fleet 节点均为 root 独占 VPS, 无本地多用户, /tmp sticky bit 亦阻止他人
+#   替换 root 已创建的文件; 与 tcpingCheck.py 的 /tmp 分发模式保持一致, 不迁私有目录.
 _MonitorCaFile() {
     if [ -n "${MONITOR_CA:-}" ]; then
         if [ -r "${MONITOR_CA}" ] \
@@ -704,7 +738,8 @@ _MonitorCaFile() {
     return 0
 }
 
-_TcpingPushOnce() {  # $1 = report JSON (单行); 成功 return 0 (前置: 已过 _TcpingPush 门禁)
+_TcpingPushOnce() {  # $1 = report JSON (单行); return 0=成功 1=一般失败(网络/响应异常)
+                     #                        2=TLS 证书校验失败 (调用方走门禁告警, 不重试)
     # 门禁兜底 (防未来新增调用方绕过): 仅 https + CA 可用才外发 Bearer 密钥
     case "$MONITOR_URL" in
         https://*) ;;
@@ -715,16 +750,22 @@ _TcpingPushOnce() {  # $1 = report JSON (单行); 成功 return 0 (前置: 已�
     _tp_url="${MONITOR_URL%/}/api/v1/status/tcping"
     _tp_body=$(printf '{"report":%s}' "$1")
     _tp_out=""
+    _tp_rc=0
     if command -v curl >/dev/null 2>&1; then
         _tp_out=$(curl -sS -m 20 --cacert "$_tp_ca" \
             -H 'Content-Type: application/json' \
             -H "Authorization: Bearer ${MONITOR_KEY}" \
-            -d "$_tp_body" "$_tp_url" 2>/dev/null) || true
+            -d "$_tp_body" "$_tp_url" 2>/dev/null) || _tp_rc=$?
+        # TLS 证书校验类失败 (密钥未外发, 安全侧失败 — 须让人知道, 不能只留 info 日志):
+        #   51=证书与主机名不符 60=证书无法由指定 CA 认证 (CA 轮换未同步/疑似中间人)
+        #   77=CA 文件读取/内容问题
+        case "$_tp_rc" in 51|60|77) return 2 ;; esac
     elif command -v wget >/dev/null 2>&1; then
         _tp_out=$(wget -qO- -T 20 --ca-certificate="$_tp_ca" \
             --header='Content-Type: application/json' \
             --header="Authorization: Bearer ${MONITOR_KEY}" \
-            --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || true
+            --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || _tp_rc=$?
+        case "$_tp_rc" in 5) return 2 ;; esac   # GNU wget: 5=SSL 证书校验失败
     else
         return 1
     fi
@@ -736,7 +777,25 @@ _TcpingPushOnce() {  # $1 = report JSON (单行); 成功 return 0 (前置: 已�
     esac
 }
 
-_TcpingPush() {  # $1 = report JSON; 失败 5s 后重试一次 (网络抖动容错)
+# ---- TLS 证书校验失败处置 (_TcpingPushOnce 返回 2 时调用) ----
+# 证书与监控内部 CA 不匹配 = CA 轮换未同步或疑似中间人: 密钥未外发 (安全), 但
+# 持续静默失败会让面板数据悄悄变陈旧 (>26h 后退回纯丢包判定) — 与前置门禁
+# 同口径走 last_push_gate 状态迁移告警 (一次), 下次推送成功时自动清除并通知恢复
+_TcpingTlsGate() {
+    _tpg_reason="TLS 证书校验失败 (monitor 证书与监控内部 CA 不匹配 — 证书轮换未同步或疑似中间人) — 已拒绝外发密钥"
+    log info "tcping 推送安全门禁: ${_tpg_reason} — 本周期跳过推送 (确定性失败不重试, 消除后自动恢复)"
+    if [ "$(_PortCheckStateGet last_push_gate)" != "$_tpg_reason" ]; then
+        _PortCheckStateSet last_push_gate "$_tpg_reason"
+        _TcpingNotify "⚠️ tcping 推送被安全门禁暂停 (需人工处理)
+■ 原因: ${_tpg_reason}
+■ 影响: 面板收不到本节点 tcping 被墙数据 (本地检测/TG 通知不受影响), 原因消除后自动恢复
+■ 处置: 核对监控侧证书与 ${NODEHUB_URL:-}/certs/monitor-ca.pem 是否同源 (监控换 CA 后需重新上架, issuer CN=ca-CN); 排除链路劫持 (换网络/直连复核); 密钥未外发, 无需轮换"
+    fi
+    return 0
+}
+
+_TcpingPush() {  # $1 = report JSON; 一般失败 5s 后重试一次 (网络抖动容错);
+                 #                TLS 证书校验失败为确定性失败, 不重试 (走门禁告警)
     [ "${TCPING_PUSH:-1}" = "0" ] && return 1
     if [ -z "${MONITOR_URL:-}" ] || [ -z "${MONITOR_KEY:-}" ]; then
         log info "tcping 推送: MONITOR_URL/MONITOR_KEY 未配置, 跳过推送 (仅本地检测/通知; 配置后下周期自动生效)"
@@ -771,13 +830,33 @@ _TcpingPush() {  # $1 = report JSON; 失败 5s 后重试一次 (网络抖动容�
         fi
         return 0
     fi
-    if [ -n "$(_PortCheckStateGet last_push_gate)" ]; then
-        _PortCheckStateSet last_push_gate ""
-        _TcpingNotify "✅ tcping 推送门禁恢复: 此前拦截原因已消除, 推送继续 (monitor 侧数据自本周期起恢复)"
+    # ── 推送: _TcpingPushOnce 0=成功 / 1=一般失败 (5s 后重试一次) / 2=TLS 证书
+    #    校验失败 (确定性失败不重试 — 走门禁告警; 2026-09-20 复审 fix: 此前证书
+    #    校验失败与普通网络失败混在一起只留 info 日志, 与 §5 文档承诺的 TG 告警不符) ──
+    _tpr=1
+    _TcpingPushOnce "$1" && _tpr=0 || _tpr=$?
+    if [ "$_tpr" -eq 2 ]; then
+        _TcpingTlsGate
+        return 0
     fi
-    _TcpingPushOnce "$1" && return 0
-    sleep 5
-    _TcpingPushOnce "$1"
+    if [ "$_tpr" -ne 0 ]; then
+        sleep 5
+        _TcpingPushOnce "$1" && _tpr=0 || _tpr=$?
+        if [ "$_tpr" -eq 2 ]; then
+            _TcpingTlsGate
+            return 0
+        fi
+    fi
+    if [ "$_tpr" -eq 0 ]; then
+        # 门禁恢复判定放在「推送真正成功」之后 (而非前置门禁通过即清): 前置通过
+        # ≠ 推送已恢复 (TLS/网络仍可能失败), 仅成功时清除+通知, 防 告警↔恢复 反转刷屏
+        if [ -n "$(_PortCheckStateGet last_push_gate)" ]; then
+            _PortCheckStateSet last_push_gate ""
+            _TcpingNotify "✅ tcping 推送门禁恢复: 此前拦截原因已消除, 推送继续 (monitor 侧数据自本周期起恢复)"
+        fi
+        return 0
+    fi
+    return 1
 }
 
 # ---- 检测结果摘要 (TG 通知正文用, 从 report JSON 提取逐网状态) ----
