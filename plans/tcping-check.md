@@ -1,4 +1,4 @@
-# tcping 被墙检测方案 (tcpingCheck.py + /ingest/tcping + 并集判定)
+# tcping 被墙检测方案 (tcpingCheck.py + POST /api/v1/status/tcping + 并集判定)
 
 > 实施: 2026-09-05 · 关联: plans/stat-ip-identity.md (stat_user 契约) ·
 > ServerStatus-Rust-Moniter: monitor/core/checks/tcping_client.py (同源同步) ·
@@ -64,6 +64,9 @@
 | `partial` | 有组部分失败, 无组全断 |
 | `not_listening` | 本机 node_port 无 TCP 监听 (纯 UDP: Hysteria2 直听) — TCP/UDP 独立命名空间, 不判被墙 |
 | `ok` | 全部正常 |
+| `error` | 探测服务异常 (tcp.ping.pe 接口变更/限流) — 不推送, 节点端当日 ≥3 次止损 |
+| `no_cn_probe` | 大陆组无探测点 (不判被墙, 照常推送) |
+| `no_result` | 全部组无有效结果 (不判被墙, 照常推送) |
 
 ### block_level (交叉验证, 只有节点端能做 — must)
 

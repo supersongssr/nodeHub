@@ -67,7 +67,7 @@ stat_client 三网数据**降级为「出向质量参考」**, 只展示、不�
 
 | 改动 | 内容 |
 |---|---|
-| 3-1 verdict 互报 | nodeAgent 判定后 POST `monitor /ingest` (扩展 probe ingest 或新 `/ingest/blockverdict`); 与中央 `cn_port_check` 互相校验, 不一致 (如 tcp.ping.pe 限流误判) 时降级 S5 并复核 |
+| 3-1 verdict 互报 | nodeAgent 判定后 POST `monitor /api/v1/status/tcping` (既有稳定契约, 见 plans/tcping-check.md §5; 旧 /ingest 家族已于 2026-09-16 删除); 与中央 `cn_port_check` 互相校验, 不一致 (如 tcp.ping.pe 限流误判) 时降级 S5 并复核 |
 | 3-2 cn_port_check 补 v6 | 中央侧同步补双栈维度 (SPanel node kv `ipv6=`) |
 | 3-3 统一 TG 模板 | 入向判定(权威) + 出向三网读数(参考) + 本机连接真值(`ss` 按 AF 分组) 三行齐发, 杜绝"两个系统打架"的观感 |
 
@@ -82,4 +82,4 @@ stat_client 三网数据**降级为「出向质量参考」**, 只展示、不�
 1. h132 在监控页显示: 被墙状态 = "v4 IP级 / v6 正常 (S2)", 出向列 = 联通✗ 电信7% 移动0% (参考);
 2. 全仓 grep "被墙" 无出向口径残留; 六套 A-F 判定函数仅剩展示用途改名版;
 3. 人工抽查 3 个已知被墙节点 + 3 个健康节点, 入向 verdict 与 tcp.ping.pe 人工复核一致;
-4. nodeAgent 不再自动换端口 (处置集中在面板侧); S1/S2 判定经 /ingest/tcping 推送, 由面板下发处置 (150.129.10.140 属 S2, 仅通知 — 正确)。
+4. nodeAgent 不再自动换端口 (处置集中在面板侧); S1/S2 判定经 `POST /api/v1/status/tcping` (MONITOR_URL/MONITOR_KEY Bearer) 推送, 由面板下发处置 (150.129.10.140 属 S2, 仅通知 — 正确)。
