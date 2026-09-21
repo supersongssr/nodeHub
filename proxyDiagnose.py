@@ -303,6 +303,11 @@ def run(cmd, timeout=90):
         return p.returncode, p.stdout or '', p.stderr or ''
     except FileNotFoundError:
         return 127, '', ''
+    except OSError as e:
+        # exec 阶段失败 (ENOEXEC=8 架构不匹配 / EPERM noexec 挂载等): 报错文本
+        # 须进 stderr 而非吞空 — X2 架构检测依赖此处透传 'Exec format error' 字样
+        # (FileNotFoundError 必须排在其前: 它是 OSError 的子类)
+        return 126, '', f'{type(e).__name__}: {e}'
     except Exception:
         return 1, '', ''
 
@@ -377,7 +382,10 @@ def port_listening(port, tcp_only=False):
     正则锚定替代 GNU grep \b — 跨实现一致)"""
     flags = ('-H', '-tlnp') if tcp_only else ('-H', '-tulnp')
     pat = re.compile(rf'[:.]{re.escape(str(port))}([^0-9]|$)')
-    return any(pat.search(l) for l in ss_lines(flags))
+    # 只锚定本地地址列 (第 5 列): 整行搜索会把【对端】端口也算进来 —
+    # 出站 UDP 查询 (对端 :53/:443) 在 NODE_PORT 撞上该端口时会被误判"在监听"
+    return any(len(l.split()) >= 5 and pat.search(l.split()[4])
+               for l in ss_lines(flags))
 
 
 # ============================================================
@@ -1154,9 +1162,10 @@ def check_xray():
     # X2. 二进制能运行 (架构不匹配会报 exec format error)
     ver_out = run_all([XRAY_BIN, '-version'])
     ver = ver_out.splitlines()[0] if ver_out.splitlines() else ''
+    ver_l = ver.lower()  # Python strerror 为 'Exec format error' (首字母大写), 匹配须不区分大小写
     if 'Xray' in ver:
         result('PASS', 'XRAY_VER_OK', 'xray 版本: ' + ' '.join(ver.split()[1:3]))
-    elif 'exec format error' in ver or 'cannot execute binary file' in ver:
+    elif 'exec format error' in ver_l or 'cannot execute binary file' in ver_l:
         result('FAIL', 'XRAY_BIN_ARCH', f'二进制架构不匹配, 无法执行: {ver}',
                f'下载了错误 CPU 架构的 xray。本机: {platform.machine()}, 请重新下载对应架构版本')
     else:
@@ -1530,7 +1539,12 @@ def check_node_port_external():
     declared = xray_declared_proto_ports() | nginx_declared_proto_ports()
     declared_udp = {p for proto, p in declared if proto == 'udp'}
     pat = re.compile(rf'[:.]{re.escape(node_port)}([^0-9]|$)')
-    listen = [l for l in ss_lines() if pat.search(l) and not _udp_session_socket(l, declared_udp)]
+    # 只锚定本地地址列 (第 5 列, 与 runtime_holders 一致): 整行搜索会把【对端】端口
+    # 也算进来 — 非本机进程的出站 UDP (对端 :53 DNS / :443 QUIC) 在 NODE_PORT 撞上
+    # 该端口时会被误判成"在监听", 掩盖 NODE_PORT_NOT_LISTENING
+    listen = [l for l in ss_lines()
+              if len(l.split()) >= 5 and pat.search(l.split()[4])
+              and not _udp_session_socket(l, declared_udp)]
     if not listen:
         actual = []          # 真实对外监听 (TCP LISTEN / 非临时段或在配置中声明的 UDP)
         udp_sessions = 0     # 出站 UDP 会话 socket 数量 (仅计数, 不列为监听端口)
