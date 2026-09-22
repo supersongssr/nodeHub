@@ -20,8 +20,9 @@ proxyDiagnose.py — 代理服务 (xray / nginx / 代理安装环境) 故障诊�
   · 系统时间不同步; 防火墙; DNS; 面板辅助脚本 0 字节空文件 (198.12.124.74 根因)
   · apt 仓库 Release 文件 Valid-Until 过期 → apt-get update 退出 100, 安装脚本 set -e
     直接中断 (103.227.224.98 根因: Debian 11 bullseye 于 2026-08-31 结束 LTS,
-    security 套件冻结, Valid-Until=最后更新+7天 过后必然触发) — --fix 自动关闭
-    Acquire::Check-Valid-Until 校验并 apt-get update 验证; 附带包锁残留自动解除
+    security 套件冻结, Valid-Until=最后更新+7天 过后必然触发) — --fix 先实测
+    apt-get update, 仅真报 expired 才关闭 Acquire::Check-Valid-Until 校验并复跑
+    验证 (本地索引 stale 只需刷新, 不动配置); 附带包锁残留自动解除
   · 出站 IPv4 web 端口被上游封锁但 freedom 强制 IPv4 → 代理"假活" (38.45.72.223 根因)
   · NODE_PORT 只 bind 127.0.0.1 → 本地"在监听"但外部不可达
   · NODE_PORT 大陆方向被墙 (借 tcp.ping.pe 三网+云厂探测点与海外对照逐网判定,
@@ -47,8 +48,8 @@ proxyDiagnose.py — 代理服务 (xray / nginx / 代理安装环境) 故障诊�
   python3 proxyDiagnose.py --target xray|nginx|env|net|cert|outbound|traffic
   python3 proxyDiagnose.py --json               # 输出 JSON (供程序解析)
   python3 proxyDiagnose.py --no-notify          # 抑制 Telegram 推送 (程序化调度用)
-  python3 proxyDiagnose.py --fix                # 自动修复: 解除 apt/dpkg 残留包锁 +
-                                                #   关闭过期仓库有效期校验 (修复动作报 WARN)
+  python3 proxyDiagnose.py --fix                # 自动修复: 解除 apt/dpkg 残留包锁 (先宽限等待) +
+                                                #   实测 apt-get update 后按需关闭过期仓库校验 (修复动作报 WARN)
   python3 proxyDiagnose.py --quiet              # 只输出 FAIL/WARN
   python3 proxyDiagnose.py --no-color           # 关闭颜色
   python3 proxyDiagnose.py --host root@1.2.3.4  # 远程诊断 (ssh 推送自身, 远端需 python3)
@@ -544,25 +545,69 @@ def fix_apt_valid_until():
     return False, f'写入配置后 apt-get update 仍失败 (退出码 {rc}): {tail}'
 
 
-def fix_apt_locks(locks):
-    """解除 apt/dpkg 包锁 (与 proxyInstall.sh WaitForAptLock 同策略):
-    停 unattended-upgrades → SIGKILL 残余持锁进程 → 删锁文件 → dpkg --configure -a。
-    返回 (ok, 说明)。"""
+_APT_LOCK_EXES = {'apt-get', 'apt', 'dpkg', 'unattended-upgrade',
+                  'unattended-upgrade-shutdown', 'apt.systemd.daily', 'aptd'}
+
+
+def _apt_lock_pids():
+    """持锁类进程 [(pid, 命令行)] — 只按【可执行程序名】精确匹配 (argv[0] 的 basename;
+    shebang 场景如 'python3 /usr/bin/unattended-upgrade' 顺带看第一个参数)。
+    不再对 ps 整行做子串匹配: 那会误杀 argv 恰含 dpkg/apt 字样的无辜进程 (如
+    tail -f /var/log/dpkg.log), 反而漏掉 /usr/lib/apt/apt.systemd.daily (整行
+    不含 'apt ' 子串) 这类真实的锁持有者。"""
     pids = []
     for line in run_out(['ps', 'aux']).splitlines():
         if 'grep' in line or SCRIPT_NAME in line:
             continue
-        if re.search(r'(unattended-upgr|apt-get|apt |dpkg)', line):
-            parts = line.split()
-            if len(parts) > 10:
-                pids.append((parts[1], ' '.join(parts[10:])))
-    if pids:
-        # 常驻自动升级 (unattended-upgrades) 是锁的主要来源, 先停服务防杀后复活
-        run(['systemctl', 'stop', 'unattended-upgrades'])
-        for pid, cmd in pids:
-            note(f'终止持锁进程 pid={pid} ({cmd[:70]})')
-            run(['kill', '-9', pid])
-        time.sleep(1)
+        parts = line.split()
+        if len(parts) <= 10:
+            continue
+        names = [os.path.basename(parts[10])]
+        if names[0].startswith('python') and len(parts) > 11:
+            names.append(os.path.basename(parts[11]))
+        if any(n in _APT_LOCK_EXES for n in names):
+            pids.append((parts[1], ' '.join(parts[10:])))
+    return pids
+
+
+def _locks_held(locks):
+    """锁是否仍被某进程持有 (fuser 退出码 0 = 有持有者; 无 fuser 时按未持有)"""
+    if not has('fuser'):
+        return False
+    return any(run(['fuser', lk])[0] == 0 for lk in locks if os.path.exists(lk))
+
+
+def fix_apt_locks(locks):
+    """解除 apt/dpkg 包锁 (与 proxyInstall.sh WaitForAptLock 同策略 + 宽限等待):
+    停自动升级入口 → 轮询等待锁自行释放 (最多 45s) → 顽留者先 SIGTERM 留退出窗口、
+    再 SIGKILL → 删锁文件 → dpkg --configure -a。返回 (ok, 说明)。
+    直接 SIGKILL 活跃 apt/dpkg 事务会把 dpkg 拦腰打断在半配置状态 (连 dpkg
+    --configure -a 都可能救不回); 诊断脚本调用时机随机, 撞上活事务并不罕见。"""
+    # 常驻自动升级 (unattended-upgrades / apt-daily*) 是锁的主要来源, 先停入口防
+    # 宽限期内新事务再起 (对已在收尾的存量事务无影响)
+    for unit in ('unattended-upgrades', 'apt-daily.timer', 'apt-daily-upgrade.timer'):
+        run(['systemctl', 'stop', unit])
+    # 宽限窗口: 正常收尾的 unattended-upgrades / apt-daily 通常数十秒内自释放
+    waited = 0
+    while waited < 45 and _locks_held(locks):
+        if waited == 0:
+            note('锁被占用, 等待其自行释放 (最多 45s)...')
+        time.sleep(5)
+        waited += 5
+    killed = 0
+    if _locks_held(locks):
+        pids = _apt_lock_pids()
+        if pids:
+            for pid, cmd in pids:
+                note(f'宽限 {waited}s 后锁仍被持有, SIGTERM: pid={pid} ({cmd[:70]})')
+                run(['kill', pid])
+            time.sleep(8)
+            remain = _apt_lock_pids()  # 重扫: SIGTERM 后已退出的不再追杀
+            for pid, cmd in remain:
+                note(f'仍未退出, SIGKILL: pid={pid} ({cmd[:70]})')
+                run(['kill', '-9', pid])
+            time.sleep(1)
+            killed = len(pids)
     for lock in locks:
         try:
             os.remove(lock)
@@ -575,7 +620,8 @@ def fix_apt_locks(locks):
         return False, '锁仍被占用: ' + ' '.join(still)
     if rc != 0:
         return False, f'dpkg --configure -a 退出码 {rc}, 存在半完成的包配置, 需人工检查'
-    return True, f'终止 {len(pids)} 个持锁进程, 解除 {len(locks)} 把锁'
+    how = f'宽限后终止 {killed} 个持锁进程' if killed else '等待后锁自行释放'
+    return True, f'{how}, 解除 {len(locks)} 把锁'
 
 
 # ============================================================
@@ -642,7 +688,8 @@ def check_env():
         result('WARN', 'ENV_DNS_UNKNOWN', '无 getent, 跳过 DNS 检测')
 
     # E5. 包管理器锁占用 — apt/dpkg 正在被占用会卡住安装
-    #     --fix: 沿用 proxyInstall.sh WaitForAptLock 策略自动解除, 修复动作以 WARN 呈现
+    #     --fix: 沿用 proxyInstall.sh WaitForAptLock 策略自动解除 (先宽限等待锁自行
+    #     释放, 不打断活跃事务; 顽留者先 SIGTERM 再 SIGKILL), 修复动作以 WARN 呈现
     if has('fuser'):
         locks = []
         for lock in ('/var/lib/dpkg/lock-frontend', '/var/lib/apt/lists/lock',
@@ -657,7 +704,7 @@ def check_env():
                 if ok:
                     result('WARN', 'ENV_PKG_LOCK_FIXED',
                            f'包管理器锁被占用, 已自动解除 ({msg}): ' + ' '.join(locks),
-                           '修复动作: 停 unattended-upgrades → 终止持锁 apt/dpkg 进程 → 删锁文件 → dpkg --configure -a。若锁属于一个仍在进行的真实安装, 请重跑该安装')
+                           '修复动作: 停 unattended-upgrades/apt-daily* → 等待锁自行释放 (最多 45s) → 顽留持锁进程 SIGTERM/SIGKILL → 删锁文件 → dpkg --configure -a。若锁属于一个仍在进行的真实安装, 请重跑该安装')
                 else:
                     result('WARN', 'ENV_PKG_LOCK',
                            f'包管理器锁被占用, --fix 自动解除未成功 ({msg})',
@@ -668,11 +715,16 @@ def check_env():
         else:
             result('PASS', 'ENV_PKG_LOCK_OK', '包管理器锁空闲')
 
-    # E10. apt 仓库 Release 有效期 — Valid-Until 过期 → apt-get update 必失败 (退出 100),
-    #      安装脚本 set -e 直接中断。真实故障 (2026-09-09, 103.227.224.98):
-    #      Debian 11 bullseye 于 2026-08-31 结束 LTS, security 套件冻结,
-    #      InRelease Valid-Until=2026-09-07 一过 apt 即报 'Release file ... is expired'。
-    #      --fix: 写 Acquire::Check-Valid-Until=false 并 apt-get update 验证。
+    # E10. apt 仓库 Release 有效期 — 真过期 (系统 EOL 后仓库冻结) 时 apt-get update
+    #      报 'Release file ... is expired' 退出 100, 安装脚本 set -e 直接中断。
+    #      真实故障 (2026-09-09, 103.227.224.98): Debian 11 bullseye 于 2026-08-31
+    #      结束 LTS, security 套件冻结, InRelease Valid-Until=2026-09-07 一过即触发。
+    #      但本地 /var/lib/apt/lists 缓存只反映「索引新旧」不反映「远端死活」: 节点
+    #      >7 天没跑 apt update (常态) 时缓存必然过期, 而 apt-get update 校验的是
+    #      新拉取的 Release, 远端仍活跃就能正常刷新 — 本地静态扫描无法区分二者。
+    #      故: 非 --fix 只报 WARN 不下「必失败」断言; --fix 先实测 apt-get update,
+    #      刷新成功 = 索引 stale (不修改任何配置), 仅真报 'is expired' 才写
+    #      Acquire::Check-Valid-Until=false 并复跑验证。
     _lists = '/var/lib/apt/lists'
     _has_lists = os.path.isdir(_lists) and (
         glob.glob(os.path.join(_lists, '*_InRelease'))
@@ -682,18 +734,30 @@ def check_env():
         if expired:
             names = '; '.join(f'{r} (Valid-Until: {v})' for r, v in expired)
             if FIX:
-                ok, msg = fix_apt_valid_until()
-                if ok:
-                    result('WARN', 'ENV_REPO_EXPIRED_FIXED',
-                           f'apt 仓库 Release 已过期, 已自动关闭有效期校验: {names}',
-                           f'⚠️ 过期根因是该仓库已停止更新 (OS 停止安全维护), 本修复仅恢复安装能力, 不恢复安全更新。已写入/确认 {VALID_UNTIL_CONF} 并 apt-get update 验证通过')
+                rc, out, err = run(['apt-get', 'update'], timeout=300)
+                upd = (out + '\n' + err) if (out and err) else (out or err)
+                if rc == 0:
+                    result('WARN', 'ENV_REPO_STALE_REFRESHED',
+                           f'本地缓存的 apt 仓库 Release 已过期, 但远端仓库仍活跃 — 实测 apt-get update 刷新成功, 无需关闭有效期校验: {names}',
+                           '本地索引 stale (节点长期未跑 apt update 的常态) 而非仓库冻结; 本次未修改任何 apt 配置')
+                elif 'is expired' in upd:
+                    ok, msg = fix_apt_valid_until()
+                    if ok:
+                        result('WARN', 'ENV_REPO_EXPIRED_FIXED',
+                               f'apt-get update 实测报 expired, 已自动关闭有效期校验: {names}',
+                               f'⚠️ 该仓库确已停止更新 (多因 OS 停止安全维护, 见 E11), 本修复仅恢复安装能力, 不恢复安全更新。已写入/确认 {VALID_UNTIL_CONF} 并 apt-get update 复跑验证通过')
+                    else:
+                        result('FAIL', 'ENV_REPO_EXPIRED_FIX_FAILED',
+                               f'apt 仓库 Release 过期, --fix 自动修复未成功: {names}', msg)
                 else:
-                    result('FAIL', 'ENV_REPO_EXPIRED_FIX_FAILED',
-                           f'apt 仓库 Release 过期, --fix 自动修复未成功: {names}', msg)
+                    tail = ' '.join(upd.split())[:160] or f'apt-get update 退出码 {rc}'
+                    result('FAIL', 'ENV_REPO_UPDATE_FAILED',
+                           f'apt-get update 实测失败 (非仓库过期原因), 安装会中断: {tail}',
+                           '未修改 apt 配置 (问题不在 Release 有效期); 检查网络出站 / DNS (见 E4 与 outbound 检查) / 镜像源可达性')
             else:
-                result('FAIL', 'ENV_REPO_EXPIRED',
-                       f'apt 仓库 Release 已过期 (apt-get update 必报 expired 退出 100): {names}',
-                       '修复: printf \'Acquire::Check-Valid-Until "false";\\n\' > /etc/apt/apt.conf.d/99check-valid-until 后重试安装; 或直接加 --fix 自动修复并验证')
+                result('WARN', 'ENV_REPO_EXPIRED_LOCAL',
+                       f'本地缓存的 apt 仓库 Release 已过期 (静态只读判断, 无法区分远端冻结与本地索引 stale): {names}',
+                       "节点 >7 天未跑 apt update 属常态: 远端仓库仍活跃时 apt-get update 会自动刷新, 无需处理; 仅当系统已 EOL (见 E11) 时 update 才报 'is expired' 退出 100, 届时 printf 'Acquire::Check-Valid-Until \"false\";\\n' > /etc/apt/apt.conf.d/99check-valid-until, 或加 --fix 自动实测并按需修复")
         else:
             result('PASS', 'ENV_REPO_FRESH', 'apt 仓库 Release 有效期正常 (无过期仓库)')
     else:
@@ -1452,18 +1516,23 @@ def check_net():
     check_node_port_cn_tcping()
 
     # NW11. 云安全组分级提示 (接管原 NW5 的无条件 WARN):
-    #   只有「本地对外监听正常 (NW9) + 全球探测点含海外全断 (NW10)」才是安全组未放行
-    #   的实锤特征 → 升级 WARN; 其余 (外部可达 / 检测跳过 / 本地未监听另有 FAIL) 仅信息行。
-    if NET_PROBE['external'] == 'unreachable' and NET_PROBE['listen'] != 'fail':
+    #   只有「本地对外监听正常 (NW9, listen='ok') + 全球探测点含海外全断 (NW10)」
+    #   才是安全组未放行的实锤特征 → 升级 WARN; 远端代测模式 (listen='skip') 本机
+    #   看不到目标机的监听状态, 不得宣称"监听正常", 只出提示; 其余 (外部可达 /
+    #   检测跳过 / 本地未监听另有 FAIL) 仅信息行。
+    if NET_PROBE['external'] == 'unreachable' and NET_PROBE['listen'] == 'ok':
         result('WARN', 'NET_SG_SUSPECT',
                '本地端口对外监听正常, 但全球探测点 (含海外) 全部连不上 → 高度疑似云安全组未放行',
                '云厂商安全组 (AWS SG / 阿里云安全组 / GCP 防火墙) 需在控制台单独放行 NODE_PORT 对应端口; '
                '本机侧再依次核对 NW1-NW3 (iptables/ufw/firewalld)')
+    elif NET_PROBE['external'] == 'unreachable' and NET_PROBE['listen'] == 'skip':
+        note('远端目标 NODE_PORT 全球探测 (含海外) 全断: 本机看不到目标机的监听状态 (ss 只能看本机), '
+             '先在目标机上确认服务在监听 (可用 --host 远程诊断), 再核对目标机的云安全组 / 防火墙')
     elif NET_PROBE['external'] == 'reachable':
         note('云安全组备忘: NODE_PORT 外部探测点可达 → 安全组已放行 (仅大陆不通属被墙, 与安全组无关, 见上方判定)')
     else:
         note('云安全组备忘: 云厂商安全组 (AWS SG / 阿里云安全组 / GCP 防火墙) 需在控制台单独放行端口; '
-             '本地无法检测, 本次无外部探测证据 (跳过/服务不可用), 不计 WARN')
+             '本地无法检测, 本次无外部探测证据 (跳过/服务不可用) 或本地未监听已有 FAIL 项, 不计 WARN')
 
 
 def _read_proc(path):
