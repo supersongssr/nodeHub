@@ -382,10 +382,14 @@ def port_listening(port, tcp_only=False):
     """端口是否在监听 (锚定 [:.]PORT([^0-9]|$), 防 :443 误匹 :4430 / IPv6 地址段;
     正则锚定替代 GNU grep \b — 跨实现一致)"""
     flags = ('-H', '-tlnp') if tcp_only else ('-H', '-tulnp')
+    # 本地地址列随 flags 变化: -tulnp 带 Netid 首列 (本地=index 4), -tlnp 无 (index 3) —
+    # 固定取 [4] 在 tcp_only 时会锚到【对端】列, 而监听 socket 对端恒为 0.0.0.0:*,
+    # port_listening(tcp_only=True) 将恒 False (本机被墙检测被前置门禁整体跳过)
+    col = 3 if tcp_only else 4
     pat = re.compile(rf'[:.]{re.escape(str(port))}([^0-9]|$)')
-    # 只锚定本地地址列 (第 5 列): 整行搜索会把【对端】端口也算进来 —
+    # 只锚定本地地址列: 整行搜索会把【对端】端口也算进来 —
     # 出站 UDP 查询 (对端 :53/:443) 在 NODE_PORT 撞上该端口时会被误判"在监听"
-    return any(len(l.split()) >= 5 and pat.search(l.split()[4])
+    return any(len(l.split()) > col and pat.search(l.split()[col])
                for l in ss_lines(flags))
 
 
