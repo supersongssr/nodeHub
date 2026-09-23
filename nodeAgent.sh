@@ -1370,6 +1370,53 @@ PatchTiktokOutboundPassword() {
     return 0
 }
 
+# ============================================================
+# 一次性补丁 (2026-09-23): 重启 stat_client 监控客户端 (ServerStatus 探针)
+#
+# 作用: systemctl restart stat_client — 处置动作由面板统一下发,
+#   节点端仅负责执行一次, 不做后续自愈。
+# 约束 (一次性): 接下来的 24 小时内运行一次就不再运行 —
+#   * 调度窗口: 至 2026-09-25 00:00 前 (按天粒度, 部署于 2026-09-23 午后,
+#     覆盖 24h 并预留离线节点短暂掉线后回归的余量; 窗口外新拉到脚本也不跑)
+#   * 仅执行一次: 标记文件【先落再执行】, 即便 restart 失败也不重试 —
+#     失败多为服务自身损坏, 每小时重试只会反复刷 TG 告警, 一次性告警即止
+#     (区别于 PatchXraySighupReloadBug 的「成功才落标记」: 那类巡检修复幂等
+#     且值得重试; 本补丁忠实语义 = 运行一次就不再运行)
+# ============================================================
+PatchRestartStatClient() {
+    # 1) 仅运行一次 — 标记文件存在则跳过; 先落标记 (严格执行一次性语义)
+    _marker="${HOME}/nodeAgent.restart-stat-client.patch.done"
+    [ -f "$_marker" ] && return 0
+    : > "$_marker"
+
+    # 2) 前置依赖: systemctl 存在 + stat_client.service 已安装; 缺一静默跳过
+    #    (未装探针的机器不做无谓动作, 也不告警 — 与 RestartXrayWithHealthCheck 同口径)
+    command -v systemctl >/dev/null 2>&1 \
+        || { log debug "PatchRestartStatClient: systemctl 不存在, 跳过"; return 0; }
+    systemctl list-unit-files 2>/dev/null | grep -q '^stat_client\.service' \
+        || { log debug "PatchRestartStatClient: stat_client.service 未安装, 跳过"; return 0; }
+
+    # 3) 重启 + 健康验证 (restart 退出码不保证服务存活, 短轮询 is-active 确认,
+    #    与 RestartXrayWithHealthCheck 同口径; sleep 为内置命令, set -e 下安全)
+    log info "PatchRestartStatClient: 一次性重启 stat_client (ServerStatus 探针)"
+    if ! systemctl restart stat_client 2>/dev/null; then
+        log error "PatchRestartStatClient: systemctl restart stat_client 失败 — 请检查 journalctl -u stat_client -n 50"
+        return 0
+    fi
+    _rsc_i=0
+    while [ "$_rsc_i" -lt 3 ]; do
+        sleep 1
+        _rsc_i=$((_rsc_i + 1))
+        [ "$(systemctl is-active stat_client 2>/dev/null)" = "active" ] && break
+    done
+    if [ "$(systemctl is-active stat_client 2>/dev/null)" = "active" ]; then
+        log info "PatchRestartStatClient: stat_client 已重启并确认运行 (PID=$(systemctl show -p MainPID --value stat_client 2>/dev/null || echo '?'))"
+    else
+        log error "PatchRestartStatClient: stat_client 重启后未进入 active — 请检查 journalctl -u stat_client -n 50"
+    fi
+    return 0
+}
+
 RunPatches() {
     _today=$(date '+%Y-%m-%d')
     _today_num=$(date '+%Y%m%d')
@@ -1392,6 +1439,11 @@ RunPatches() {
     # 一次性 (仅 2026-09-11 当天): tiktok 解锁出站 (unlocktiktok.freessr.bid)
     # shadowsocks password: fbiopenthedoor → aiopenthedoor + 重启 xray
     [ "$_today" = "2026-09-11" ] && PatchTiktokOutboundPassword
+
+    # 一次性 (窗口: 2026-09-25 00:00 前 ≈ 部署后 24h, 含离线节点回归余量):
+    # 重启 stat_client 监控客户端 (ServerStatus 探针) — 运行一次即永久停用,
+    # marker 先落失败不重试, 详见 PatchRestartStatClient
+    [ "$_today_num" -lt 20260925 ] && PatchRestartStatClient
 
     return 0
 }
