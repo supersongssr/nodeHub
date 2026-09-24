@@ -869,32 +869,78 @@ def check_env():
 #   listen 443 ssl (TCP) + xray hysteria (UDP) 同处 443 = 正常共存)。
 #   真冲突 = 双方【同协议同端口】声明; 再按当前谁实际占用细分 4 类根因。
 # ============================================================
-def xray_declared_proto_ports():
-    """xray 声明的 (协议, 端口) 集合 (原生 json 解析, 替代 jq)。
-    协议判定: protocol ∈ {hysteria,hysteria2,tuic} 或 network ∈ {kcp,quic} → UDP;
-    其余 (vless/vmess/trojan/shadowsocks/dokodemo) → TCP。port 仅取纯数字 (丢弃范围)。"""
+def _xray_inbound_decls():
+    """xray inbounds 的原始声明 [(协议集合, 端口原文)] — 端口原文可为单口/范围串。
+    返回 None = 无配置文件或配置不可解析 (x-ui 等面板把 config 写在非默认路径)。
+    协议判定: protocol ∈ {hysteria,hysteria2,tuic} 或 streamSettings.network ∈ {kcp,quic}
+    → UDP; dokodemo-door 等以 settings.network 指明传输协议 ("udp"/"tcp,udp") 时按其
+    声明 — 原先只看 protocol/streamSettings, dokodemo 恒判 TCP, 其 UDP 监听进不了
+    声明集, 会被 _udp_session_socket 误当出站会话剔除 (NW9 假 FAIL)。"""
     if not os.path.isfile(XRAY_CONF):
-        return set()
+        return None
     cfg = load_json_file(XRAY_CONF)
     if not isinstance(cfg, dict):
-        return set()
-    ports = set()
+        return None
     inbounds = cfg.get('inbounds')
     if not isinstance(inbounds, list):
-        return ports
+        return None
+    decls = []
     for inb in inbounds:
         if not isinstance(inb, dict):
             continue
         proto = inb.get('protocol') or ''
         stream = inb.get('streamSettings')
         network = (stream.get('network') if isinstance(stream, dict) else '') or ''
+        settings = inb.get('settings')
+        snet = ((settings.get('network') if isinstance(settings, dict) else '') or '').strip()
+        if proto in ('hysteria', 'hysteria2', 'tuic') or network in ('kcp', 'quic'):
+            protos = {'udp'}
+        elif snet:
+            protos = {t for t in snet.split(',') if t in ('tcp', 'udp')} or {'tcp'}
+        else:
+            protos = {'tcp'}
         p = inb.get('port')
-        p = str(p) if p is not None else ''
-        if not re.fullmatch(r'[0-9]+', p):
-            continue
-        is_udp = proto in ('hysteria', 'hysteria2', 'tuic') or network in ('kcp', 'quic')
-        ports.add(('udp' if is_udp else 'tcp', int(p)))
+        decls.append((protos, str(p) if p is not None else ''))
+    return decls
+
+
+def xray_declared_proto_ports():
+    """xray 声明的 (协议, 端口) 集合 (原生 json 解析, 替代 jq); 范围端口仍不展开
+    (端口冲突检查逐口跑 ss, 展开大范围会拖垮 — 范围场景由 _declared_udp_ports 处理)。"""
+    ports = set()
+    decls = _xray_inbound_decls()
+    if not decls:
+        return ports
+    for protos, p in decls:
+        if re.fullmatch(r'[0-9]+', p or ''):
+            for pr in protos:
+                ports.add((pr, int(p)))
     return ports
+
+
+def _declared_udp_ports():
+    """UDP 会话 socket 剔除的【豁免端口集】= 配置声明为 UDP 的端口 (xray 范围端口
+    在此展开; dokodemo-door settings.network=udp 一并按 UDP 声明) ∪ nginx UDP (quic)。
+    无任何可解析配置 (XRAY_CONF 缺失/坏 JSON/非默认路径, 且未装 nginx) 时返回
+    None = 不做剔除: 误剔真实 UDP 监听会制造 NODE_PORT_NOT_LISTENING 假 FAIL, 危害
+    大于提示列表多列几个会话 socket 的噪声。实测 `ss -tulnp` 下出站会话 socket 均
+    UNCONN + 通配对端 (0.0.0.0:*), 无法按 Peer/状态与监听区分, 只能依赖配置声明。"""
+    exempt = set()
+    decls = _xray_inbound_decls()
+    if decls is not None:
+        for protos, p in decls:
+            if 'udp' not in protos:
+                continue
+            m = re.fullmatch(r'([0-9]+)-([0-9]+)', p or '')
+            if m and int(m.group(2)) >= int(m.group(1)):
+                exempt.update(range(int(m.group(1)), int(m.group(2)) + 1))
+            elif (p or '').isdigit():
+                exempt.add(int(p))
+    if has('nginx'):
+        exempt.update(port for proto, port in nginx_declared_proto_ports()
+                      if proto == 'udp')
+        return exempt                     # nginx 在装 = 有配置证据 → 正常剔除
+    return exempt if decls is not None else None   # xray 也解析不出 → 无证据不剔除
 
 
 def nginx_conf_text():
@@ -1566,7 +1612,11 @@ def _udp_session_socket(line, declared_udp):
     背景: ss 对 UDP 无 LISTEN 语义 (一律 UNCONN) —— xray freedom/XUDP 为每个用户
     UDP 流 (DNS/NTP/QUIC 转发) 开一个本地 socket, 端口由内核从临时端口段随机分配,
     随流量开关漂移; `ss -tulnp` 会把它们一并列出, 极易误读成"监听了几十个端口"。
-    判定: udp UNCONN + 属主 xray/nginx + 本地端口在临时端口段内 + 不在配置声明端口中。"""
+    判定: udp UNCONN + 属主 xray/nginx + 本地端口在临时端口段内 + 不在配置声明端口中
+    (实测 ss -tulnp 下会话 socket 均 UNCONN + 通配对端, 无 Peer/状态可区分, 只能靠
+    配置声明兜底)。declared_udp=None (无任何可解析配置) 时不剔除 — 见 _declared_udp_ports。"""
+    if declared_udp is None:
+        return False
     parts = line.split()
     if len(parts) < 5 or parts[0] != 'udp' or parts[1] != 'UNCONN':
         return False
@@ -1582,15 +1632,15 @@ def _udp_session_socket(line, declared_udp):
 def _xray_nginx_public_listen(proto_filter=None):
     """xray/nginx 对外 (非环回) 真实监听地址列表 — 剔除出站 UDP 会话 socket。
     proto_filter: None=全部 | 'tcp'=仅 TCP LISTEN (服务端口, 喂给 tcping 前置提示)"""
-    declared = xray_declared_proto_ports() | nginx_declared_proto_ports()
-    declared_udp = {p for proto, p in declared if proto == 'udp'}
+    declared_udp = _declared_udp_ports()
     out = []
     for line in ss_lines():
-        if not re.search(r'users:.+"(xray|nginx)"', line) \
-           or re.search(r'127\.0\.0\.1|::1', line):
+        if not re.search(r'users:.+"(xray|nginx)"', line):
             continue
         parts = line.split()
-        if len(parts) < 5:
+        # 环回判定锚定【本地地址列开头】(与 NW9 external 判定同口径): 整行搜
+        # 127.0.0.1/::1 会误杀 [2a01:4f8::1]:443 这类压缩写法公网 IPv6 (末尾恰含 ::1 子串)
+        if len(parts) < 5 or re.match(r'^(127\.|\[?::1\])', parts[4]):
             continue
         if proto_filter == 'tcp' and not (parts[0] == 'tcp' and parts[1] == 'LISTEN'):
             continue
@@ -1609,8 +1659,7 @@ def check_node_port_external():
     # 协议感知: NODE_PORT 可能承载 TCP 也可能 UDP (Hysteria2 直听), 双协议同查。
     # UDP 侧须剔除出站会话 socket (见 _udp_session_socket): 否则既会刷出几十个假
     # "监听端口", 也可能在 node_port 恰落入临时端口段 (如 59424) 时被会话 socket 误判 PASS。
-    declared = xray_declared_proto_ports() | nginx_declared_proto_ports()
-    declared_udp = {p for proto, p in declared if proto == 'udp'}
+    declared_udp = _declared_udp_ports()   # None = 无配置证据 → 不剔除 (防误剔真实监听)
     pat = re.compile(rf'[:.]{re.escape(node_port)}([^0-9]|$)')
     # 只锚定本地地址列 (第 5 列, 与 runtime_holders 一致): 整行搜索会把【对端】端口
     # 也算进来 — 非本机进程的出站 UDP (对端 :53 DNS / :443 QUIC) 在 NODE_PORT 撞上
@@ -1622,11 +1671,11 @@ def check_node_port_external():
         actual = []          # 真实对外监听 (TCP LISTEN / 非临时段或在配置中声明的 UDP)
         udp_sessions = 0     # 出站 UDP 会话 socket 数量 (仅计数, 不列为监听端口)
         for line in ss_lines():
-            if not re.search(r'users:.+"(xray|nginx)"', line) \
-               or re.search(r'127\.0\.0\.1|::1', line):
+            if not re.search(r'users:.+"(xray|nginx)"', line):
                 continue
             parts = line.split()
-            if len(parts) < 5:
+            # 环回锚定本地地址列开头 (同 _xray_nginx_public_listen, 防误杀公网 IPv6)
+            if len(parts) < 5 or re.match(r'^(127\.|\[?::1\])', parts[4]):
                 continue
             if _udp_session_socket(line, declared_udp):
                 udp_sessions += 1
@@ -1842,7 +1891,9 @@ def check_node_port_cn_tcping():
     # 目标 IP: NODE_TARGET_IP (第三方服务器上测别的节点; 最高优先, 不被 ~/.env 覆盖)
     #   > 已加载的 node_ip > ~/node.json .ip (注册响应原键; 兼容旧 .node_ip)
     #   > 公网探测 (探测的就是运行机自己)
-    from_detect = False
+    # 除 NODE_TARGET_IP 外, 其余来源按语义都是【本节点自身 IP】(面板注册写下的就是
+    # 本机地址) — 见下方 is_local 判定, 不再与 hostname -I 比对。
+    explicit_remote = bool((ENV.get('NODE_TARGET_IP') or '').strip())
     host = (ENV.get('NODE_TARGET_IP') or '').strip() or (ENV.get('node_ip') or '').strip()
     if not host:
         nj = load_json_file(os.path.join(HOME, 'node.json'))
@@ -1852,16 +1903,24 @@ def check_node_port_cn_tcping():
             host = str(nj.get('ip') or nj.get('node_ip') or '').strip()
     if not host:
         host = _detect_public_ipv4()
-        from_detect = bool(host)
     if not host:
         result('WARN', 'CN_TCPING_NO_IP',
                f'无法确定目标公网 IP, 跳过 NODE_PORT={node_port} 大陆 tcping 被墙检测',
                '未配 node_ip 且公网探测 (api.ip.sb/ifconfig.me) 失败; 测远程节点用 NODE_TARGET_IP=<目标IP> NODE_PORT=<端口>')
         return
 
-    # 目标是否本机: 决定监听类检查 (ss 前置 / 交叉验证临时端口) 是否适用
-    ips = host_ips()
-    is_local = (not ips.strip()) or (f' {host} ' in f' {ips} ') or from_detect
+    # 目标是否本机: 决定监听类检查 (ss 前置 / 交叉验证临时端口) 是否适用。
+    # 自身 IP 来源 (node_ip / node.json / 公网探测) 一律视为本机: NAT/私网网卡 VPS、
+    # LXC、注册后换 IP 未刷新 node.json 时, 该公网 IP 不在 hostname -I 输出中, 但
+    # 本地 ss/前置检查只依赖本机、与目标 IP 是否在网卡上无关 — 误判成"远程目标"会
+    # 跳过纯 UDP 前置拦截, hy2 端口全球 TCP 探测必然全断, 连环误报 PORT_UNREACHABLE
+    # + NET_SG_SUSPECT (NW11)。仅 NODE_TARGET_IP (显式测他机) 需比对本机网卡,
+    # 恰指向本机 IP 时仍走本地检查。
+    if explicit_remote:
+        ips = host_ips()
+        is_local = (not ips.strip()) or (f' {host} ' in f' {ips} ')
+    else:
+        is_local = True
 
     # 前置 (仅本机目标): NODE_PORT 必须有 TCP 监听 (纯 UDP 端口 tcping 无意义;
     #   远程目标无法 ss, 端口实际未开时海外探测点也会失败 → PORT_UNREACHABLE 兜底)
