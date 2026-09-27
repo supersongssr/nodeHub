@@ -1417,6 +1417,53 @@ PatchRestartStatClient() {
     return 0
 }
 
+# ============================================================
+# 一次性补丁 (2026-09-27): 重启 xray 刷新 ssp-ssn DNS 解析
+#
+# 背景: 2026-09-24 SPanel 迁移 h84 时, ssp-ssn.freessr.bid 的 AAAA 一度被指到
+#   错误机器 (2400:8902::f03c:91ff:fe02:1418, 宝塔站点), IPv6 优先的节点
+#   (xray 内置 poseidon 面板对接) 心跳全部打到错误机器 → 面板节点大量“消失”。
+#   2026-09-27 AAAA 已修正为 2406:ef80:4:9af1::1; 长驻进程 xray 需重启才会
+#   重新解析, 本补丁负责让 SSH 不通的节点也能自愈。
+# 约束:
+#   * DNS 安全门: 重启前 getent 校验 ssp-ssn 解析结果里【不再含】坏地址
+#     2400:8902::f03c:91ff:fe02:1418 — 仍解析到坏地址 (本地缓存/权威未生效)
+#     时跳过且不落 marker, 下个周期重查, 防止部署节奏错位时无谓重启。
+#   * 仅执行一次: marker【成功才落】(与 PatchTiktokOutboundPassword 同语义,
+#     重启失败值得下周期重试; 区别于 stat_client 补丁的“先落 marker 不重试”)。
+#   * 前置: systemctl 存在 + xray.service 已安装, 缺一静默跳过 (纯监控机不动)。
+#   * 动作: 复用 RestartXrayWithHealthCheck 5 (restart + is-active 轮询 +
+#     端口监听兜底 + 失败自动 Telegram 告警)。
+# ============================================================
+PatchRestartXrayDnsRefresh() {
+    _marker="${HOME}/nodeAgent.restart-xray-dns-refresh.patch.done"
+    [ -f "$_marker" ] && return 0
+
+    # 1) 前置依赖: systemctl 存在 + xray.service 已安装; 缺一静默跳过
+    command -v systemctl >/dev/null 2>&1 \
+        || { log debug "PatchRestartXrayDnsRefresh: systemctl 不存在, 跳过"; return 0; }
+    systemctl list-unit-files 2>/dev/null | grep -q '^xray\.service' \
+        || { log debug "PatchRestartXrayDnsRefresh: xray.service 未安装, 跳过"; return 0; }
+
+    # 2) DNS 安全门: 坏地址仍在解析结果中 → 未生效, 下周期再查
+    _bad_v6="2400:8902::f03c:91ff:fe02:1418"
+    if _prd_res=$(getent hosts ssp-ssn.freessr.bid 2>/dev/null) \
+        && printf '%s\n' "$_prd_res" | grep -qi "${_bad_v6}"; then
+        log debug "PatchRestartXrayDnsRefresh: ssp-ssn 仍解析到坏地址 ${_bad_v6} (缓存未过期), 本周期跳过"
+        return 0
+    fi
+
+    # 3) 重启 + 健康验证 (成功才落 marker, 失败下周期重试)
+    log info "PatchRestartXrayDnsRefresh: 一次性重启 xray (刷新 ssp-ssn DNS 解析)"
+    if RestartXrayWithHealthCheck 5; then
+        : > "$_marker"
+        log info "PatchRestartXrayDnsRefresh: 补丁完成 (marker 已落: $_marker)"
+    else
+        log error "PatchRestartXrayDnsRefresh: 重启/健康验证失败 — 下个周期重试"
+    fi
+    return 0
+}
+
 RunPatches() {
     _today=$(date '+%Y-%m-%d')
     _today_num=$(date '+%Y%m%d')
@@ -1444,6 +1491,11 @@ RunPatches() {
     # 重启 stat_client 监控客户端 (ServerStatus 探针) — 运行一次即永久停用,
     # marker 先落失败不重试, 详见 PatchRestartStatClient
     [ "$_today_num" -lt 20260925 ] && PatchRestartStatClient
+
+    # 一次性 (窗口: 2026-10-11 00:00 前 ≈ 14 天, 覆盖离线数日后回归的节点):
+    # 重启 xray 刷新 ssp-ssn DNS 解析 (AAAA 曾错指 2400:8902::f03c:91ff:fe02:1418,
+    # 2026-09-27 已修正) — 含 DNS 安全门 + 健康验证, 详见 PatchRestartXrayDnsRefresh
+    [ "$_today_num" -lt 20261011 ] && PatchRestartXrayDnsRefresh
 
     return 0
 }
