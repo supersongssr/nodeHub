@@ -85,9 +85,14 @@ stat_user=$(printf '%s' "1.2.3.4" | md5sum | awk '{print $1}')
   md5sum 缺失) 回退 USER=node_name 并告警, 不中断安装。
 - 持久化 (仅为可读, 每次重算覆盖): `~/node.env` (`stat_user=`)、`~/node.stat_user`、
   `~/node.json` (`.stat_user`)。
-- 幂等: unit 中 `-u` / `--alias` / `-g`(分组/模式) 任一变化 → 自动重写 systemd
-  配置并重启; 比对用 `grep -qF` 固定字符串 + 尾随空格锚定 (防前缀碰撞与
-  正则元字符误判"未变化", f-4d647ec6)。
+- 幂等: unit 中 `-u` / `--alias` / `-a`/`-p`(上报地址/密码) / `-g`(分组/模式)
+  任一变化 → 自动重写 systemd 配置并重启; 比对用 `grep -qF` 固定字符串 +
+  尾随空格锚定 (防前缀碰撞与正则元字符误判"未变化", f-4d647ec6)。
+  凭据轮换纳入比对: 面板换 STAT_API_URL/STAT_API_PASSWORD 后改好 ~/.env 重跑即生效
+  (不再误判"无变化"跳过重写, f-1bafff5d)。
+- 幂等跳过时的活性检查: 配置未变跳过重装, 但 `enabled` 且未运行 → `restart`
+  拉活 (停摆非人为); `disabled`/`masked` (人为停用, 停用口径 =
+  `systemctl disable --now`) → 保持停用, 不改状态。
 - node_name = node_id (v2.9 归位): alias 展示面板节点 ID, 与面板侧对齐;
   检索职能完全由 stat_user (md5(IP)) 承担, 职责单一。
 

@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.9.4-20260918"
+VERSION="v2.9.5-20260927"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -1435,6 +1435,11 @@ Step0_ApplyId() {
 #   两者均无值 → 按本机是否已有监控分流 (原则上所有节点都应装监控):
 #                已装且运行中 → info "保持现有监控" (已装过, 无需重装)
 #                未装/未运行  → log error 告警 (推 Telegram), 不中断安装
+# 幂等跳过时的活性检查 (配置未变 → 跳过重装, 但要看运行状态):
+#   enabled  且未运行 → 本应运行却停摆 (手动 stop / exit 0 后 Restart=on-failure
+#                        不拉起 / failed) → restart 拉活 (重装是运维修复的自然动作)
+#   disabled / masked  → 人为停用 (本函数给出的停用口径 = systemctl disable --now)
+#                        → 不改状态, 保持停用, 不拉活
 # 派生失败 (IP 空/md5sum 缺失) 回退 USER=node_name, 仅告警不中断
 # ============================================================
 Step0_5_InstallServerStatus() {
@@ -1487,18 +1492,28 @@ Step0_5_InstallServerStatus() {
         [ -z "${stat_user:-}" ] && log warn "stat_user 未派生 (IP 缺失?) — USER 回退 node_name, 外部项目将无法按 IP 检索"
     fi
 
-    # 幂等检测: 已安装且 -u USER / --alias / 分组模式 均未变 → 跳过; 任一变化 (换 IP/改名/换组/切模式) → 重写 service
+    # 幂等检测: 已安装且 -u USER / --alias / -a 上报地址 / -p 上报密码 / 分组模式 均未变 → 跳过;
+    # 任一变化 (换 IP/改名/换组/切模式/面板轮换上报地址或密码) → 重写 service
     # 分组/模式必须纳入比对: STAT_GID 是分组首要选择器, 仅改 STAT_GID 时 IP/节点 ID 不变
     # → -u 与 --alias 均命中, 不比对 -g 会误判"无变化"→ service 残留旧 GID, 节点停留旧分组
-    if [ -f /opt/ServerStatus/client/stat_client ]; then
-        _stat_svc=/etc/systemd/system/stat_client.service
+    # -a/-p 必须纳入比对: 面板轮换 STAT_API_URL/STAT_API_PASSWORD 后, 运维改好 ~/.env 重跑,
+    # 若不比对 → 其余项全命中误判"无变化"跳过重写 → stat_client 拿旧凭据连新面板,
+    # 节点在监控面板静默下线 (f-1bafff5d; 全仓库仅本链路会写该 service, 凭据变更无其它生效路径)
+    if [ -f "${STAT_BIN_PATH:-/opt/ServerStatus/client/stat_client}" ]; then
+        # 路径注入口 (默认真实路径): 主要供 bats 测试注入临时文件, 生产不设置即不受影响
+        # (与 unlockCheck 的 UC_INSTALLER_WAIT_MAX 同口径的测试钩子)
+        _stat_svc="${STAT_SVC_PATH:-/etc/systemd/system/stat_client.service}"
         _stat_idem=true
-        # -F 固定字符串 + 尾随空格锚定: STAT_USER/STAT_GID 来自 ~/.env 未消毒,
+        # -F 固定字符串 + 尾随空格锚定: STAT_USER/STAT_GID/URL/密码 来自 ~/.env 未消毒,
         # 含 BRE 元字符 (如 a.c) 时按正则解释会误命中 → 误判"未变化"跳过重写 (f-4d647ec6)
         grep -qF -- "-u ${_stat_u} " "$_stat_svc" 2>/dev/null || _stat_idem=false
         # --alias 尾随空格锚定 (alias 后必跟 " --interval"): 防新名是旧名子串时误判未变化
         # (旧值 --alias us-2 会被无锚定的 "--alias us" 命中, 改名不生效)
         grep -qF -- "--alias ${node_name} " "$_stat_svc" 2>/dev/null || _stat_idem=false
+        # -a/-p 尾随空格锚定: flag 后必跟下一参数 (-u / -g / --alias), 同防前缀碰撞
+        # (旧值 https://a.com/v1 时, 新值 https://a.com 不会被误判"未变化")
+        grep -qF -- "-a ${STAT_API_URL} " "$_stat_svc" 2>/dev/null || _stat_idem=false
+        grep -qF -- "-p ${STAT_API_PASSWORD} " "$_stat_svc" 2>/dev/null || _stat_idem=false
         if [ -n "${STAT_GID:-}" ]; then
             # group 模式: service 必须携带当前 -g ${STAT_GID}
             grep -qF -- "-g ${STAT_GID} " "$_stat_svc" 2>/dev/null || _stat_idem=false
@@ -1507,10 +1522,35 @@ Step0_5_InstallServerStatus() {
             _stat_idem=false
         fi
         if [ "$_stat_idem" = "true" ]; then
-            log info "stat_client 已存在且 USER=${_stat_u} / alias=${node_name} / 分组配置 均未变化，跳过安装"
+            # 配置未变 → 跳过重装, 但补一道运行状态检查:
+            #   enabled 且未运行 → 停摆 (非人为停用) → restart 拉活;
+            #   disabled/masked   → 人为停用 (停用口径 = systemctl disable --now) → 保持现状不碰
+            # (is-enabled 为判据: 本函数与子脚本装出的 unit 恒为 enabled, 非 enabled 即人为改过)
+            _stat_unit_state=$(systemctl is-enabled stat_client 2>/dev/null || true)
+            case "${_stat_unit_state}" in
+                enabled|enabled-runtime)
+                    if ! systemctl is-active stat_client >/dev/null 2>&1; then
+                        log warn "stat_client 配置未变但未在运行 (enabled 且 inactive) — 重启拉活"
+                        if systemctl restart stat_client 2>/dev/null; then
+                            sleep 2
+                            if [ "$(systemctl is-active stat_client 2>/dev/null)" = "active" ]; then
+                                log info "stat_client 已重启并确认运行"
+                            else
+                                log error "stat_client 重启后未进入 active — 请检查 journalctl -u stat_client -n 50"
+                            fi
+                        else
+                            log error "stat_client 重启失败 — 请检查 journalctl -u stat_client -n 50"
+                        fi
+                    fi
+                    ;;
+                *)
+                    log info "stat_client 已被禁用 (is-enabled=${_stat_unit_state:-未知}) — 视为人为停用, 保持现状不拉活"
+                    ;;
+            esac
+            log info "stat_client 已存在且 USER=${_stat_u} / alias=${node_name} / 上报地址/密码/分组 均未变化，跳过安装"
             return 0
         fi
-        log info "stat_client 已存在但 USER/alias/分组 变化 → 重写 systemd 配置 (USER=${_stat_u} alias=${node_name})"
+        log info "stat_client 已存在但 USER/alias/上报地址/密码/分组 变化 → 重写 systemd 配置 (USER=${_stat_u} alias=${node_name})"
     fi
 
     # 下载安装子脚本 (置于模式/幂等校验之后 — 冲突/均空/幂等跳过路径不发起网络请求)
