@@ -33,13 +33,13 @@ stat_user = md5( ip )        # 全量 32 位小写 hex, 无前缀无域
 
 ★stat 模式由 `STAT_GID` / `STAT_USER` 互斥二选一决定 (proxyInstall Step0_5):
 只设 `STAT_GID` = 动态节点 / group 模式 (下表); 只设 `STAT_USER` = 固定节点 (user 模式无 -g, probeTask 跳过采集);
-两者均设 = 配置冲突 → 告警并跳过 stat 安装; 两者均不设 → 跳过 stat client 安装 (不装监控, 代理不受影响)。
+两者均设 = 配置冲突 → 告警并跳过 stat 安装; 两者均不设 → 已有运行中的 stat_client 则保持现有监控、跳过安装, 否则 error 告警 (推 Telegram) 提示配置, 不中断安装。
 
 | 字段 | 值 | 受众 |
 |---|---|---|
 | `-u` (username, **检索主键**) | `stat_user` = `6465ec74397c9126916786bbcd6d7601` | ★外部项目 (按 IP 算 md5) |
 | `--alias` (展示名) | `node_name` = `node_id` (如 `42`, 面板节点 ID) | 人 |
-| `-g` (分组) | `STAT_GID` (显式指定; 已移除 `${API_PANEL}` 默认值) | 动态节点标记 (probeTask 依赖 `-g`) |
+| `-g` (分组) | `STAT_GID` (显式指定; 已移除 `${API_PANEL}` 默认值) | 分组展示; probeTask 判定以 `node_class` 为准, `-g` 仅无 `node_class` 的历史节点兜底 |
 
 ## 4. IP 归一化 (节点与消费端必须一致)
 
@@ -78,7 +78,8 @@ stat_user=$(printf '%s' "1.2.3.4" | md5sum | awk '{print $1}')
 
 - `Step0_5` 模式判定 (`STAT_GID` / `STAT_USER` 互斥二选一): 只设 `STAT_GID` → group 模式
   (`-g ${STAT_GID}`, 动态节点); 只设 `STAT_USER` → 固定 user 模式 (无 `-g`);
-  均设 = 配置冲突, 告警并跳过安装; 均不设 = 跳过 stat client 安装 (不装监控)。
+  均设 = 配置冲突, 告警并跳过安装; 均不设 = 已有运行中的 stat_client → 保持现有监控、跳过
+  安装, 否则 error 告警 (推 Telegram) 提示设置 `STAT_GID` 或 `STAT_USER`, 不中断安装。
 - `DeriveStatIdentity()` (Step1_Register 后): 仅动态节点执行 — IPv4 优先选 IP →
   归一化 → md5 → 写入 `-u`; 固定节点 (显式 `STAT_USER`) 直接跳过并清理
   历史残留 (契约不适用, 不发布误导性检索键, f-0727fb17); 失败 (IP 空 /

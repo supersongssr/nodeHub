@@ -18,7 +18,7 @@ stat_client -u <md5(IP)> --alias <node_id> -g <STAT_GID>
 ### 固定节点 (user 模式: 只设 STAT_USER, 留空 STAT_GID)
 
 ```
-stat_user = STAT_USER                     # 人工命名, 稳定不变 → -u
+stat_user = STAT_USER                     # 人工命名 → -u; 不派生 md5(IP), 亦不持久化 (见 §2)
 node_class = static                       # probeTask 跳过采集 (user 模式无 -g)
 stat_client -u <STAT_USER> --alias <node_id|NODE_NAME>     # 无 -g
 ```
@@ -26,13 +26,14 @@ stat_client -u <STAT_USER> --alias <node_id|NODE_NAME>     # 无 -g
 按 IP 检索契约仅适用于动态节点 (固定节点人工命名, 不参与 md5(IP) 检索)。
 
 `STAT_GID` 与 `STAT_USER` 同时设置 → 配置冲突: 告警 (推 Telegram) 并跳过 stat 安装;
-两者均未设置 → 跳过 stat client 安装 (不装监控, 代理功能不受影响, 其余步骤照常)。
+两者均未设置 → 按本机是否已有监控分流: 已有运行中的 stat_client → 保持现有监控、跳过安装;
+  没有 → error 告警 (推 Telegram) 提示设置 `STAT_GID` 或 `STAT_USER` (原则上所有节点都应装监控), 安装不中断。
 
 ### 行为矩阵
 
 | 配置 | -u USER | -g 分组 | node_class | probeTask | 类别 |
 |---|---|---|---|---|---|
-| 都不设 | — (不安装) | — | dynamic | — | 跳过 stat client 安装 (不装监控, 代理不受影响; 已移除 `${API_PANEL}` 默认兜底) |
+| 都不设 | — (不安装) | — | dynamic | — | 已有运行中的 stat_client → 保持现有监控、跳过安装; 否则 error 告警 (推 Telegram) 提示设置 `STAT_GID` 或 `STAT_USER`, 安装不中断 (已移除 `${API_PANEL}` 默认兜底) |
 | 只设 STAT_GID | md5(IP) | STAT_GID | dynamic | 采集 | **动态节点** ★group 模式标准路径 |
 | 只设 STAT_USER | STAT_USER | 无 | static | 跳过 | **固定节点** (user 模式) |
 | 都设 | — (不安装) | — | static | — | **配置冲突**: 告警 (推 Telegram) + 跳过 stat 安装, 其余步骤照常 |
@@ -43,7 +44,7 @@ stat_client -u <STAT_USER> --alias <node_id|NODE_NAME>     # 无 -g
 |---|---|---|---|
 | `-u` (username, **行主键**) | `stat_user` | `md5(IP)` | ★外部项目: 只知 IP → 算 md5 → 匹配 username 字段即命中 |
 | `--alias` (展示名) | `node_name` | `node_id` | 人 (面板显示节点 ID, 与面板侧对齐) |
-| `-g` (分组) | group | `STAT_GID` (显式指定; 已移除 `${API_PANEL}` 默认兜底) | 动态节点标记 (probeTask 依赖 `-g`) |
+| `-g` (分组) | group | `STAT_GID` (显式指定; 已移除 `${API_PANEL}` 默认兜底) | 分组展示; probeTask 判定以 `node_class` 字段为准, `-g` 仅历史节点 (无 `node_class`) 兜底 |
 
 ### 关键性质
 
@@ -63,6 +64,8 @@ stat_client -u <STAT_USER> --alias <node_id|NODE_NAME>     # 无 -g
 例: `md5("1.2.3.4") = 6465ec74397c9126916786bbcd6d7601`
 
 ## 2. 持久化 (随处可读)
+
+★`stat_user` 列仅适用动态节点 (固定节点不派生、不持久化 `stat_user`, 安装时还会清理历史残留, 见 §4):
 
 | 位置 | node_name | stat_user |
 |---|---|---|
@@ -91,11 +94,15 @@ printf '%s' "1.2.3.4" | md5sum | awk '{print $1}'
 
 ```
 Step0(node_id) → Step1_Register(采集 node_ip) → ResolveNodeName(=node_id)
-  → PersistNodeName → DeriveStatIdentity(=md5(IP)) → Step0_5(ServerStatus)
+  → PersistNodeName → DeriveStatIdentity(仅动态节点=md5(IP); 固定节点跳过并清理历史残留) → Step0_5(ServerStatus)
 ```
 
-- 重装同 IP: stat_user/alias 均不变 → Step0_5 幂等跳过
-- 换 IP / 改 NODE_NAME: unit 中 `-u` 或 `--alias` 变化 → 自动重写并重启
+- 重装同 IP (配置未变): `-u`/`--alias`/`-a`/`-p`/`-g` 均不变 → Step0_5 幂等跳过重装; 但补活性检查
+  — `enabled` 且未运行 → `restart` 拉活, `disabled`/`masked` (人为停用) → 保持停用不碰
+- 换 IP / 改 NODE_NAME / 换组 (`STAT_GID`) / 切模式 / 面板轮换上报地址或密码
+  (`STAT_API_URL`/`STAT_API_PASSWORD`): unit 中 `-u` / `--alias` / `-a` / `-p` / `-g` 任一变化
+  → 自动重写并重启 (比对用 `grep -qF` 固定字符串 + 尾随空格锚定; group→user 切换时
+  service 残留 `-g` 亦触发; 凭据轮换纳入比对, f-1bafff5d)
 - stat_user 派生失败 (IP 空 / md5sum 缺失): USER 回退 node_name + 告警, 不中断安装
 
 ## 5. 演进记录
