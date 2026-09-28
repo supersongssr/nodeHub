@@ -30,13 +30,15 @@
   * 仅在 2026-09-03 当天 (本地时区) 允许执行, 其余日期直接退出
   * 标记文件存在则不再执行 (一次性; nodeAgent.sh 侧另有同名标记双重防护)
 
-已知问题 (2026-09-16 周期复审裁定 won't fix — 补丁已执行且日期门已过, 不再运行):
-  * 配置写入为 open(path,'w') 原地截断重写 (非原子), 写坏后不回滚、重试无法自愈;
-    ~/node.json 同模式, 写坏后被目标筛选判为非目标节点静默落标记
-  * 幂等重入 (changed=False) 仍无条件 xray -test + 重启 xray, 重试路径多余中断
-  * 节点重装回退 PQ-only 后, 标记文件 + 单日日期门使补丁无法重打 (nodeAgent 侧同)
-  若未来复用本模板写新补丁, 请改为: 临时文件 + os.replace() 原子替换、写失败/
-  入口解析失败立即恢复备份、changed=False 时跳过校验与重启、收敛式调度。
+复审处置 (2026-09-28 整组重审):
+  * [已修复] 配置写入原为 open(path,'w') 原地截断重写 (非原子, 写坏后不回滚、
+    重试无法自愈) — 现改为同目录临时文件 + os.replace() 原子替换; 入口
+    json.load 失败且备份可解析时先恢复备份再退出; ~/node.json 解析失败显式
+    报错返回 1 (不再静默判为非目标节点, 防 wrapper 落标记永久掩盖损坏)
+  * [owner 裁定非缺陷, 保留现状] 幂等重入 (changed=False) 仍执行 xray -test +
+    重启 — 重试仅发生于当日窗口内, 保持「校验通过 + 已重启」收尾不变式
+  * [owner 裁定非缺陷, 保留现状] 节点重装回退 PQ-only 后, 标记 + 单日日期门
+    使补丁无法重打 — 一次性补丁语义如此, 重装节点由面板重新下发处置
 
 用法: python3 vision_unrestrict_curve.py
 退出码: 0=完成或无需处理, 1=执行失败 (nodeAgent 下个周期可重试)
@@ -124,11 +126,57 @@ def restore_file(bak):
         shutil.copy2(bak, bak[: -len(BACKUP_SUFFIX)])
 
 
+def write_json_atomic(path, obj):
+    """原子写 JSON — 同目录临时文件写完 fsync 后 os.replace() 整体替换。
+    写中途失败 (磁盘满/IO 错误/被杀) 时目标文件保持原样, 磁盘上不会出现
+    半截 JSON; 失败时清理临时文件并向上抛 OSError (由调用方处置)。
+    (进程被 SIGKILL 的极端情况至多遗留一个 *.tmp.vu.* 孤儿文件, 无害)"""
+    tmp = "%s.tmp.vu.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def recover_corrupt_json(path):
+    """path 解析失败时的自愈: 备份存在且备份自身可解析 → 恢复备份返回 True。
+    备份不存在 / 备份也损坏 / 恢复动作失败 → 返回 False (不盲目覆盖, 交人工)。"""
+    bak = path + BACKUP_SUFFIX
+    if not os.path.exists(bak):
+        return False
+    try:
+        with open(bak, "r", encoding="utf-8") as f:
+            json.load(f)   # 备份必须自身可解析, 防止拿另一份坏文件覆盖
+    except (OSError, ValueError):
+        return False
+    try:
+        shutil.copy2(bak, path)
+    except OSError:
+        return False
+    return True
+
+
 # ---------- 步骤 1: 修改 xray curvePreferences ----------
 def patch_xray_config():
     """返回 (是否修改, 修改的 inbound tag 列表); 未命中目标则 (False, [])"""
-    with open(XRAY_CONFIG, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    try:
+        with open(XRAY_CONFIG, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        # 半截 JSON 残留 (旧版非原子写的历史现场): 备份可解析则先恢复 (自愈),
+        # 随后仍向上抛 — 本周期退出, 下个周期在完好的配置上重跑, 损坏不再永久残留
+        if recover_corrupt_json(XRAY_CONFIG):
+            log("error", "%s 解析失败, 已恢复可用备份 (残留半截写入?), 本周期退出" % XRAY_CONFIG)
+        raise
 
     patched_tags = []
     for inbound in cfg.get("inbounds") or []:
@@ -150,9 +198,10 @@ def patch_xray_config():
 
     if patched_tags:
         backup_file(XRAY_CONFIG)
-        with open(XRAY_CONFIG, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-            f.write("\n")
+        # 原子替换: 中途失败 (磁盘满/IO 错误) 时 config.json 保持原样,
+        # 不会残留半截 JSON (旧版 open('w') 原地截断重写的缺陷即在此),
+        # 失败向上抛 → main 记 error 返回 1, 下个周期干净重试
+        write_json_atomic(XRAY_CONFIG, cfg)
     return bool(patched_tags), patched_tags
 
 
@@ -217,15 +266,15 @@ def restart_xray():
 
 # ---------- 步骤 4: 修改 ~/node.json v2_name ----------
 def patch_node_json():
+    # 解析失败 (半截 JSON 等) 直接向上抛 — main 记 error 返回 1 不落标记;
+    # 不能静默吞掉, 否则损坏的 node.json 会被 wrapper 落 patch.done 永久掩盖
     with open(NODE_JSON, "r", encoding="utf-8") as f:
         node = json.load(f)
     if node.get("v2_name") == NEW_V2:  # 已改过 (幂等)
         return False
     backup_file(NODE_JSON)
     node["v2_name"] = NEW_V2
-    with open(NODE_JSON, "w", encoding="utf-8") as f:
-        json.dump(node, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    write_json_atomic(NODE_JSON, node)   # 原子替换, 写坏不留半截文件
     return True
 
 
@@ -249,7 +298,14 @@ def main():
         with open(NODE_JSON, "r", encoding="utf-8") as f:
             v2_name = (json.load(f) or {}).get("v2_name", "")
     except (OSError, ValueError):
-        v2_name = ""
+        # 解析失败 ≠ 非目标节点 (2026-09-28 复审 fix): 显式报错返回 1, 不落标记 —
+        # 否则 wrapper 见 exit 0 即写 patch.done, 半截 node.json 被永久掩盖;
+        # 备份可解析则先恢复, 让下个周期在完好的 node.json 上重跑
+        if recover_corrupt_json(NODE_JSON):
+            log("error", "~/node.json 解析失败, 已恢复可用备份 — 本周期退出, 下个周期重试")
+        else:
+            log("error", "~/node.json 解析失败且无可恢复备份 — 请人工检查 (不落标记)")
+        return 1
     if v2_name != TARGET_V2:
         log("debug", "v2_name=%s != %s, 非目标节点, 跳过" % (v2_name or "空", TARGET_V2))
         return 0

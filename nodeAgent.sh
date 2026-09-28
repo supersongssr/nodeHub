@@ -183,6 +183,23 @@ LoadEnv() {
         *) API_URL="https://${API_URL}" ;;
     esac
 
+    # API_URL 传输安全 (2026-09-28 复审 fix, 与下方 NODEHUB_URL 同口径):
+    #   显式 http:// 时 SubmitStatus 每小时把 token=API_TOKEN 放进 POST body 明文
+    #   外发 (链路可窃听/可冒充节点上报) — 尊重运维选择不阻断上报, 但必须 warn
+    #   (→ TG) 让人知道; 标记文件去重, 改回 https:// 后自动解除, 防每小时刷屏
+    _api_marker=~/nodeAgent.apiurl-warned
+    case "$API_URL" in
+        https://*)
+            rm -f "$_api_marker" 2>/dev/null || true
+            ;;
+        http://*)
+            if [ ! -f "$_api_marker" ]; then
+                : > "$_api_marker" 2>/dev/null || true
+                log warn "API_URL 非 https:// (${API_URL}) — SubmitStatus 每小时将把 API_TOKEN 明文外发 (可被链路窃听/冒充节点上报); 请人工改为 https:// 开头 (修复后告警自动解除, 期间不重复发)"
+            fi
+            ;;
+    esac
+
     # NODEHUB_URL 传输安全 (must: 资源/CA 分发链路禁止静默走明文 HTTP — 2026-09-20 复审 fix):
     #   本脚本经 NODEHUB_URL 下载自更新/tcpingCheck.py/监控 CA 等资源, curl/wget
     #   对无 scheme 的 URL 一律按 http:// 处理 — CA 信任锚走明文被链路替换后,
