@@ -11,10 +11,8 @@
 # [必填] Telegram 通知
 #   TG_BOT_TOKEN  — Telegram Bot Token
 #   TG_CHAT_ID    — Telegram Chat ID
-# [可选] 监控 CA 同步源 (nodeAgent tcping 推送 TLS 验证用)
-#   MONITOR_CA_URL — 监控内部 CA PEM 下载地址; 配置后自动拉取到
-#                   ${NODEHUB_DIR}/certs/monitor-ca.pem 供节点拉取验证,
-#                   未配置时需人工放置该文件 (缺失则节点推送门禁拒推)
+# 历史: MONITOR_CA_URL 监控 CA 同步源已于 2026-09-28 随内部 CA 分发链路下线
+#   (monitor 已换公网 CA 证书, 节点端缺省标准验证, 不再分发 monitor-ca.pem)
 # ============================================================
 
 set -eu
@@ -161,34 +159,13 @@ SyncXray() {
 }
 
 # ============================================================
-# Step 3: 监控 CA 证书同步 (nodeAgent tcping 推送 TLS 验证用)
-# 说明: monitor 8443 内部自签 CA (issuer CN=ca-CN, 非公开 CA); 节点端每
-#       周期从 ${NODEHUB_URL}/certs/monitor-ca.pem 拉取做 --cacert 链校验.
-#       来源二选一: .env MONITOR_CA_URL (本步骤自动拉取) 或人工将 PEM 放
-#       到 ${NODEHUB_DIR}/certs/monitor-ca.pem. 两者皆无时仅记日志跳过
-#       (不置败 — 不阻断 GeoData/Xray 同步; 节点端门禁会自行 TG 告警).
+# Step 3 (已下线 2026-09-28): 监控 CA 证书同步
+#   monitor 已服务公网 CA 证书 (*.freessr.bid, Let's Encrypt) → 节点端
+#   nodeAgent tcping 推送缺省走系统信任库标准验证, 不再需要
+#   ${NODEHUB_DIR}/certs/monitor-ca.pem 分发 (内部 CA 链路单点漏配曾致
+#   fleet 断推 5 天); 保留 MONITOR_CA (节点端可选 pin) 能力, 详见
+#   nodeAgent.sh _MonitorCaFile / plans/tcping-check.md
 # ============================================================
-SyncMonitorCa() {
-    Log "=== 同步监控 CA 证书 ==="
-    mkdir -p "${NODEHUB_DIR}/certs"
-    if [ -n "${MONITOR_CA_URL:-}" ]; then
-        _ca_tmp="${NODEHUB_DIR}/certs/monitor-ca.pem.tmp.$$"
-        if wget -q -T 120 -O "${_ca_tmp}" "${MONITOR_CA_URL}" \
-           && [ "$(head -n 1 "${_ca_tmp}" 2>/dev/null)" = "-----BEGIN CERTIFICATE-----" ]; then
-            mv -f "${_ca_tmp}" "${NODEHUB_DIR}/certs/monitor-ca.pem"
-            Log "监控 CA: 已同步 → ${NODEHUB_DIR}/certs/monitor-ca.pem"
-        else
-            rm -f "${_ca_tmp}"
-            Log "监控 CA: 下载失败或非 PEM (${MONITOR_CA_URL})"
-            _sync_ok=0
-        fi
-    fi
-    if [ -s "${NODEHUB_DIR}/certs/monitor-ca.pem" ]; then
-        Log "监控 CA: ${NODEHUB_DIR}/certs/monitor-ca.pem 就绪 (节点端可验证推送 TLS)"
-    else
-        Log "监控 CA: ${NODEHUB_DIR}/certs/monitor-ca.pem 不存在且未配 MONITOR_CA_URL — 跳过 (节点推送将因 CA 缺失被门禁拒推)"
-    fi
-}
 
 # ============================================================
 # 主流程
@@ -199,7 +176,6 @@ _sync_ok=1
 Init
 SyncGeoData
 SyncXray
-SyncMonitorCa
 if [ "$_sync_ok" -eq 1 ]; then
     NotifyTG "sync 完成"
 else

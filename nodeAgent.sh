@@ -659,8 +659,8 @@ SyncSSL() {
 #                               Bearer 全权密钥禁止明文 HTTP 传输)
 #   MONITOR_KEY=ssr_live_...   推送 Bearer 密钥 (monitor [api.tokens]); 两者为推送必配,
 #                               未配置时不推送 (info 日志提示, 本地检测/通知不受影响)
-#   MONITOR_CA=/path/ca.pem   监控内部 CA 证书 (推送 TLS 验证用); 缺省时每周期自
-#                               ${NODEHUB_URL}/certs/monitor-ca.pem 自动拉取 (wget -N)
+#   MONITOR_CA=/path/ca.pem   推送 TLS 校验的显式 CA/pin (可选加固; 缺省走系统信任库
+#                               标准验证 — monitor 已服务公网 CA 证书 *.freessr.bid)
 #   NODEHUB_URL                  资源下载地址 (自更新/tcpingCheck/监控 CA); 非 https:// 时
 #                               warn+TG 告警 (无 scheme 自动补全, 显式 http:// 仅告警)
 #
@@ -705,66 +705,75 @@ $1"
 #   * body: {"report": <tcpingCheck.py 输出>} — 不携带 token/node_id 字段;
 #     节点匹配走 report 内 stat_user (md5(IP) 契约) > ip
 #   * 响应 {"ok":true,...}; 同节点 60s 内重复上报去重 (deduped=true 亦为成功)
-#   * TLS (must: 全权 Bearer 密钥只经「https + 监控 CA 验证」链路外发):
-#     monitor 8443 服务内部自签证书 (issuer CN=ca-CN, 非公开 CA) →
-#     curl --cacert / wget --ca-certificate 指定监控内部 CA 做链校验
-#     (不再 -k 盲信任意证书 — 否则 MITM 可自签截获全权密钥/伪造被墙报告);
-#     CA 来源: ~/.env MONITOR_CA 显式路径 > 每周期自 ${NODEHUB_URL}/certs/
-#     monitor-ca.pem 自动拉取 (wget -N, 与 tcpingCheck.py 同模式).
-#     MONITOR_URL 非 https:// / CA 不可用 / 推送时证书校验失败 (证书与 CA 不匹配 —
-#     轮换未同步或疑似劫持) → 安全门禁拒推 (本地检测/通知不受影响), 门禁状态
-#     迁移时 TG 告警一次 (state: last_push_gate; 推送成功后自动清除并通知恢复)
+#   * TLS (must: 全权 Bearer 密钥只经 https 验证链路外发, 不 -k 盲信任意证书):
+#     monitor 8443 服务公网 CA 证书 (*.freessr.bid, Let's Encrypt, 自动续期) →
+#     缺省走系统信任库标准验证 (curl/wget 默认行为); MONITOR_CA 显式配置时以
+#     --cacert/--ca-certificate 指定 CA 做私有 pin (可选加固, 无全网分发依赖).
+#     MONITOR_URL 非 https:// / 推送时证书校验失败 (证书无法验证/疑似中间人) →
+#     安全门禁拒推 (本地检测/通知不受影响), 门禁状态迁移时 TG 告警一次
+#     (state: last_push_gate; 推送成功后自动清除并通知恢复)
+#     (2026-09-28: 内部 CA (issuer CN=ca-CN) + ${NODEHUB_URL}/certs/monitor-ca.pem
+#      每周期分发链路下线 — 单点漏配曾致 fleet 断推 5 天, monitor 已换公网证书)
 # 旧 /ingest/tcping body-token 垫片已删除 (2026-09-16): 共享 token 随脚本分发到
 #   每台节点等于公开, 持脚本者可伪造任意节点上报 (监控侧 token 亦已轮换作废);
 #   必须逐节点配置 MONITOR_URL/MONITOR_KEY, 未配置时直接跳过推送, 不再回退。
 # 开关: TCPING_PUSH=0 整体关闭推送 (本地检测/通知不受影响)
-# ---- 监控 CA 解析 (_TcpingPush 门禁与 --cacert 共用) ----
-# 优先级: ~/.env MONITOR_CA 显式路径 (须可读且首行 PEM 头) > /tmp/monitor-ca.pem
-#   (每周期自 ${NODEHUB_URL}/certs/monitor-ca.pem wget -N 拉取, 见 TcpingPortCheck)
-# 输出: 可用 CA 文件路径; 无输出 = 不可用 (调用方按门禁拒推处理)
-# 备注 (2026-09-20 复审, owner 裁定 won't fix): CA 存 /tmp 固定路径在多用户机器上
-#   理论上可被本地用户预置假 CA/符号链接劫持 (wget -N 见本地更新即跳过下载) —
-#   本 fleet 节点均为 root 独占 VPS, 无本地多用户, /tmp sticky bit 亦阻止他人
-#   替换 root 已创建的文件; 与 tcpingCheck.py 的 /tmp 分发模式保持一致, 不迁私有目录.
+# ---- 监控 CA 解析 (仅 MONITOR_CA 显式 pin 时使用; 2026-09-28 起缺省标准验证) ----
+# monitor 已服务公网 CA 证书 → 缺省不加 --cacert 走系统信任库; 仅当 ~/.env 显式
+#   配置 MONITOR_CA (须可读且首行 PEM 头) 时输出路径作私有 pin (加固可选项).
+#   历史: 内部 CA (issuer CN=ca-CN) + ${NODEHUB_URL}/certs/monitor-ca.pem 每周期
+#   wget 分发链路已下线 (单点漏配曾致 fleet 断推 5 天, 见 plans/tcping-check.md);
+#   /tmp/monitor-ca.pem 信任锚随之下线 (TcpingPortCheck 每周期清理遗留).
+# 输出: pin CA 文件路径; 无输出 = 无 pin (调用方走标准验证, 不再作为门禁条件)
 _MonitorCaFile() {
-    if [ -n "${MONITOR_CA:-}" ]; then
-        if [ -r "${MONITOR_CA}" ] \
-           && [ "$(head -n 1 "${MONITOR_CA}" 2>/dev/null)" = "-----BEGIN CERTIFICATE-----" ]; then
-            printf '%s\n' "${MONITOR_CA}"
-        fi
-        return 0
+    [ -z "${MONITOR_CA:-}" ] && return 0
+    if [ -r "${MONITOR_CA}" ] \
+       && [ "$(head -n 1 "${MONITOR_CA}" 2>/dev/null)" = "-----BEGIN CERTIFICATE-----" ]; then
+        printf '%s\n' "${MONITOR_CA}"
     fi
-    [ -s /tmp/monitor-ca.pem ] && printf '%s\n' /tmp/monitor-ca.pem
     return 0
 }
 
 _TcpingPushOnce() {  # $1 = report JSON (单行); return 0=成功 1=一般失败(网络/响应异常)
                      #                        2=TLS 证书校验失败 (调用方走门禁告警, 不重试)
-    # 门禁兜底 (防未来新增调用方绕过): 仅 https + CA 可用才外发 Bearer 密钥
+    # 门禁兜底 (防未来新增调用方绕过): 仅 https 才外发 Bearer 密钥
     case "$MONITOR_URL" in
         https://*) ;;
         *)  return 1 ;;
     esac
-    _tp_ca=$(_MonitorCaFile)
-    [ -n "$_tp_ca" ] || return 1
+    _tp_ca=$(_MonitorCaFile)   # 空 = 系统信任库标准验证; 非空 = MONITOR_CA pin
     _tp_url="${MONITOR_URL%/}/api/v1/status/tcping"
     _tp_body=$(printf '{"report":%s}' "$1")
     _tp_out=""
     _tp_rc=0
     if command -v curl >/dev/null 2>&1; then
-        _tp_out=$(curl -sS -m 20 --cacert "$_tp_ca" \
-            -H 'Content-Type: application/json' \
-            -H "Authorization: Bearer ${MONITOR_KEY}" \
-            -d "$_tp_body" "$_tp_url" 2>/dev/null) || _tp_rc=$?
+        if [ -n "$_tp_ca" ]; then
+            _tp_out=$(curl -sS -m 20 --cacert "$_tp_ca" \
+                -H 'Content-Type: application/json' \
+                -H "Authorization: Bearer ${MONITOR_KEY}" \
+                -d "$_tp_body" "$_tp_url" 2>/dev/null) || _tp_rc=$?
+        else
+            _tp_out=$(curl -sS -m 20 \
+                -H 'Content-Type: application/json' \
+                -H "Authorization: Bearer ${MONITOR_KEY}" \
+                -d "$_tp_body" "$_tp_url" 2>/dev/null) || _tp_rc=$?
+        fi
         # TLS 证书校验类失败 (密钥未外发, 安全侧失败 — 须让人知道, 不能只留 info 日志):
-        #   51=证书与主机名不符 60=证书无法由指定 CA 认证 (CA 轮换未同步/疑似中间人)
-        #   77=CA 文件读取/内容问题
+        #   51=证书与主机名不符 60=证书无法由信任库/pin CA 认证 (证书异常/疑似中间人)
+        #   77=pin CA 文件读取/内容问题 (仅 MONITOR_CA 配置时出现)
         case "$_tp_rc" in 51|60|77) return 2 ;; esac
     elif command -v wget >/dev/null 2>&1; then
-        _tp_out=$(wget -qO- -T 20 --ca-certificate="$_tp_ca" \
-            --header='Content-Type: application/json' \
-            --header="Authorization: Bearer ${MONITOR_KEY}" \
-            --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || _tp_rc=$?
+        if [ -n "$_tp_ca" ]; then
+            _tp_out=$(wget -qO- -T 20 --ca-certificate="$_tp_ca" \
+                --header='Content-Type: application/json' \
+                --header="Authorization: Bearer ${MONITOR_KEY}" \
+                --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || _tp_rc=$?
+        else
+            _tp_out=$(wget -qO- -T 20 \
+                --header='Content-Type: application/json' \
+                --header="Authorization: Bearer ${MONITOR_KEY}" \
+                --post-data="$_tp_body" "$_tp_url" 2>/dev/null) || _tp_rc=$?
+        fi
         case "$_tp_rc" in 5) return 2 ;; esac   # GNU wget: 5=SSL 证书校验失败
     else
         return 1
@@ -778,18 +787,21 @@ _TcpingPushOnce() {  # $1 = report JSON (单行); return 0=成功 1=一般失败
 }
 
 # ---- TLS 证书校验失败处置 (_TcpingPushOnce 返回 2 时调用) ----
-# 证书与监控内部 CA 不匹配 = CA 轮换未同步或疑似中间人: 密钥未外发 (安全), 但
-# 持续静默失败会让面板数据悄悄变陈旧 (>26h 后退回纯丢包判定) — 与前置门禁
-# 同口径走 last_push_gate 状态迁移告警 (一次), 下次推送成功时自动清除并通知恢复
+# monitor 证书无法验证 (公网 CA 验证失败 / MONITOR_CA pin 不匹配) = 证书异常/
+# 过期未续/疑似中间人: 密钥未外发 (安全), 但持续静默失败会让面板数据悄悄变陈旧
+# (>26h 后退回纯丢包判定) — 与前置门禁同口径走 last_push_gate 状态迁移告警
+# (一次), 下次推送成功时自动清除并通知恢复
 _TcpingTlsGate() {
-    _tpg_reason="TLS 证书校验失败 (monitor 证书与监控内部 CA 不匹配 — 证书轮换未同步或疑似中间人) — 已拒绝外发密钥"
+    _tpg_pin=""
+    [ -n "${MONITOR_CA:-}" ] && _tpg_pin=" / 与 MONITOR_CA pin 不匹配"
+    _tpg_reason="TLS 证书校验失败 (monitor 证书无法通过公网 CA 验证${_tpg_pin} — 证书异常/过期未续/疑似中间人) — 已拒绝外发密钥"
     log info "tcping 推送安全门禁: ${_tpg_reason} — 本周期跳过推送 (确定性失败不重试, 消除后自动恢复)"
     if [ "$(_PortCheckStateGet last_push_gate)" != "$_tpg_reason" ]; then
         _PortCheckStateSet last_push_gate "$_tpg_reason"
         _TcpingNotify "⚠️ tcping 推送被安全门禁暂停 (需人工处理)
 ■ 原因: ${_tpg_reason}
 ■ 影响: 面板收不到本节点 tcping 被墙数据 (本地检测/TG 通知不受影响), 原因消除后自动恢复
-■ 处置: 核对监控侧证书与 ${NODEHUB_URL:-}/certs/monitor-ca.pem 是否同源 (监控换 CA 后需重新上架, issuer CN=ca-CN); 排除链路劫持 (换网络/直连复核); 密钥未外发, 无需轮换"
+■ 处置: 核对 monitor (${MONITOR_URL:-}) 证书链 (公网 CA 签发且未过期 / MONITOR_CA pin 与证书同源); 排除链路劫持 (换网络/直连复核); 密钥未外发, 无需轮换"
     fi
     return 0
 }
@@ -801,10 +813,11 @@ _TcpingPush() {  # $1 = report JSON; 一般失败 5s 后重试一次 (网络抖�
         log info "tcping 推送: MONITOR_URL/MONITOR_KEY 未配置, 跳过推送 (仅本地检测/通知; 配置后下周期自动生效)"
         return 0
     fi
-    # ── 安全门禁 (must): MONITOR_KEY 为全权密钥, 只经「https + 监控 CA 验证」的
-    #    TLS 外发 — ① MONITOR_URL 强制 https:// (curl/wget 对无 scheme URL 默认
-    #    按明文 HTTP 处理, Bearer 密钥会裸奔上链路); ② 证书经监控内部 CA 验证
-    #    (替代 -k 盲信任意证书). 拦截 → 本周期跳过推送 (本地检测/迁移通知不受
+    # ── 安全门禁 (must): MONITOR_KEY 为全权密钥, 只经 https TLS 外发 —
+    #    ① MONITOR_URL 强制 https:// (curl/wget 对无 scheme URL 默认按明文
+    #    HTTP 处理, Bearer 密钥会裸奔上链路); ② 证书校验走公网 CA 标准验证
+    #    (缺省, 无分发依赖) 或 MONITOR_CA pin (显式配置), 校验失败由
+    #    _TcpingTlsGate 处置. 拦截 → 本周期跳过推送 (本地检测/迁移通知不受
     #    影响), 门禁状态迁移时 TG 告警一次 (state: last_push_gate,
     #    与 last_status 迁移通知同口径, 防每小时刷屏)
     _tpg_reason=""
@@ -812,12 +825,10 @@ _TcpingPush() {  # $1 = report JSON; 一般失败 5s 后重试一次 (网络抖�
         https://*) ;;
         *)  _tpg_reason="MONITOR_URL 非 https:// (${MONITOR_URL}) — Bearer 密钥禁止明文 HTTP 传输" ;;
     esac
-    if [ -z "$_tpg_reason" ] && [ -z "$(_MonitorCaFile)" ]; then
-        if [ -n "${MONITOR_CA:-}" ]; then
-            _tpg_reason="MONITOR_CA 不可用 (文件不存在/不可读/非 PEM 证书): ${MONITOR_CA} — 拒绝未验证 TLS 外发密钥"
-        else
-            _tpg_reason="监控 CA 缺失 (${NODEHUB_URL:-}/certs/monitor-ca.pem 拉取失败, MONITOR_CA 亦未配置) — 拒绝未验证 TLS 外发密钥"
-        fi
+    # 显式配了 MONITOR_CA pin 但文件不可用 → 拒推 (拒绝静默降级为非 pin 验证;
+    #   未配 MONITOR_CA 的缺省场景不设此门禁 — 公网 CA 标准验证, 无分发依赖)
+    if [ -z "$_tpg_reason" ] && [ -n "${MONITOR_CA:-}" ] && [ -z "$(_MonitorCaFile)" ]; then
+        _tpg_reason="MONITOR_CA 不可用 (文件不存在/不可读/非 PEM 证书): ${MONITOR_CA} — 拒绝降级外发密钥"
     fi
     if [ -n "$_tpg_reason" ]; then
         log info "tcping 推送安全门禁: ${_tpg_reason} — 本周期跳过推送 (消除后自动恢复)"
@@ -826,7 +837,7 @@ _TcpingPush() {  # $1 = report JSON; 一般失败 5s 后重试一次 (网络抖�
             _TcpingNotify "⚠️ tcping 推送被安全门禁暂停 (需人工处理)
 ■ 原因: ${_tpg_reason}
 ■ 影响: 面板收不到本节点 tcping 被墙数据 (本地检测/TG 通知不受影响), 原因消除后自动恢复
-■ 处置: ① ~/.env MONITOR_URL 必须以 https:// 开头; ② 监控内部 CA (issuer CN=ca-CN) 放 ${NODEHUB_URL:-}/certs/monitor-ca.pem (节点每周期自动拉取), 或 ~/.env 配 MONITOR_CA=<CA pem 路径>"
+■ 处置: ~/.env MONITOR_URL 必须以 https:// 开头; MONITOR_CA pin 需为可读 PEM 证书文件 (无需 pin 可移除该配置走标准验证)"
         fi
         return 0
     fi
@@ -925,20 +936,12 @@ TcpingPortCheck() {
         return 0
     fi
 
-    # ── 监控 CA 证书 (推送 TLS 验证用; wget -N 仅变更时拉, 与 tcpingCheck.py 同模式) ──
-    #    仅已配 MONITOR_URL/MONITOR_KEY 且推送开启的节点需要; 拉取失败不阻断
-    #    检测 — 后续 _TcpingPush 门禁会因 CA 缺失拒推并 TG 告警 (下周期重试)
-    if [ -n "${MONITOR_URL:-}" ] && [ -n "${MONITOR_KEY:-}" ] \
-       && [ "${TCPING_PUSH:-1}" != "0" ] && [ -z "${MONITOR_CA:-}" ]; then
-        if ! ( cd /tmp && wget -N -T 30 -t 1 "${NODEHUB_URL}/certs/monitor-ca.pem" 2>/dev/null ); then
-            log info "tcping 检测: 下载 monitor-ca.pem 失败 — ${NODEHUB_URL}/certs/monitor-ca.pem (推送将因 CA 缺失暂停)"
-        fi
-        # 完整性: 非空 + PEM 头 (防 404 残留/HTML 错误页落入 --cacert)
-        if [ -s /tmp/monitor-ca.pem ] \
-           && [ "$(head -n 1 /tmp/monitor-ca.pem 2>/dev/null)" != "-----BEGIN CERTIFICATE-----" ]; then
-            log info "tcping 检测: /tmp/monitor-ca.pem 内容非 PEM 证书, 丢弃"
-            rm -f /tmp/monitor-ca.pem
-        fi
+    # ── 清理内部 CA 时代遗留 (2026-09-28 分发链路下线: 缺省改公网 CA 标准验证) ──
+    #    /tmp/monitor-ca.pem 为历史每周期自 ${NODEHUB_URL}/certs/monitor-ca.pem
+    #    wget 拉取产物; 统一清除, 防个别节点残留被误当 pin 使用
+    if [ -s /tmp/monitor-ca.pem ]; then
+        rm -f /tmp/monitor-ca.pem
+        log info "tcping 检测: 已清理历史遗留 /tmp/monitor-ca.pem (内部 CA 链路已下线, 缺省公网 CA 标准验证)"
     fi
 
     # ── 运行检测 (auto: blocked 时自动交叉验证; timeout 兜底防挂死主流程) ──

@@ -1,18 +1,20 @@
 #!/usr/bin/env bats
 # ============================================================
 # test_node_agent_tcping_push.bats — 推送安全门禁 + NODEHUB_URL 传输安全测试
-# 覆盖 (2026-09-20 复审 fix 回归):
+# 覆盖 (2026-09-20 复审 fix 回归 + 2026-09-28 公网 CA 标准验证改造):
 #   T1.  TLS 证书校验失败 (curl 60) → 门禁拒推 + TG 告警一次, 确定性失败不重试
 #   T1b. wget 5 (SSL 校验失败, curl 不可用) → 同样映射为 TLS 门禁 (rc=2)
 #   T2.  持续 TLS 校验失败 (第二周期) → 不重复告警 (last_push_gate 去重)
 #   T3.  TLS 失败后推送成功 → 门禁清除 + 恢复 TG 一次
 #   T4.  一般网络失败 (curl 7) → 重试一次后失败返回, 不设门禁/不发 TG
 #   T5.  前置门禁回归: MONITOR_URL 非 https → 拒推 + TG 一次
+#   T7.  MONITOR_CA 未配置 (缺省) → 公网 CA 标准验证推送, 不带 --cacert, 无门禁
+#   T8.  MONITOR_CA 显式配置但文件不可用 → 前置门禁拒推 (拒绝降级) + TG 一次
 #   T6.  LoadEnv NODEHUB_URL: 无 scheme 自动补全 https:// + warn(TG) 一次;
 #        持续失配不重复告警; 显式 http:// 仅告警不强改; 恢复 https 后清标记
 #
 # 隔离: HOME=mktemp 目录; curl (推送+TG) / wget / sleep 用 stub, 不访问网络;
-#       CA 走 MONITOR_CA 指向 fixture PEM (真实 _MonitorCaFile 校验路径)
+#       MONITOR_CA pin 走 fixture PEM (真实 _MonitorCaFile 校验路径)
 # ============================================================
 
 load 'test_helper'
@@ -53,7 +55,8 @@ setup() {
     # ---- CA fixture: 首行 PEM 头 (通过 _MonitorCaFile 真实校验) ----
     printf -- '-----BEGIN CERTIFICATE-----\nFAKECA\n-----END CERTIFICATE-----\n' > "$CA_PEM"
 
-    # ---- curl stub: TG 调用记 TG_LOG; 推送调用按 STUB_PUSH_RC 模拟结果 ----
+    # ---- curl stub: TG 调用记 TG_LOG; 推送调用记完整参数到 PUSH_LOG (验证 --cacert pin/
+    #      标准验证分支), 按 STUB_PUSH_RC 模拟结果 ----
     cat > "${STUB_BIN}/curl" <<'EOF'
 #!/bin/sh
 case "$*" in
@@ -62,7 +65,7 @@ case "$*" in
         exit 0
         ;;
 esac
-printf 'PUSH\n' >> "${PUSH_LOG:?}"
+printf '%s\n' "$*" >> "${PUSH_LOG:?}"
 case "${STUB_PUSH_RC:-0}" in
     0) printf '{"ok":true,"deduped":false}'; exit 0 ;;
     *) exit "${STUB_PUSH_RC}" ;;
@@ -70,10 +73,10 @@ esac
 EOF
     chmod +x "${STUB_BIN}/curl"
 
-    # ---- wget stub (T1b curl 不可用时走此分支) ----
+    # ---- wget stub (T1b curl 不可用时走此分支; 同样记录完整参数) ----
     cat > "${STUB_BIN}/wget" <<'EOF'
 #!/bin/sh
-printf 'PUSH\n' >> "${PUSH_LOG:?}"
+printf '%s\n' "$*" >> "${PUSH_LOG:?}"
 case "${STUB_PUSH_RC:-0}" in
     0) printf '{"ok":true}'; exit 0 ;;
     *) exit "${STUB_PUSH_RC}" ;;
@@ -109,7 +112,7 @@ trap - EXIT
 exit $_rc
 EOF
 
-    # 清理 /tmp 固定路径残留 (T1b 依赖 /tmp/monitor-ca.pem fixture)
+    # 清理 /tmp 固定路径残留 (防历史 fixture 影响缺省标准验证路径测试)
     rm -f /tmp/monitor-ca.pem
 }
 
@@ -148,7 +151,7 @@ EOF
     [ "$(push_count)" -eq 1 ]                            # 不重试 (一般失败才 sleep 5 重试)
     [ "$(tg_count)" -eq 1 ]
     grep -q "TLS 证书校验失败" "$TG_LOG"
-    grep -q "monitor 证书与监控内部 CA 不匹配" "$TG_LOG"
+    grep -q "证书无法通过公网 CA 验证" "$TG_LOG"
     grep -q "密钥未外发" "$TG_LOG"
     case "$(gate_state)" in
         "TLS 证书校验失败"*) ;;
@@ -156,11 +159,10 @@ EOF
     esac
 }
 
-@test "T1b: wget 5 (SSL 校验失败, curl 不可用) → _TcpingPushOnce 映射 return 2" {
+@test "T1b: wget 5 (SSL 校验失败, curl 不可用, 缺省标准验证) → _TcpingPushOnce 映射 return 2" {
     export STUB_PUSH_RC=5
     unset MONITOR_CA
-    # /tmp CA fixture (MONITOR_CA 未设时 _MonitorCaFile 走此路径, 无外部命令依赖)
-    printf -- '-----BEGIN CERTIFICATE-----\nFAKECA\n' > /tmp/monitor-ca.pem
+    # 缺省无 pin → wget 分支不加 --ca-certificate (系统信任库标准验证)
     # wbin: 仅含 wget 桩 (无 curl) → command -v curl 落空, 真实代码走 wget 分支
     _wbin="${TEST_TMPDIR}/wbin"; mkdir -p "$_wbin"
     cp "${STUB_BIN}/wget" "${_wbin}/wget"
@@ -173,6 +175,7 @@ trap - EXIT
 exit $_rc' _ "${_wbin}" "${TEST_TMPDIR}/agent.lib.sh" 2>/dev/null
     [ "$status" -eq 2 ]
     [ "$(push_count)" -eq 1 ]
+    ! grep -q -- '--ca-certificate' "$PUSH_LOG"          # 无 pin 不带 CA 参数
 }
 
 # ============================================================
@@ -238,6 +241,47 @@ exit $_rc' _ "${_wbin}" "${TEST_TMPDIR}/agent.lib.sh" 2>/dev/null
     case "$(gate_state)" in
         "MONITOR_URL 非 https"*) ;;
         *) fail "last_push_gate 应记录前置门禁原因" ;;
+    esac
+}
+
+# ============================================================
+# T7: MONITOR_CA 未配置 (缺省) → 公网 CA 标准验证推送, 无门禁
+# ============================================================
+
+@test "T7: 无 MONITOR_CA → 标准验证推送成功, curl 不带 --cacert, 无门禁无 TG" {
+    unset MONITOR_CA
+    export STUB_PUSH_RC=0
+    run_push
+    [ "$status" -eq 0 ]
+    [ "$(push_count)" -eq 1 ]
+    ! grep -q -- '--cacert' "$PUSH_LOG"                   # 标准验证不带 pin 参数
+    [ "$(tg_count)" -eq 0 ]                              # 无门禁告警
+    [ -z "$(gate_state)" ]
+}
+
+@test "T7b: MONITOR_CA pin 配置时 → curl 带 --cacert (pin 加固路径不回退)" {
+    export STUB_PUSH_RC=0
+    run_push
+    [ "$status" -eq 0 ]
+    [ "$(push_count)" -eq 1 ]
+    grep -q -- '--cacert' "$PUSH_LOG"                     # pin 生效
+    [ "$(tg_count)" -eq 0 ]
+}
+
+# ============================================================
+# T8: MONITOR_CA 显式配置但不可用 → 前置门禁拒推 (拒绝降级)
+# ============================================================
+
+@test "T8: MONITOR_CA 文件不存在 → 拒推 + TG 一次, 未外发密钥" {
+    export MONITOR_CA="${TEST_TMPDIR}/nonexistent-ca.pem"
+    run_push
+    [ "$status" -eq 0 ]
+    [ "$(push_count)" -eq 0 ]                            # 未外发密钥
+    [ "$(tg_count)" -eq 1 ]
+    grep -q "MONITOR_CA 不可用" "$TG_LOG"
+    case "$(gate_state)" in
+        "MONITOR_CA 不可用"*) ;;
+        *) fail "last_push_gate 应记录 pin 不可用原因, 实际: $(gate_state)" ;;
     esac
 }
 
