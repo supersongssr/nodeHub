@@ -243,8 +243,13 @@ if USE_COLOR and sys.stdout.isatty():
 else:
     C_RED = C_YELLOW = C_GREEN = C_CYAN = C_DIM = C_BOLD = C_RESET = ''
 
-try:  # ssh/管道下保持行缓冲, 实时输出 (等价 sh 的无缓冲 printf)
-    sys.stdout.reconfigure(line_buffering=True)
+try:  # ssh/管道下保持行缓冲, 实时输出 (等价 sh 的无缓冲 printf);
+      # 并强制 UTF-8 输出 — 远端 locale 可能为非 UTF-8 (如 Debian 模板 LANG=en_US 即
+      # ISO-8859-1, stdout 编码 latin-1), 否则首个中文/emoji 输出即 UnicodeEncodeError,
+      # 连 INTERNAL_* 兜底也崩, 整个诊断中断 (--host 推到任意节点执行, 无法保证各节点
+      # locale 正确); errors='replace' 兜底其它不可编码字符, 绝不因输出编码中断
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
 except Exception:
     pass
 
