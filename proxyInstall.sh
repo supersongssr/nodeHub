@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.9.5-20260927"
+VERSION="v2.9.6-20260927"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -194,6 +194,84 @@ AssertValidJson() {
     log debug "断言通过: ${_desc} — 有效 JSON"
 }
 
+# ============================================================
+# 下载产物内容校验 — 供 FetchValidated 使用
+#   script  : 非空 + 以 #! 开头 (shell 脚本)
+#   elf     : 非空 + ELF 魔数 \x7fELF (二进制, od 取前 4 字节 hex)
+#   unit    : 非空 + 含 ExecStart (systemd unit, 截断的 unit 缺 ExecStart)
+#   nonempty: 非空 (数据文件, 如 geosite/geoip)
+#   cert    : 含 BEGIN CERTIFICATE (与 Step1_5 原校验同口径)
+#   key     : 含 PRIVATE KEY (与 Step1_5 原校验同口径)
+# 返回: 0 校验通过; 1 不通过 (含文件不存在)
+# ============================================================
+_ValidateFile() {
+    _vf_type="$1"
+    _vf_file="$2"
+    case "${_vf_type}" in
+        script)   [ -s "${_vf_file}" ] && [ "$(head -c 2 "${_vf_file}" 2>/dev/null)" = "#!" ] ;;
+        elf)      [ -s "${_vf_file}" ] && [ "$(od -An -tx1 -N4 "${_vf_file}" 2>/dev/null | tr -d ' \n')" = "7f454c46" ] ;;
+        unit)     [ -s "${_vf_file}" ] && grep -q 'ExecStart' "${_vf_file}" 2>/dev/null ;;
+        nonempty) [ -s "${_vf_file}" ] ;;
+        cert)     grep -q 'BEGIN CERTIFICATE' "${_vf_file}" 2>/dev/null ;;
+        key)      grep -q 'PRIVATE KEY' "${_vf_file}" 2>/dev/null ;;
+        *)        log error "_ValidateFile: 未知校验类型: ${_vf_type}"; return 2 ;;
+    esac
+}
+
+# ============================================================
+# wget 下载 + 内容校验 + 脏文件自愈 — 关键下载产物统一入口
+# why: wget -N 只比时间戳 — 上次下载中断留下的截断/空文件 (脏文件) 修改时间
+#      比服务器新, wget -N 会跳过下载并返回成功 → 坏文件永久残留, 重装也
+#      无法自愈 (nodeAgent.sh 加固处的注释详述了该机制)。只看退出码不看
+#      内容, 坏脚本/坏二进制/坏证书会被"成功"部署: 截断脚本语法报错、空
+#      脚本安静退出 0, 后台/cron 死掉均不推告警 → 解锁上报/监控采样等
+#      功能静默缺失 (f-24eb4a13 及同类)。
+# 流程: ① wget -N 常规下载 (远程更新才拉取; 本地已有且有效时, 服务器
+#          不可达也不阻断 — 沿用本地副本, 由内容校验统一裁决)
+#      ② 内容校验 (_ValidateFile)
+#      ③ 失败 → rm -f 删脏文件 + wget -O 强制重下一次 (无条件覆盖)
+#      ④ 仍失败 → 删除文件返回 1 (不留脏文件给下次重装)
+# 返回: 0 = 文件内容校验通过; 1 = 强制重下后仍不通过/下载失败
+# 用法: FetchValidated <校验类型> <本地绝对路径> <URL>
+#      (本地路径的 basename 须与 URL 的文件名一致 — wget -N -P 按此落盘)
+# ============================================================
+FetchValidated() {
+    _fv_type="$1"
+    _fv_file="$2"
+    _fv_url="$3"
+    _fv_dir="${_fv_file%/*}"
+    [ "${_fv_dir}" = "${_fv_file}" ] && _fv_dir="."
+    _fv_name="${_fv_file##*/}"
+
+    # ① 常规下载 (退出码不直接判失败 — 见函数头注释)
+    wget -N --timeout=60 --tries=3 -P "${_fv_dir}" "${_fv_url}" >/dev/null 2>&1 || true
+
+    # ② 内容校验
+    if _ValidateFile "${_fv_type}" "${_fv_file}"; then
+        log debug "${_fv_name} 已下载并内容校验通过 (${_fv_type})"
+        return 0
+    fi
+
+    # ③ 校验失败 = 本地脏文件残留或本次下载损坏 → 强制重下
+    log warn "${_fv_name} 内容校验失败 (${_fv_type}: 空文件/截断/非预期格式), 强制删除后重新下载: ${_fv_url}"
+    rm -f "${_fv_file}"
+    if ! wget --timeout=60 --tries=3 -O "${_fv_file}" "${_fv_url}" >/dev/null 2>&1; then
+        log error "${_fv_name} 强制重新下载失败: ${_fv_url}"
+        rm -f "${_fv_file}"
+        return 1
+    fi
+    if _ValidateFile "${_fv_type}" "${_fv_file}"; then
+        log info "${_fv_name} 强制重下后内容校验通过 (${_fv_type})"
+        return 0
+    fi
+
+    # ④ 下载源本身损坏
+    log error "${_fv_name} 重新下载后校验仍失败 — 下载源可能损坏: ${_fv_url}"
+    log error "${_fv_name} 内容前 200 字符: $(head -c 200 "${_fv_file}" 2>/dev/null)"
+    rm -f "${_fv_file}"
+    return 1
+}
+
 # 剥离所有非数字字符(保留小数点)，返回纯 float 字符串
 sanitize_float() {
     echo "$1" | tr -d '\n\r' | sed 's/[^0-9.]//g'
@@ -302,22 +380,33 @@ PersistNodeName() {
 #  消费端 tcpingCheck/proxyDiagnose 均有 md5(ip) 运行时兜底, 清理不影响行为)
 # ============================================================
 CleanupStaleStatUser() {
+    # 每处清理各自接住退出码: 仅成功才计入 _stale, 失败单独告警 —
+    # 否则残留与实际 -u (STAT_USER) 不符的 md5(IP) 检索键, 而日志宣称
+    # 已清理, 运维被误导 (f-091442d2)
     _stale=0
     if grep -q '^stat_user=' ~/node.env 2>/dev/null; then
-        flock /tmp/nodeEnv.lock sed -i '/^stat_user=/d' ~/node.env 2>/dev/null || true
-        _stale=1
+        if flock /tmp/nodeEnv.lock sed -i '/^stat_user=/d' ~/node.env 2>/dev/null; then
+            _stale=1
+        else
+            log warn "node.env 清理 stat_user= 行失败 (磁盘满/文件只读?) — 请手动删除 ~/node.env 中该行, 否则残留与实际 -u 不符的误导性检索键"
+        fi
     fi
     if [ -f ~/node.stat_user ]; then
-        rm -f ~/node.stat_user
-        _stale=1
+        if rm -f ~/node.stat_user 2>/dev/null; then
+            _stale=1
+        else
+            log warn "node.stat_user 删除失败 — 请手动删除, 否则残留与实际 -u 不符的误导性检索键"
+        fi
     fi
     if [ -f ~/node.json ] && grep -q '"stat_user"' ~/node.json 2>/dev/null; then
-        _tmp_cj=$(jq 'del(.stat_user)' ~/node.json 2>/dev/null) \
-            && printf '%s\n' "$_tmp_cj" > ~/node.json \
-            || log warn "~/node.json 清理 stat_user 字段失败, 跳过"
-        _stale=1
+        if _tmp_cj=$(jq 'del(.stat_user)' ~/node.json 2>/dev/null) \
+            && printf '%s\n' "$_tmp_cj" > ~/node.json; then
+            _stale=1
+        else
+            log warn "node.json 清理 stat_user 字段失败 — 请手动删除该字段, 否则残留与实际 -u 不符的误导性检索键"
+        fi
     fi
-    [ "${_stale}" = 1 ] && log info "已清理历史动态安装残留的 stat_user (node.env / node.stat_user / node.json)"
+    [ "${_stale}" = 1 ] && log info "已清理历史动态安装残留的 stat_user (成功的项; 失败项已单独 warn 告警, 不会静默)"
     return 0
 }
 
@@ -1558,7 +1647,10 @@ Step0_5_InstallServerStatus() {
     _script_url="${NODEHUB_URL}/scripts/${_script_name}"
 
     cd /tmp
-    wget -N --timeout=60 --tries=3 "${_script_url}" || die "${_script_name} 下载失败: ${_script_url}"
+    # 下载 + 内容校验 + 脏文件自愈: 坏脚本 sh 执行失败只留一条 error,
+    # 重装也无法自愈 (wget -N 不会重下脏文件)
+    FetchValidated script "/tmp/${_script_name}" "${_script_url}" \
+        || die "${_script_name} 下载或校验失败 (非空+#! 开头, 已尝试强制重下): ${_script_url}"
     chmod +x "/tmp/${_script_name}"
 
     # 3. 拼参: STAT_GID 存在 → group 模式 (追加 -g); alias 恒为 node_name
@@ -1726,20 +1818,16 @@ Step1_5_DownloadSSL() {
 
     [ -z "${root_domain:-}" ] && die "root_domain 为空，无法下载 SSL 证书"
 
-    wget -N --timeout=60 --tries=3 -P /etc/ssl "${NODEHUB_URL}/ssl/${root_domain}.key" \
-        || die "SSL key 下载失败: ${NODEHUB_URL}/ssl/${root_domain}.key"
-    wget -N --timeout=60 --tries=3 -P /etc/ssl "${NODEHUB_URL}/ssl/${root_domain}.pem" \
-        || die "SSL pem 下载失败: ${NODEHUB_URL}/ssl/${root_domain}.pem"
-
-    # 校验 PEM 文件格式 — .pem 必须包含 CERTIFICATE，.key 必须包含 PRIVATE KEY
+    # 下载 + 内容校验 + 脏文件自愈 (FetchValidated):
+    #   .pem 必须包含 CERTIFICATE, .key 必须包含 PRIVATE KEY;
+    #   此前校验失败只 die 不重下 — 截断脏文件因 wget -N 时间戳机制永久残留,
+    #   重装永远死在同一处且报错文案误导 (指向证书服务器而非本地脏文件)
     _pem_file="/etc/ssl/${root_domain}.pem"
     _key_file="/etc/ssl/${root_domain}.key"
-    if ! grep -q 'BEGIN CERTIFICATE' "$_pem_file" 2>/dev/null; then
-        die "SSL 证书格式错误: ${_pem_file} 不包含 CERTIFICATE — 源文件可能损坏，请检查证书服务器"
-    fi
-    if ! grep -q 'PRIVATE KEY' "$_key_file" 2>/dev/null; then
-        die "SSL 私钥格式错误: ${_key_file} 不包含 PRIVATE KEY — 源文件可能损坏，请检查证书服务器"
-    fi
+    FetchValidated key "${_key_file}" "${NODEHUB_URL}/ssl/${root_domain}.key" \
+        || die "SSL key 下载或校验失败 (不含 PRIVATE KEY, 已尝试强制重下): ${NODEHUB_URL}/ssl/${root_domain}.key"
+    FetchValidated cert "${_pem_file}" "${NODEHUB_URL}/ssl/${root_domain}.pem" \
+        || die "SSL pem 下载或校验失败 (不含 CERTIFICATE, 已尝试强制重下): ${NODEHUB_URL}/ssl/${root_domain}.pem"
 
     log info "SSL 证书已下载并校验通过: ${_pem_file} ${_key_file}"
 }
@@ -1803,8 +1891,10 @@ Step3_InstallXray() {
     # 下载二进制到 /tmp，wget -N 跳过已下载的同名文件
     log info "下载 Xray 内核: ${xray_bin_name}..."
     xray_url="${NODEHUB_URL}/xray/${xray_bin_name}"
-    wget -N --timeout=60 --tries=3 -P /tmp "$xray_url" \
-        || die "Xray 内核下载失败: ${xray_url}"
+    # ELF 魔数校验 + 脏文件自愈: 截断的二进制 cp 成 xray 后服务起不来,
+    # 且重装无法自愈 (wget -N 不会重下脏文件)
+    FetchValidated elf "/tmp/${xray_bin_name}" "${xray_url}" \
+        || die "Xray 内核下载或校验失败 (非空+ELF 魔数, 已尝试强制重下): ${xray_url}"
 
     # 复制并改名
     cp -f "/tmp/${xray_bin_name}" "$xray_bin_path"
@@ -1831,20 +1921,21 @@ Step3_InstallXray() {
     chown -R root:root /var/log/xray 2>/dev/null || true
     log info "Xray 日志目录就绪: /var/log/xray"
 
-    # 下载 GeoIP/GeoSite 数据文件
+    # 下载 GeoIP/GeoSite 数据文件 (非空校验 + 脏文件自愈: 截断的 dat 会让 xray 启动失败)
     mkdir -p /usr/local/share/xray
     log info "下载 geosite.dat..."
-    wget -N --timeout=60 --tries=3 -P /usr/local/share/xray "${NODEHUB_URL}/geodat/geosite.dat" \
-        || die "geosite.dat 下载失败: ${NODEHUB_URL}/geodat/geosite.dat"
+    FetchValidated nonempty /usr/local/share/xray/geosite.dat "${NODEHUB_URL}/geodat/geosite.dat" \
+        || die "geosite.dat 下载或校验失败 (空文件, 已尝试强制重下): ${NODEHUB_URL}/geodat/geosite.dat"
     log info "下载 geoip.dat..."
-    wget -N --timeout=60 --tries=3 -P /usr/local/share/xray "${NODEHUB_URL}/geodat/geoip.dat" \
-        || die "geoip.dat 下载失败: ${NODEHUB_URL}/geodat/geoip.dat"
+    FetchValidated nonempty /usr/local/share/xray/geoip.dat "${NODEHUB_URL}/geodat/geoip.dat" \
+        || die "geoip.dat 下载或校验失败 (空文件, 已尝试强制重下): ${NODEHUB_URL}/geodat/geoip.dat"
     log info "GeoIP/GeoSite 数据已下载到 /usr/local/share/xray/"
 
-    # 下载 xray.service 守护文件
+    # 下载 xray.service 守护文件 (非空 + 含 ExecStart 校验: 截断的 unit
+    # 缺 ExecStart, daemon-reload 后服务起不来且无自愈)
     service_url="${NODEHUB_URL}/configs/xray/xray.service"
-    wget -N --timeout=60 --tries=3 -P /tmp "$service_url" \
-        || die "xray.service 下载失败: ${service_url}"
+    FetchValidated unit /tmp/xray.service "${service_url}" \
+        || die "xray.service 下载或校验失败 (非空+含 ExecStart, 已尝试强制重下): ${service_url}"
 
     cp -f /tmp/xray.service /etc/systemd/system/xray.service
     systemctl daemon-reload
@@ -1896,9 +1987,14 @@ Step3_InstallNginx() {
     # 确保 Nginx >= 1.25.1 (新版 http2 语法: http2 on; 而非 listen ... http2)
     EnsureNginxLatest
 
-    # POST /api/node/nginx_config — 前端渲染完整 proxy.conf，节点直接落盘
+    # POST /api/node/nginx_config — 前端渲染完整 proxy.conf
+    # 先下到临时文件, 仅 HTTP 200 且内容有效才落盘 conf.d:
+    # curl -o 对 404/5xx 同样会写响应体, 直接落盘线上文件会把错误页/空体
+    # 写进 /etc/nginx/conf.d/proxy.conf — 运行中的 nginx 当下不受影响,
+    # 但下次重启/重载 nginx -t 失败起不来 (vision 节点 404 是正常路径, 更不能碰)
+    _proxy_conf_tmp=/tmp/proxy.conf.new
     http_code=$(curl -sS --connect-timeout 30 --max-time 60 \
-        -o /etc/nginx/conf.d/proxy.conf \
+        -o "${_proxy_conf_tmp}" \
         -w "%{http_code}" \
         -H "Authorization: Bearer ${API_TOKEN}" \
         -d "node_id=${NODE_ID}" \
@@ -1906,15 +2002,41 @@ Step3_InstallNginx() {
 
     case "$http_code" in
         200)
-            nginx -t 2>&1 || die "Nginx 配置语法检查失败"
+            # 内容校验: HTTP 200 但空响应体 (面板异常) 不落盘
+            if [ ! -s "${_proxy_conf_tmp}" ]; then
+                rm -f "${_proxy_conf_tmp}"
+                die "Nginx 配置内容为空 (HTTP 200 但响应体 0 字节): ${API_URL}/api/node/nginx_config"
+            fi
+            # 备份现有配置: 语法检查失败时回滚 — 坏配置残留 conf.d 会让
+            # 下次重启 nginx 起不来
+            _conf_bak=""
+            if [ -f /etc/nginx/conf.d/proxy.conf ]; then
+                _conf_bak=/tmp/proxy.conf.bak.$$
+                cp -f /etc/nginx/conf.d/proxy.conf "${_conf_bak}"
+            fi
+            cp -f "${_proxy_conf_tmp}" /etc/nginx/conf.d/proxy.conf
+            if ! _nginx_t_err=$(nginx -t 2>&1); then
+                if [ -n "${_conf_bak}" ]; then
+                    cp -f "${_conf_bak}" /etc/nginx/conf.d/proxy.conf
+                    rm -f "${_conf_bak}"
+                    log warn "新配置语法检查失败, 已回滚为原 /etc/nginx/conf.d/proxy.conf"
+                fi
+                rm -f "${_proxy_conf_tmp}"
+                die "Nginx 配置语法检查失败: ${_nginx_t_err}"
+            fi
+            rm -f "${_proxy_conf_tmp}"
+            [ -n "${_conf_bak}" ] && rm -f "${_conf_bak}"
             systemctl restart nginx
             systemctl enable nginx
             log info "Nginx 服务已启动"
             ;;
         404)
-            log info "该节点无 Nginx 配置 (如 vision 模式)，跳过"
+            # 该节点无 Nginx 配置 (如 vision 模式) — 不改动现有 conf.d 文件
+            rm -f "${_proxy_conf_tmp}"
+            log info "该节点无 Nginx 配置 (如 vision 模式)，跳过 (未改动 /etc/nginx/conf.d/proxy.conf)"
             ;;
         *)
+            rm -f "${_proxy_conf_tmp}"
             die "Nginx 配置下载失败: HTTP ${http_code}"
             ;;
     esac
@@ -2258,8 +2380,11 @@ Step4_DeployCrontab() {
     log info "nodeAgent.sh 已下载并校验通过 (以 #! 开头, $(wc -c < "$_agent_file") bytes)"
 
     # 下载 nodeMonitor.sh (每分钟执行)
-    wget -N --timeout=60 --tries=3 -P ~ "${NODEHUB_URL}/nodeMonitor.sh" \
-        || die "nodeMonitor.sh 下载失败: ${NODEHUB_URL}/nodeMonitor.sh"
+    # 与上方 nodeAgent.sh 同口径的完整性校验 + 强制重下: cron 每分钟静默执行,
+    # 坏脚本只往 /tmp 日志刷语法错误、空脚本安静退出 0, 均无任何告警 —
+    # 流量采样 (~/nodeMonitor.json) 静默停摆, 只能靠安装期把好内容关
+    FetchValidated script "${HOME}/nodeMonitor.sh" "${NODEHUB_URL}/nodeMonitor.sh" \
+        || die "nodeMonitor.sh 下载或校验失败 (非空+#! 开头, 已尝试强制重下): ${NODEHUB_URL}/nodeMonitor.sh"
     chmod +x ~/nodeMonitor.sh
     log info "nodeMonitor.sh 已下载到 ~/"
 
@@ -2313,7 +2438,8 @@ Step4_DeployCrontab() {
 #   unlockCheck RunUnlockCheck 仅按 -f 判断是否跳过探测, 空文件不删则
 #   异步路径同样不重新探测 → 上报缺整块字段 → 解锁路由丢失。
 # 三重回退 (均安全降级到异步闭环, 只是多拉一次):
-#   ① 下载失败  ② 脚本执行失败  ③ 上报响应无 "updated":[..."] 非空数组
+#   ① 下载或内容校验失败 (非空+#! 校验, 失败自动强制重下)  ② 脚本执行失败
+#   ③ 上报响应无 "updated":[..."] 非空数组
 #   (防缓存存在但解析为空 → 面板 node_unlock 仍空 → 单次拉取丢失解锁路由)
 # 副作用: 置 _unlock_synced=true, 供 Step4_5 跳过异步闭环
 # ============================================================
@@ -2343,8 +2469,11 @@ Step2_6_PreSyncUnlock() {
         return 0
     fi
 
-    wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/unlockCheck.sh" \
-        || { log warn "unlockCheck.sh 下载失败, 回退 Step4.5 异步闭环"; return 0; }
+    # 下载 + 内容校验 + 脏文件自愈 (f-24eb4a13): 截断的 unlockCheck.sh
+    # 语法报错退出、空文件安静退出 0, 后台 nohup 死掉不推 Telegram →
+    # 解锁上报静默缺失; 且 wget -N 不重下脏文件, 必须校验+强制重下
+    FetchValidated script /tmp/unlockCheck.sh "${NODEHUB_URL}/unlockCheck.sh" \
+        || { log warn "unlockCheck.sh 下载或校验失败 (非空+#! 开头, 已尝试强制重下), 回退 Step4.5 异步闭环"; return 0; }
     chmod +x /tmp/unlockCheck.sh
 
     log info "缓存命中, 同步补报解锁数据 (仅解析+上报, 数秒)..."
@@ -2377,8 +2506,11 @@ Step4_5_LaunchUnlockCheck() {
 
     log info "Step 4.5: 下载并后台启动 unlockCheck.sh"
 
-    wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/unlockCheck.sh" \
-        || { log error "unlockCheck.sh 下载失败"; return 1; }
+    # 下载 + 内容校验 + 脏文件自愈 (f-24eb4a13, 与 Step 2.6 同口径):
+    # 坏脚本 nohup 后台死掉无任何告警 → 解锁数据不再上报、面板 node_unlock
+    # 缺失、config.json 丢解锁路由, 无自动恢复
+    FetchValidated script /tmp/unlockCheck.sh "${NODEHUB_URL}/unlockCheck.sh" \
+        || { log error "unlockCheck.sh 下载或校验失败 (非空+#! 开头, 已尝试强制重下)"; return 1; }
     chmod +x /tmp/unlockCheck.sh
     log info "unlockCheck.sh 已下载到 /tmp/"
 

@@ -68,9 +68,17 @@ EOF
     chmod +x "${MOCK_BIN_DIR}"/*
     export PATH="${MOCK_BIN_DIR}:${PATH}"
 
+    # 防串扰: 重写路径会校验 /tmp 下的子脚本 — 确保不存在有效残留
+    # (本机恰好残留有效脚本时, FetchValidated 会沿用本地副本而不再 die)
+    rm -f /tmp/serverstatus_client_install.sh
+
     # ---- 提取被测函数 (不能 source 整个 proxyInstall.sh — 末尾会执行 Main) ----
     sed -n '/^Step0_5_InstallServerStatus() {/,/^}$/p' \
         "${PROJECT_ROOT}/proxyInstall.sh" > "${TEST_TMPDIR}/step05.sh"
+
+    # Step0_5 的子脚本下载走 FetchValidated (下载+校验+强制重下) — 一并提取
+    sed -n '/^_ValidateFile() {/,/^}$/p;/^FetchValidated() {/,/^}$/p' \
+        "${PROJECT_ROOT}/proxyInstall.sh" > "${TEST_TMPDIR}/fetch_validated.sh"
 
     # ---- 桩: log / die ----
     cat > "${TEST_TMPDIR}/stubs.sh" <<'EOF'
@@ -78,6 +86,7 @@ log() { _lvl="$1"; shift; echo "[${_lvl}] $*" >> "${MOCK_STATE_DIR}/log.out"; }
 die() { log error "die: $*"; exit 1; }
 EOF
     . "${TEST_TMPDIR}/stubs.sh"
+    . "${TEST_TMPDIR}/fetch_validated.sh"
     . "${TEST_TMPDIR}/step05.sh"
 
     # ---- 公共环境 (各测试按需覆盖) ----
