@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.9.6-20260927"
+VERSION="v2.9.7-20260930"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -2447,6 +2447,9 @@ Step2_6_PreSyncUnlock() {
     log info "Step 2.6: 检查解锁检测缓存 (命中则同步补报, 避免二次拉取配置)"
 
     _all_cached=true
+    # 注: 缓存只判非空、不做时效判定 — owner 裁定 (f-b0e23df0 won't fix):
+    # 节点 IP 的解锁结果一般不会变化, 重装沿用既有缓存属可接受行为,
+    # 无需 24h 过期/每日巡检; 需强制刷新走 sh ~/manage.sh unlock (清缓存重探)
     for _f in /tmp/media_unlock_clean.txt /tmp/media_check_clean.txt \
               /tmp/check_google_scholar_unlock.json /tmp/notebooklm_check_result.json; do
         if [ -s "$_f" ]; then
@@ -2496,6 +2499,8 @@ Step2_6_PreSyncUnlock() {
 # ============================================================
 # Step 4.5: 下载并后台启动 unlockCheck.sh
 # (缓存命中的重装已由 Step 2.6 同步补报, 此处跳过 — config.json 仅拉取一次)
+# 容错: unlockCheck 属非关键收尾组件, 下载/校验失败仅告警放行不中断安装
+#       (f-7745b04d, 与 Step2.6/Step4.6 同口径); 解锁闭环可事后 sh ~/manage.sh unlock 补做
 # ============================================================
 Step4_5_LaunchUnlockCheck() {
     # Step 2.6 已同步补报 (缓存命中) → 无需异步闭环, 跳过二次拉取+重启
@@ -2509,8 +2514,11 @@ Step4_5_LaunchUnlockCheck() {
     # 下载 + 内容校验 + 脏文件自愈 (f-24eb4a13, 与 Step 2.6 同口径):
     # 坏脚本 nohup 后台死掉无任何告警 → 解锁数据不再上报、面板 node_unlock
     # 缺失、config.json 丢解锁路由, 无自动恢复
+    # 容错 (f-7745b04d): 下载/校验失败仅告警放行 — 此刻 xray/nginx 已就绪,
+    # return 1 在 set -e 下会把整套安装在最后一步误判为失败 (假告警,
+    # Step4.6/安装摘要全部跳过), 404 类确定性失败重试也救不了
     FetchValidated script /tmp/unlockCheck.sh "${NODEHUB_URL}/unlockCheck.sh" \
-        || { log error "unlockCheck.sh 下载或校验失败 (非空+#! 开头, 已尝试强制重下)"; return 1; }
+        || { log warn "unlockCheck.sh 下载或校验失败 (非空+#! 开头, 已尝试强制重下), 跳过解锁检测 (安装不受影响, 可事后 sh ~/manage.sh unlock 补做)"; return 0; }
     chmod +x /tmp/unlockCheck.sh
     log info "unlockCheck.sh 已下载到 /tmp/"
 

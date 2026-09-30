@@ -11,6 +11,12 @@
 # 用法:
 #   直接运行:  sh ~/unlockCheck.sh
 #   后台运行:  nohup sh ~/unlockCheck.sh >> ~/nodeLogs 2>&1 &
+# 威胁模型备注 (owner 裁定, 复审 f-644a3931/f-bfcbadb5 及同类 won't fix):
+#   本脚本以 root 运行, 锁文件/临时配置/检测脚本与结果均落 /tmp 固定路径,
+#   理论上可被本地用户以符号链接/预置文件劫持 (不安全临时文件模式, 含
+#   安装器侧 /tmp/unlockCheck.out 等同类写入)。节点服务器仅 root 用户可
+#   登录 — 若出现可利用的非 root 本地用户, 即代表主机已被攻破, 威胁已
+#   超出本脚本防护范围, 故不迁移 /run, 维持现状。
 # ============================================================
 
 set -eu
@@ -78,13 +84,18 @@ RunUnlockCheck() {
     cd /tmp || return
 
     # Script 1: check.unlock.media — Netflix/Disney/ChatGPT/Claude/Gemini 等
+    # 下载补重试 (f-b8af5b23); 空结果不落缓存 — 见下方非空校验
     if [ ! -f /tmp/media_unlock_clean.txt ]; then
         log info "执行 check.unlock.media..."
-        curl -L -s check.unlock.media > /tmp/_media_unlock_script.sh 2>/dev/null || true
+        curl -L -s --retry 3 --retry-delay 5 check.unlock.media > /tmp/_media_unlock_script.sh 2>/dev/null || true
         if [ -f /tmp/_media_unlock_script.sh ]; then
             echo 66 | bash /tmp/_media_unlock_script.sh > /tmp/media_unlock.txt 2>/dev/null || true
         fi
         sed -r 's/\x1b\[[0-9;]*m//g' /tmp/media_unlock.txt > /tmp/media_unlock_clean.txt 2>/dev/null || true
+        # 空结果不落缓存 (f-b8af5b23): 下载/执行失败产生的 0 字节文件若残留,
+        # 下方 [ ! -f ] 会判"已缓存"永久跳过探测 → 上报缺整块字段且不再重试;
+        # 删掉则本次按缺失解析、下次运行自动重探
+        [ -s /tmp/media_unlock_clean.txt ] || rm -f /tmp/media_unlock_clean.txt
     else
         log debug "check.unlock.media 结果已缓存，跳过"
     fi
@@ -92,11 +103,12 @@ RunUnlockCheck() {
     # Script 2: yeahwu/check — TikTok/Bilibili/iQIYI
     if [ ! -f /tmp/media_check_clean.txt ]; then
         log info "执行 yeahwu/check..."
-        wget -qO /tmp/_media_check_script.sh https://github.com/yeahwu/check/raw/main/check.sh 2>/dev/null || true
+        wget --timeout=60 --tries=3 -qO /tmp/_media_check_script.sh https://github.com/yeahwu/check/raw/main/check.sh 2>/dev/null || true
         if [ -f /tmp/_media_check_script.sh ]; then
             bash /tmp/_media_check_script.sh > /tmp/media_check.txt 2>/dev/null || true
         fi
         sed -r 's/\x1b\[[0-9;]*m//g' /tmp/media_check.txt > /tmp/media_check_clean.txt 2>/dev/null || true
+        [ -s /tmp/media_check_clean.txt ] || rm -f /tmp/media_check_clean.txt
     else
         log debug "yeahwu/check 结果已缓存，跳过"
     fi
@@ -106,6 +118,8 @@ RunUnlockCheck() {
         log info "执行 Google Scholar 检测..."
         wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/scripts/check_google_scholar_standalone.py" 2>/dev/null || true
         [ -f /tmp/check_google_scholar_standalone.py ] && python3 /tmp/check_google_scholar_standalone.py 2>/dev/null || true
+        # 同 f-b8af5b23: 空结果不落缓存, 避免被 [ ! -f ] 判已缓存永久跳过
+        [ -s /tmp/check_google_scholar_unlock.json ] || rm -f /tmp/check_google_scholar_unlock.json
     else
         log debug "Google Scholar 结果已缓存，跳过"
     fi
@@ -115,6 +129,7 @@ RunUnlockCheck() {
         log info "执行 NotebookLM 检测..."
         wget -N --timeout=60 --tries=3 -P /tmp "${NODEHUB_URL}/scripts/notebooklm_unlock_checker.py" 2>/dev/null || true
         [ -f /tmp/notebooklm_unlock_checker.py ] && python3 /tmp/notebooklm_unlock_checker.py 2>/dev/null || true
+        [ -s /tmp/notebooklm_check_result.json ] || rm -f /tmp/notebooklm_check_result.json
     else
         log debug "NotebookLM 结果已缓存，跳过"
     fi
