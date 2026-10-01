@@ -17,11 +17,21 @@
 #   安装器侧 /tmp/unlockCheck.out 等同类写入)。节点服务器仅 root 用户可
 #   登录 — 若出现可利用的非 root 本地用户, 即代表主机已被攻破, 威胁已
 #   超出本脚本防护范围, 故不迁移 /run, 维持现状。
+# 2026-09-30 整组复审续裁 (同一理念: 不为穷尽每个理论缺陷把系统复杂化 —
+#   引入更多代码只会带来更多 bug 和漏洞, 理论风险交给告警监控与人工兜底):
+#   * f-7e4899f0(检测脚本下载)/f-b3b4615a(锁文件)/f-603b8ec4(结果文件) —
+#     同上 /tmp 固定路径类, won't fix, 维持现状
+#   * f-8e63a1a9(check.unlock.media 明文拉取) — 该下载本身即网络测试性质
+#     (测这条网络是否正常/能否解锁), owner 接受链路风险, won't fix
+#   * .env 显式 http:// 的 API_URL/NODEHUB_URL — .env 属管理员核心配置,
+#     显式写 http:// 即管理员的主动选择, 尊重之, 不告警不阻断
+#   * f-b96b52eb(同步失败留半截配置) — 不做原子替换等复杂加固, 以告警
+#     监控代替: 检测到 xray 未正确启动/配置可疑时 XrayDownNotify 推送 TG
 # ============================================================
 
 set -eu
 
-SCRIPT_VERSION="v1.3.1-$(date '+%Y%m%d')"
+SCRIPT_VERSION="v1.4.0-$(date '+%Y%m%d')"
 
 # ============================================================
 # 日志
@@ -50,6 +60,10 @@ LoadEnv() {
     [ -f ~/.env ] && . ~/.env || { log error "加载 ~/.env 失败"; exit 1; }
     [ -f ~/node.env ] && . ~/node.env || true
 
+    # 传输协议 (owner 裁定 won't fix, 2026-09-30 复审): .env 属管理员核心配置,
+    #   显式写 http:// 即管理员的主动选择, 尊重之 — 不告警不阻断; 这里仅对
+    #   "忘写协议"的情况自动补 https:// (与 nodeAgent 侧的明文告警口径不同:
+    #   那边是每小时常驻上报, 本脚本低频一次性运行, 无需告警)
     case "${API_URL:-}" in http*) ;; *) API_URL="https://${API_URL}" ;; esac
     case "${NODEHUB_URL:-}" in http*) ;; *) NODEHUB_URL="https://${NODEHUB_URL}" ;; esac
 
@@ -85,6 +99,9 @@ RunUnlockCheck() {
 
     # Script 1: check.unlock.media — Netflix/Disney/ChatGPT/Claude/Gemini 等
     # 下载补重试 (f-b8af5b23); 空结果不落缓存 — 见下方非空校验
+    # 明文 http 拉取 (f-8e63a1a9, owner 裁定 won't fix 2026-09-30): 本步本身
+    #   就是网络测试性质 — 测这条网络是否正常、能否解锁, owner 接受链路
+    #   风险, 维持现状不改协议
     if [ ! -f /tmp/media_unlock_clean.txt ]; then
         log info "执行 check.unlock.media..."
         curl -L -s --retry 3 --retry-delay 5 check.unlock.media > /tmp/_media_unlock_script.sh 2>/dev/null || true
@@ -203,6 +220,36 @@ SubmitUnlockCheck() {
         "${API_URL}/api/node/unlock_check" 2>&1) || true
 
     log info "上报结果: ${_response}"
+}
+
+# ============================================================
+# XrayDownNotify — 检测到 xray 未正确启动/配置落盘可疑时推送 Telegram
+# owner 裁定 (2026-09-30 复审, f-b96b52eb): 配置同步失败等场景不做原子
+# 替换之类的复杂加固 (引入更多代码 = 更多 bug 面), 以告警监控代替 —
+# 出问题第一时间让人知道, 人工介入兜底。
+# * TG 配置取 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID, 兼容旧名
+#   TG_BOT_TOKEN/TG_CHAT_ID (与 nodeAgent/proxyInstall 同口径); 未配置则
+#   仅走 log, 静默跳过推送, 绝不影响主流程
+# * 同一次运行只推一条 (_xray_alerted 置位去重, 防同故障连环刷屏)
+# ============================================================
+XrayDownNotify() {
+    _reason="$1"
+    log error "xray 异常告警: ${_reason}"
+    [ "${_xray_alerted:-0}" = "1" ] && return 0
+    _xray_alerted=1
+    _tg_token="${TELEGRAM_BOT_TOKEN:-${TG_BOT_TOKEN:-}}"
+    _tg_chat="${TELEGRAM_CHAT_ID:-${TG_CHAT_ID:-}}"
+    { [ -z "$_tg_token" ] || [ -z "$_tg_chat" ]; } && return 0
+    _tg_text="🚨 [NodeHub] unlockCheck.sh — xray 未正确启动
+节点ID: ${NODE_ID:-N/A}
+时间: $(date '+%Y-%m-%d %H:%M:%S')
+情况: ${_reason}
+请人工检查: systemctl status xray ; xray run -test -config /usr/local/etc/xray/config.json ; df -h"
+    curl -sS --connect-timeout 5 --max-time 15 \
+        --data-urlencode "chat_id=${_tg_chat}" \
+        --data-urlencode "text=${_tg_text}" \
+        "https://api.telegram.org/bot${_tg_token}/sendMessage" >/dev/null 2>&1 || true
+    return 0
 }
 
 # ============================================================
@@ -349,10 +396,19 @@ RefreshXrayConfig() {
     if ! cp -f "$_home_conf" "$_xray_conf" 2>/dev/null; then
         log error "同步 ${_xray_conf} 失败, 放弃更新 (xray 继续运行现有配置)"
         # cp 失败可能已截断/部分写入目标 — 尽力以备份恢复 xray 目录配置
+        _xray_conf_dirty=0
         if [ -n "$_backup" ] && [ -f "$_backup" ]; then
             cp -f "$_backup" "$_xray_conf" 2>/dev/null \
-                || log error "备份恢复 ${_xray_conf} 亦失败, 请人工检查: ls -l ${_xray_conf}"
+                || { log error "备份恢复 ${_xray_conf} 亦失败, 请人工检查: ls -l ${_xray_conf}"; _xray_conf_dirty=1; }
+        else
+            # 无备份 (首装/备份拷贝同因磁盘满先失败) → 残缺文件留在原位
+            _xray_conf_dirty=1
         fi
+        # f-b96b52eb (owner 裁定 2026-09-30): 不做原子替换等复杂加固, 以告警
+        # 监控代替 — 半截配置会让 xray 下次重启起不来, 此刻 xray 仍在跑旧
+        # 配置, 推 TG 让人工尽快处理 (查磁盘空间/配置文件)
+        [ "$_xray_conf_dirty" = "1" ] && XrayDownNotify \
+            "同步 ${_xray_conf} 失败且未能以备份恢复 — 磁盘可能残留半截配置, xray 下次重启将启动失败 (当前仍在运行旧配置); 请检查磁盘空间与配置文件"
         _UndoHomeConfWrite "$_backup"
         return 1
     fi
@@ -371,6 +427,7 @@ RefreshXrayConfig() {
     if ! systemctl restart xray 2>/dev/null; then
         log error "systemctl restart xray 失败"
         _RollbackXrayConfig "$_backup" "$_xray_conf"
+        XrayDownNotify "systemctl restart xray 失败, 已回滚旧配置并重试 (当前 is-active: $(systemctl is-active xray 2>/dev/null || echo unknown)) — 节点疑似下线, 请立即人工检查"
         return 1
     fi
 
@@ -389,6 +446,7 @@ RefreshXrayConfig() {
 
     log error "xray 重启后健康验证失败 (is-active 非 active), 回滚旧配置"
     _RollbackXrayConfig "$_backup" "$_xray_conf"
+    XrayDownNotify "新配置重启后健康验证失败, 已回滚旧配置并重启 (当前 is-active: $(systemctl is-active xray 2>/dev/null || echo unknown)) — 若非 active 节点已下线, 请立即人工检查"
     return 1
 }
 
