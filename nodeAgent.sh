@@ -9,7 +9,9 @@
 #       Telegram 通知仅在【被墙状态迁移】时发送一次 (详见 TcpingPortCheck);
 #       CDN 模式节点 (~/node.json v2_name 含 cdn, 如 xhttp-cdn / xhttp-cdn-hy2) 不发被墙通知
 #       (套 CDN 即已知 IP 被墙, IP 被墙则端口必被墙), 反之检测到大陆恢复可达时发一次解封通知
-#       (提示可换回直连, 与监控侧 "非CDN在线节点才判被墙 / CDN 只判解封" 口径对齐)
+#       (提示可换回直连, 与监控侧 "非CDN在线节点才判被墙 / CDN 只判解封" 口径对齐);
+#       vnstat 运行状态巡检 — 服务未运行/数据停更时按状态迁移发一次 Telegram 告警
+#       (2026-07-09 事故: vnstat.service 静默停摆 83 天无人知晓, 面板历史只见 "-")
 # 约束: 严禁在节点端进行流量计算、单位换算或清零操作
 # ============================================================
 
@@ -238,6 +240,78 @@ CollectRawTraffic() {
     SERVER_UPTIME=$(awk '{print int($1)}' /proc/uptime)
 
     log debug "采集完成 — raw_rx=${RAW_RX} raw_tx=${RAW_TX} uptime=${SERVER_UPTIME}"
+}
+
+# ============================================================
+# vnstat 运行状态巡检 — 未运行/数据停更时按状态迁移告警一次
+# 背景: 2026-07-09 事故 — vnstat.service 因数据库属主被改为 root, vnstat 用户
+#       写库失败退出 (默认每 5 分钟保存一次), systemd 重试达限后永久 failed,
+#       静默停摆 83 天才被发现; 面板 7 日历史只显示 "-", 无任何主动告警。
+# 检测 (两层, 任一命中即判异常):
+#   1) 服务/进程层: 有 systemctl → is-active vnstat ≠ active;
+#      无 systemctl (容器等) → pgrep 不到 vnstatd 进程
+#   2) 数据新鲜度层: 服务在跑但 vnstat 自报 updated 时间 > 15 分钟
+#      (3 个保存周期) 未推进 → 疑似写库失败 (即上述事故的故障形态);
+#      vnstat 2.x 的 updated 是本地日期时间结构 (非 epoch, 实测 2.6:
+#      date:{year,month,day} + time:{hour,minute}), 拼回 "Y-M-D H:M" 交
+#      GNU date -d 按系统时区转 epoch (与 vnstat 写入同时区, 无偏差);
+#      解析不出 (vnstat 1.x / jq 缺失 / date 不支持 -d) → 静默跳过本层
+# 告警语义 (对齐 tcping 被墙通知: 仅状态迁移时发, 不刷屏):
+#   * ok → down : log warn (默认阈值 warn 即推送 Telegram, 附处置命令)
+#   * down → ok : log info (本地 ~/nodeLogs 留痕; 需 TG_NOTIFY_LEVEL=info 才推送)
+#   * 持续 down : 静默去重 — 状态文件 ~/nodeAgent.vnstat.state 记忆, 逐小时不重复告警
+# 约束: 只告警不自愈 (处置由人工确认, 与 "被墙不自愈换端口" 同口径, 避免错误属主
+#       下反复拉起刷日志); vnstat 未安装 → 静默跳过 (非基线依赖); 恒 return 0 不阻断上报
+# ============================================================
+CheckVnstatHealth() {
+    # vnstat 未安装 → 静默跳过 (与 CollectVnstatTraffic 同口径)
+    command -v vnstat >/dev/null 2>&1 || return 0
+
+    _vh_state_f=~/nodeAgent.vnstat.state
+    _vh_prev=$(cat "$_vh_state_f" 2>/dev/null || true)
+    _vh_reason=""
+
+    # 1) 服务/进程层
+    if command -v systemctl >/dev/null 2>&1; then
+        _vh_active=$(systemctl is-active vnstat 2>/dev/null || true)
+        [ "$_vh_active" = "active" ] \
+            || _vh_reason="vnstat 服务未运行 (systemctl is-active vnstat → ${_vh_active:-unknown})"
+    else
+        pgrep -x vnstatd >/dev/null 2>&1 \
+            || _vh_reason="vnstat 服务未运行 (无 systemctl 环境, pgrep vnstatd 未命中)"
+    fi
+
+    # 2) 数据新鲜度层 — 仅服务层通过时评估; 取 vnstat 自报 updated (与 dbdir 配置无关)
+    if [ -z "$_vh_reason" ]; then
+        _vh_upd_txt=$(vnstat --json d 2>/dev/null | jq -r '
+            .interfaces[0].updated
+            | "\(.date.year)-\(.date.month)-\(.date.day) \(.time.hour):\(.time.minute)"' 2>/dev/null || true)
+        _vh_upd=$(date -d "${_vh_upd_txt}:00" +%s 2>/dev/null || true)
+        if [ -n "$_vh_upd" ]; then
+            _vh_age=$(( $(date +%s) - _vh_upd ))
+            [ "$_vh_age" -gt 900 ] \
+                && _vh_reason="vnstat 数据已 $((_vh_age / 60)) 分钟未更新 (服务在跑, 疑似写库失败)"
+        fi
+    fi
+
+    if [ -n "$_vh_reason" ]; then
+        printf 'down\n' > "$_vh_state_f" 2>/dev/null || true
+        # 仅 ok→down (或首次发现) 告警; 持续 down 静默 (debug 留痕)
+        if [ "$_vh_prev" != "down" ]; then
+            log warn "vnstat 未在运行 — ${_vh_reason}
+处置: systemctl reset-failed vnstat && systemctl start vnstat
+      若启动后反复失败, 检查 /var/lib/vnstat 及 vnstat.db 属主 (应为 vnstat:vnstat,
+      2026-07-09 事故根因即属主被改为 root 致写库失败)"
+        else
+            log debug "vnstat 持续异常 (已告警过, 静默): ${_vh_reason}"
+        fi
+        return 0
+    fi
+
+    printf 'ok\n' > "$_vh_state_f" 2>/dev/null || true
+    # down → ok 恢复留痕 (info 不推 TG, 防恢复/抖动刷屏; 管理员可调 TG_NOTIFY_LEVEL)
+    [ "$_vh_prev" = "down" ] && log info "vnstat 已恢复运行, 流量统计继续采集"
+    return 0
 }
 
 # ============================================================
@@ -1508,6 +1582,7 @@ RunPatches() {
 # ============================================================
 Main() {
     LoadEnv
+    CheckVnstatHealth   # vnstat 停摆巡检: 状态迁移告警一次, 不阻断后续上报
     CollectRawTraffic
     CollectVnstatTraffic
     SubmitStatus
