@@ -77,6 +77,18 @@ RunUnlockCheck() {
     log info "开始服务解锁检测"
     cd /tmp || return
 
+    # ---- 复审 owner 裁定落档 (2026-10-01, 三项均 won't fix, 维持现状) ----
+    # f-16704404 Script1-4 四处缓存判断 [ ! -f ](失败/空结果残留的 0 字节
+    #   文件同样判"已缓存"跳过重探): 属可接受 — 缓存生命周期即一次安装周期
+    #   (/tmp 重启自清, 安装器 Step2.6 补报也依赖缓存命中免重探), 恢复路径是
+    #   manage.sh unlock(清缓存强制重跑)/重装; 检测站点不可达时自动重探也
+    #   只会重复失败, 故不改 [ ! -s ] 自愈
+    # 明文拉取并 root 执行(check.unlock.media 不写协议头, curl 默认 http 起跳;
+    #   main 分支同项 f-8e63a1a9 已裁): 本步本身即网络测试性质 — 测这条网络
+    #   是否正常、能否解锁, owner 接受链路风险, 维持现状不改协议
+    # f-6a248d80 下载无重试/超时(含 Script 2 wget): 一次性安装期脚本, 偶发
+    #   失败由 manage.sh unlock 人工补跑兜底; 主导故障是连不上检测站, 重试
+    #   收益低, 不与 SubmitUnlockCheck/RefreshXrayConfig 重试口径对齐
     # Script 1: check.unlock.media — Netflix/Disney/ChatGPT/Claude/Gemini 等
     if [ ! -f /tmp/media_unlock_clean.txt ]; then
         log info "执行 check.unlock.media..."
@@ -90,6 +102,8 @@ RunUnlockCheck() {
     fi
 
     # Script 2: yeahwu/check — TikTok/Bilibili/iQIYI
+    # (wget 无 --timeout/--tries — 同 f-6a248d80 裁定 won't fix; 缓存判断
+    #  同 f-16704404 裁定, 见上方落档)
     if [ ! -f /tmp/media_check_clean.txt ]; then
         log info "执行 yeahwu/check..."
         wget -qO /tmp/_media_check_script.sh https://github.com/yeahwu/check/raw/main/check.sh 2>/dev/null || true
