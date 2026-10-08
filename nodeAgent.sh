@@ -648,18 +648,46 @@ SyncSSL() {
         rm -rf "$_ssl_tmp"; return 0
     fi
 
-    # 8) 原子部署 — install 单文件覆盖, 权限收紧 (key 600 / pem 644)
-    if ! install -m 0600 "${_ssl_tmp}/${_root_domain}.key" "$_key_file" 2>/dev/null; then
-        log error "SyncSSL: 写入 ${_key_file} 失败"
+    # 8) 成对原子部署 — 同目录先写 .new 临时文件, key/pem 双文件就绪后依次 mv
+    #    (rename, 原子) 生效; 第二个 mv 失败时用旧 key 备份原子回滚 — 磁盘上
+    #    永远只有成对证书 (直接 install 覆盖生效路径, 半途失败会留下
+    #    "新 key + 旧 pem" 错配对或截断旧文件, 最长挂 24h, 期间任何重启都
+    #    会加载错配证书 → TLS 握手失败、节点下线)
+    _key_new="${_key_file}.new"
+    _pem_new="${_pem_file}.new"
+    if ! install -m 0600 "${_ssl_tmp}/${_root_domain}.key" "$_key_new" 2>/dev/null; then
+        log error "SyncSSL: 写入 ${_key_new} 失败, 保持旧证书"
         rm -rf "$_ssl_tmp"; return 0
     fi
-    if ! install -m 0644 "${_ssl_tmp}/${_root_domain}.pem" "$_pem_file" 2>/dev/null; then
-        log error "SyncSSL: 写入 ${_pem_file} 失败"
+    if ! install -m 0644 "${_ssl_tmp}/${_root_domain}.pem" "$_pem_new" 2>/dev/null; then
+        log error "SyncSSL: 写入 ${_pem_new} 失败, 保持旧证书"
+        rm -f "$_key_new"; rm -rf "$_ssl_tmp"; return 0
+    fi
+    # 旧 key 备份 (供第二个 mv 失败时原子回滚); 备份失败则放弃本次部署
+    _had_key=0
+    [ -f "$_key_file" ] && _had_key=1
+    if [ "$_had_key" = 1 ] && ! cp -fp "$_key_file" "${_ssl_tmp}/old.key" 2>/dev/null; then
+        log error "SyncSSL: 备份 ${_key_file} 失败, 保持旧证书"
+        rm -f "$_key_new" "$_pem_new"; rm -rf "$_ssl_tmp"; return 0
+    fi
+    if ! mv -f "$_key_new" "$_key_file" 2>/dev/null; then
+        log error "SyncSSL: 替换 ${_key_file} 失败, 保持旧证书"
+        rm -f "$_key_new" "$_pem_new"; rm -rf "$_ssl_tmp"; return 0
+    fi
+    if ! mv -f "$_pem_new" "$_pem_file" 2>/dev/null; then
+        log error "SyncSSL: 替换 ${_pem_file} 失败, 回滚 ${_key_file}"
+        rm -f "$_pem_new"
+        if [ "$_had_key" = 1 ]; then
+            mv -f "${_ssl_tmp}/old.key" "$_key_file" 2>/dev/null \
+                || log error "SyncSSL: ${_key_file} 回滚失败 — 磁盘可能残留新 key+旧 pem, 请人工检查修复后再重启"
+        else
+            rm -f "$_key_file"
+        fi
         rm -rf "$_ssl_tmp"; return 0
     fi
     rm -rf "$_ssl_tmp"
     _updated=1
-    log info "SyncSSL: ${_root_domain} 证书已原子更新 (key/pem 配对校验通过)"
+    log info "SyncSSL: ${_root_domain} 证书已成对原子更新 (key/pem 配对校验通过)"
 
     # 9) 全部通过
     log info "SyncSSL: ${_root_domain} 证书同步完成 (updated=${_updated})"

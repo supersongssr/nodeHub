@@ -15,8 +15,10 @@
 #     cmp 发现内容相同照样不重启
 #
 # 安全设计 (镜像 nodeAgent.sh::SyncSSL 范式):
-#   * 两阶段: 先全部下载+校验, 校验通过的域名才统一落盘 → 杜绝
-#     "新 key + 旧 pem" 半更新中间态被进程重启时加载 (TLS 握手失败)
+#   * 两阶段: 先全部下载+校验, 校验通过的域名才统一落盘; 落盘为成对原子部署
+#     (同目录 .new 临时文件 → 双 mv 生效, 第二个 mv 失败原子回滚旧对) →
+#     磁盘上永远只有成对证书, 杜绝 "新 key + 旧 pem" 半更新中间态被进程
+#     重启时加载 (TLS 握手失败); 回滚失败则跳过重启, 保持内存旧证书
 #   * 校验: PEM/KEY 文件头 + openssl 公钥配对 (openssl 可用时)
 #   * 只处理 /etc/ssl 顶层 *.pem 及同名 .key, 不递归 /etc/ssl/certs、
 #     /etc/ssl/private (系统 CA 目录); *.bak* / *backup* / *.self.* /
@@ -162,22 +164,80 @@ SyncCerts() {
         return "$_fail"
     fi
 
-    # 6) 统一部署 — install 单文件覆盖 + 权限收紧 (key 600 / pem 644)
+    # 6) 成对原子部署 — 同目录先写 .new 临时文件, key/pem 双文件就绪后依次
+    #    mv (rename, 原子) 生效; 第二个 mv 失败时用旧 key 备份原子回滚 —
+    #    磁盘上永远只有成对证书 (install 直接覆盖生效路径, 半途失败会留下
+    #    "新 key + 旧 pem" 错配对或截断旧文件, 且旧代码还会接着无脑重启)
     Log "📝 检测到证书变化:${_changed} → 开始部署"
+    _deploy_fail=0                       # 有域名部署失败 (均已回滚, 保持旧证书对)
+    _broken=0                            # 回滚失败 — 磁盘可能残留不成对证书
     for _d in $_changed; do
-        if ! install -m 0600 "${CACHE_DIR}/${_d}.key" "${SSL_DIR}/${_d}.key" 2>/dev/null; then
-            Log "❌ 写入 ${SSL_DIR}/${_d}.key 失败"
-            _fail=1
+        _knew="${SSL_DIR}/${_d}.key.new"
+        _pnew="${SSL_DIR}/${_d}.pem.new"
+        _kold="${CACHE_DIR}/${_d}.key.old"
+        if ! install -m 0600 "${CACHE_DIR}/${_d}.key" "$_knew" 2>/dev/null; then
+            Log "❌ 写入 ${_knew} 失败 — ${_d} 保持旧证书"
+            _fail=1; _deploy_fail=1
+            continue
         fi
-        if ! install -m 0644 "${CACHE_DIR}/${_d}.pem" "${SSL_DIR}/${_d}.pem" 2>/dev/null; then
-            Log "❌ 写入 ${SSL_DIR}/${_d}.pem 失败"
-            _fail=1
+        if ! install -m 0644 "${CACHE_DIR}/${_d}.pem" "$_pnew" 2>/dev/null; then
+            Log "❌ 写入 ${_pnew} 失败 — ${_d} 保持旧证书"
+            rm -f "$_knew" 2>/dev/null
+            _fail=1; _deploy_fail=1
+            continue
         fi
+        # 旧 key 备份 (供第二个 mv 失败时原子回滚); 备份失败则放弃本域名部署
+        _had_key=0
+        [ -f "${SSL_DIR}/${_d}.key" ] && _had_key=1
+        if [ "$_had_key" = 1 ] && ! cp -fp "${SSL_DIR}/${_d}.key" "$_kold" 2>/dev/null; then
+            Log "❌ 备份 ${SSL_DIR}/${_d}.key 失败 — ${_d} 保持旧证书"
+            rm -f "$_knew" "$_pnew" 2>/dev/null
+            _fail=1; _deploy_fail=1
+            continue
+        fi
+        if ! mv -f "$_knew" "${SSL_DIR}/${_d}.key" 2>/dev/null; then
+            Log "❌ 替换 ${SSL_DIR}/${_d}.key 失败 — ${_d} 保持旧证书"
+            rm -f "$_knew" "$_pnew" 2>/dev/null
+            _fail=1; _deploy_fail=1
+            continue
+        fi
+        if ! mv -f "$_pnew" "${SSL_DIR}/${_d}.pem" 2>/dev/null; then
+            Log "❌ 替换 ${SSL_DIR}/${_d}.pem 失败 — 回滚 ${_d}.key"
+            rm -f "$_pnew" 2>/dev/null
+            if [ "$_had_key" = 1 ]; then
+                if mv -f "$_kold" "${SSL_DIR}/${_d}.key" 2>/dev/null; then
+                    Log "↩️  ${_d} 已回滚为旧证书对"
+                else
+                    Log "❌ ${_d} key 回滚失败 — 磁盘可能残留新 key + 旧 pem, 请人工检查修复后再重启"
+                    _broken=1
+                fi
+            else
+                rm -f "${SSL_DIR}/${_d}.key" 2>/dev/null
+                Log "↩️  ${_d} 无旧 key (首次部署), 已移除新 key 恢复部署前状态"
+            fi
+            _fail=1; _deploy_fail=1
+            continue
+        fi
+        rm -f "$_kold" 2>/dev/null
+        Log "✅ ${_d} 证书已更新"
     done
-    Log "✅ 部署完成:${_changed}"
+    if [ "$_deploy_fail" = 1 ]; then
+        Log "⚠️  部署结束 (部分域名失败, 均已回滚保持旧证书对):${_changed}"
+    else
+        Log "✅ 部署完成:${_changed}"
+    fi
 
     # 7) 有更新 → 重启 nginx + xray 让新证书生效
-    RestartServices || _fail=1
+    #    门禁: 仅当回滚失败 (_broken=1, 磁盘可能存在不成对证书) 时跳过重启,
+    #    运行中服务继续用内存里的旧证书; 普通部署失败的域名已回滚为旧证书
+    #    对, 重启安全, 且成功域名的证书需本次重启才生效 (下次运行 cmp 无变化
+    #    不会再重启, 一刀切跳过会让新证书无限期不生效)
+    if [ "$_broken" = 1 ]; then
+        Log "⛔ 存在回滚失败的域名, 跳过重启 — 请人工检查 ${SSL_DIR} 后手动重启 nginx/xray"
+        _fail=1
+    else
+        RestartServices || _fail=1
+    fi
     return "$_fail"
 }
 
