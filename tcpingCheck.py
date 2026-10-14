@@ -6,7 +6,8 @@
   从 proxyDiagnose.py 的 _check_node_port_cn_tcping (NW10) 提取核心探测逻辑,
   做成独立 Python3 模块 (零第三方依赖, 仅标准库), 供:
     · nodeAgent.sh 每周期 (小时) 调用: 检测本节点 NODE_PORT 是否被墙 +
-      推送结果至 ServerStatus-Rust-Moniter (POST /api/v1/status/tcping);
+      推送结果至 ServerStatus-Rust-Moniter (POST /api/v1/status/tcping,
+      Bearer 鉴权; 旧 /ingest/tcping 为 deprecated 垫片, Sunset 2026-09-29);
       被墙处置 (换端口重装等) 由远程面板基于推送数据统一下发, 节点端
       不自动换端口 (block_level 供面板区分端口级/IP级处置依据)
     · 人工排障: python3 tcpingCheck.py --ip 1.2.3.4 --port 443 [--xcheck always]
@@ -31,6 +32,8 @@
   blocked     = 有探测点的大陆组 (ct/cu/cm/vendor) 全部失败 且 海外至少 1 个成功
                 (海外对照证明端口活着 —— 全球全断是端口没开/安全组, 不是被墙)
   unreachable = 海外也全失败 (端口全球不可达, 非大陆方向问题)
+  no_contrast = 海外对照组零成功样本 (如轮询窗口耗尽) — 无对照不可判定,
+                绝不落 ok (否则会把真实被墙误判成「恢复」)
   partial     = 有组部分失败, 无组全断
   ok          = 全部正常
   not_listening = 本机 node_port 无 TCP 监听 (纯 UDP: Hysteria2 直听) —
@@ -153,6 +156,8 @@ def _http(url: str, cookie: Optional[str] = None, data: Optional[bytes] = None,
 # 探测点分组表 (进程内缓存; 每次任务从页面节点表解析)
 #   {node_id: group}  group ∈ ct/cu/cm/vendor/os
 _NODE_GROUPS: Dict[str, str] = {}
+# 分组表「解析失败」告警标记 (单次进程内只告警一次; 主测/交叉验证会各调一次 tcping)
+_parse_fail_warned = False
 
 
 def parse_node_labels(page_html: str) -> int:
@@ -221,10 +226,18 @@ def tcping(ip: str, port: int) -> Dict[str, Any]:
         time.sleep(BROWSERCHECK_DELAY)
         page = _http("%s/%s?browsercheck=ok" % (TCPING_BASE, urllib.parse.quote(tgt)),
                      cookie=cookie)
+        global _parse_fail_warned
         if not _NODE_GROUPS:
             n = parse_node_labels(page)
             if n:
                 _log("探测点分组表解析: %d 个 (%s)" % (n, groups_summary()))
+            elif not _parse_fail_warned:
+                # 解析 0 个 = 页面格式疑似变更 — 静默降级会让三网判别悄悄失效
+                # (大陆点全并入 vendor 组, 方向性被墙漏报), 必须告警留痕
+                _parse_fail_warned = True
+                _warn("探测点分组表解析到 0 个探测点 (页面格式疑似变更?), "
+                      "退化为兜底口径: 大陆探测点全部并入 vendor 组, "
+                      "电信/联通/移动方向判别失效, 被墙判定可能漏报")
         tok = re.search(r'var taskStartToken = "([^"]*)"', page)
         qry = re.search(r'var taskStartQuery = "([^"]*)"', page)
         if not (tok and qry):
@@ -314,25 +327,34 @@ def group_verdict(stat: Dict[str, Any], group: str) -> str:
 
 
 def classify(stat: Dict[str, Any]) -> str:
-    """整体状态: blocked/unreachable/partial/ok/no_cn_probe/no_result/error.
+    """整体状态: blocked/unreachable/partial/no_contrast/ok/no_cn_probe/no_result/error.
 
     blocked = 有探测点的大陆组 (ct/cu/cm/vendor) 全部 blocked —— 覆盖
     「全组被墙」与「仅某一运营商方向被墙」两种形态;
-    unreachable = 海外也全部失败 (端口全球不可达, 非大陆方向问题);
+    unreachable = 海外也全部失败且大陆侧无任何成功样本 (端口全球不可达,
+    非大陆方向问题 — 大陆全通时端口明明活着, 不能标「全球不可达」);
+    no_contrast = 海外对照组零成功样本 (如轮询窗口耗尽只拿到大陆全失败结果) —
+    无对照即不可判定, 绝不能落 ok/partial 且优先级高于 partial (否则会被
+    partial 抢先, 经恢复判定把真实被墙误判成「恢复」、误关告警);
     宁可漏报不可误报 (海外零成功/零样本时不判 blocked).
     """
     if stat.get("status") != "ok":
         return "error"
     groups = stat.get("groups") or {}
     cn_total = sum((groups.get(g) or {"total": 0})["total"] for g, _ in ISP_GROUPS)
+    cn_ok = sum((groups.get(g) or {"ok": 0})["ok"] for g, _ in ISP_GROUPS)
     os_g = groups.get("os") or {"ok": 0, "total": 0}
     if cn_total == 0 and os_g["total"] == 0:
         return "no_result"
-    if os_g["total"] > 0 and os_g["ok"] == 0:
+    if os_g["total"] > 0 and os_g["ok"] == 0 and cn_ok == 0:
         return "unreachable"
     verdicts = {g: group_verdict(stat, g) for g, _ in ISP_GROUPS}
     if "blocked" in verdicts.values():
         return "blocked"
+    # no_contrast 必须先于 partial: 任一有探测点的大陆组全断且无海外对照时,
+    # 整体不可判定 — 被_partial_抢先会经恢复判定 (ok/partial) 误关仍被墙的告警
+    if "no_contrast" in verdicts.values():
+        return "no_contrast"
     if "partial" in verdicts.values():
         return "partial"
     if cn_total == 0:
@@ -566,14 +588,18 @@ def resolve_target(ip_arg: Optional[str], port_arg: Optional[int],
     if port <= 0:
         port = 443
 
-    stat_user = _norm_ip(str(nj.get("stat_user") or "")) or _norm_ip(ne.get("stat_user") or "")
+    # stat_user 优先级与 docstring/--stat-user help 一致:
+    #   ~/node.stat_user 文件 > node.json > node.env > md5(ip)
+    # (文件是 nodeHub 工具链重写的最新身份; 换 IP 后旧 node.json 可能残留过期值)
+    stat_user = ""
+    _su_path = os.path.join(os.path.expanduser("~"), "node.stat_user")
+    try:
+        with open(_su_path, encoding="ascii") as f:
+            stat_user = f.read().strip()
+    except OSError:
+        stat_user = ""
     if not stat_user:
-        p = os.path.join(os.path.expanduser("~"), "node.stat_user")
-        try:
-            with open(p, encoding="ascii") as f:
-                stat_user = f.read().strip()
-        except OSError:
-            stat_user = ""
+        stat_user = _norm_ip(str(nj.get("stat_user") or "")) or _norm_ip(ne.get("stat_user") or "")
     if not stat_user and ip:
         stat_user = hashlib.md5(ip.encode()).hexdigest()
 
@@ -591,6 +617,12 @@ def _log(msg: str) -> None:
     if _VERBOSE:
         sys.stderr.write("[tcpingCheck] %s\n" % msg)
         sys.stderr.flush()
+
+
+def _warn(msg: str) -> None:
+    """无条件 stderr 告警 (默认静默模式下也必须可见的口径退化/异常)."""
+    sys.stderr.write("[tcpingCheck] WARNING: %s\n" % msg)
+    sys.stderr.flush()
 
 
 def run_check(ip_arg: Optional[str] = None, port_arg: Optional[int] = None,
