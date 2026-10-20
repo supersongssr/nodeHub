@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.9.6-20260927"
+VERSION="v2.9.8-20261020"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -1015,7 +1015,7 @@ TuneKernelForProxy() {
     log info "开始代理节点内核网络调优"
 
     _tune_file=/etc/sysctl.d/99-nodehub-proxy.conf
-    mkdir -p /etc/sysctl.d /etc/modprobe.d
+    mkdir -p /etc/sysctl.d /etc/modprobe.d /etc/modules-load.d
 
     # ---- 1) conntrack + 网络栈调优 (覆盖式写入, 幂等) ----
     cat > "$_tune_file" <<'SYSCTL_EOF'
@@ -1042,10 +1042,39 @@ SYSCTL_EOF
 options nf_conntrack hashsize=65536
 MODPROBE_EOF
 
+    # ---- 1.5) 显式加载 nf_conntrack 模块 ----
+    # net.netfilter.nf_conntrack_* 的 sysctl 键仅在模块加载后才存在; 全新 KVM 节点
+    # 上模块按需加载未被触发 (本脚本只加 plain ACCEPT 规则, 不依赖 conntrack; 亦无
+    # Docker/TPROXY) → sysctl -p 因 6 个 conntrack 键不存在而退出 1 (其余键已应用,
+    # sysctl -p 是"全量尝试, 任一缺失即非零") → 逐条回退时 6 行全 warn
+    # (2026-10-20 节点1324 告警根因; 逐条 warn 又被 TG 节流吞掉, 只见第一条)。
+    #   * modprobe 立即拉起 → 键就位, 本轮 sysctl -p 即成功; hashsize 参数同时生效
+    #   * /etc/modules-load.d 保证重启后 systemd-modules-load 先于 systemd-sysctl
+    #     加载 (sysctl.service After=modules-load.service), 开机即应用调优 —
+    #     否则模块在 systemd-sysctl 之后才被按需加载时, sysctl.d 中的值无人补应用
+    #     → conntrack_max 回落默认值, "conntrack 打满死锁" 防护失效
+    # 容器/OpenVZ (共享内核, 模块不可加载): modprobe 失败仅 debug 留痕,
+    # 下方逐条回退按 "键不存在 → debug 跳过" 分流, 不按 warn 刷 TG (环境限制, 非故障)
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe nf_conntrack 2>/dev/null \
+            || log debug "modprobe nf_conntrack 失败 (容器/共享内核?), conntrack 调优将按可用性跳过"
+    fi
+    cat > /etc/modules-load.d/nodehub-nf_conntrack.conf <<'MODLOAD_EOF'
+# NodeHub: 开机由 systemd-modules-load 加载, 先于 systemd-sysctl 运行,
+# 保证 /etc/sysctl.d/99-nodehub-proxy.conf 的 conntrack 键开机即可应用
+nf_conntrack
+MODLOAD_EOF
+
     # 应用 sysctl — 单独加载本文件 (不碰 sysctl.conf, 避免被其中的空值/坏行影响)
     if ! sysctl -p "$_tune_file" >/dev/null 2>&1; then
         log warn "sysctl -p $_tune_file 失败, 逐条应用"
-        grep -vE '^\s*#|^\s*$' "$_tune_file" 2>/dev/null | while IFS= read -r _line; do
+        grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$_tune_file" 2>/dev/null | while IFS= read -r _line; do
+            _k=${_line%%=*}
+            _proc_k=$(printf '%s' "$_k" | tr '.' '/')
+            if [ ! -e "/proc/sys/${_proc_k}" ]; then
+                log debug "sysctl 键不存在, 跳过: ${_k} (模块未加载/容器环境; sysctl.d 已持久化, 模块可用后 sysctl --system 可补应用)"
+                continue
+            fi
             sysctl -w "$_line" >/dev/null 2>&1 || log warn "sysctl 应用失败: $_line"
         done
     fi
