@@ -523,10 +523,63 @@ WaitForAptLock() {
 # APT 安全包装器 — 先等待锁释放，再执行 apt-get 命令
 # 用法: AptGet <apt-get 的所有参数>
 # 例:   AptGet install -y -qq jq
+# 增强: install/upgrade 类命令因包索引过期或镜像不同步
+#       (404 Not Found / Failed to fetch / Unable to fetch /
+#        Unable to locate package / Hash Sum mismatch) 失败时,
+#       自动 apt-get update 刷新索引后原样重试一次 (2026-10-18 实例:
+#       security.debian.org 池中 ca-certificates 旧版 .deb 已下架,
+#       本地索引仍指向它 → 404, 重装即愈, 但当时无自愈逻辑直接中断);
+#       重试仍失败则如实返回非零 — 刻意不用 --fix-missing, 缺包宁可
+#       失败也不静默跳过 (避免 nginx 升级被 hold back 假成功)
 AptGet() {
     WaitForAptLock
-    DEBIAN_FRONTEND=noninteractive \
-    apt-get -o Dpkg::Options::="--force-confold" "$@"
+    _apt_out=$(DEBIAN_FRONTEND=noninteractive \
+        apt-get -o Dpkg::Options::="--force-confold" "$@" 2>&1) && _apt_rc=0 || _apt_rc=$?
+    if [ -n "$_apt_out" ]; then
+        printf '%s\n' "$_apt_out"
+    fi
+    if [ "$_apt_rc" -eq 0 ]; then
+        return 0
+    fi
+
+    # 仅对会下载 .deb 的命令做"刷新索引重试"; update 自身失败重试无意义
+    case "$1" in
+        install | reinstall | upgrade | full-upgrade | dist-upgrade) ;;
+        *) return "$_apt_rc" ;;
+    esac
+
+    # 命中"索引过期/镜像不同步"特征才值得刷新索引重试, 其余错误原样上抛
+    if ! printf '%s\n' "$_apt_out" | grep -qE \
+        'Failed to fetch|Unable to fetch|Unable to locate|Hash Sum mismatch|Size mismatch|404[[:space:]]+Not Found'; then
+        return "$_apt_rc"
+    fi
+
+    _apt_errs=$(printf '%s\n' "$_apt_out" | grep -E '^E:' | head -n 3 | tr '\n' ' ')
+    log warn "apt-get $* 失败 (退出码=${_apt_rc}): ${_apt_errs:-未知错误}"
+    log info "疑似包索引过期/镜像不同步, apt-get update 刷新索引后重试一次 ..."
+
+    # 刷新索引; 若仍失败则清空 lists 强制全量重建 (镜像边缘节点元数据不一致时需要)
+    WaitForAptLock
+    if ! DEBIAN_FRONTEND=noninteractive \
+        apt-get -o Dpkg::Options::="--force-confold" update -qq >/dev/null 2>&1; then
+        log warn "apt-get update 失败, 清空 /var/lib/apt/lists 后强制重建 ..."
+        rm -rf /var/lib/apt/lists/*
+        WaitForAptLock
+        DEBIAN_FRONTEND=noninteractive \
+            apt-get -o Dpkg::Options::="--force-confold" update -qq >/dev/null 2>&1 || true
+    fi
+
+    # 原样重试 (不加 --fix-missing)
+    WaitForAptLock
+    _apt_out=$(DEBIAN_FRONTEND=noninteractive \
+        apt-get -o Dpkg::Options::="--force-confold" "$@" 2>&1) && _apt_rc=0 || _apt_rc=$?
+    if [ -n "$_apt_out" ]; then
+        printf '%s\n' "$_apt_out"
+    fi
+    if [ "$_apt_rc" -ne 0 ]; then
+        log error "apt-get $* 刷新索引后重试仍失败 (退出码=${_apt_rc})"
+    fi
+    return "$_apt_rc"
 }
 
 # ============================================================
