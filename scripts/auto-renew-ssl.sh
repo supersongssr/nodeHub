@@ -139,6 +139,21 @@ RenewDomain() {
         rm -rf "$_tmp"; return 1
     fi
 
+    # 防降级 1: 远端证书不得已过期
+    # (2026-10-01 事故: 远端源 autorenewssldownload 提供已过期 2 天的旧证书,
+    #  本脚本把它覆盖到剩余 29 天的有效证书上, 致 monitor/pi-h138 等全线 TLS 告警)
+    if ! openssl x509 -in "${_tmp}/${_domain}.pem" -checkend 0 -noout >/dev/null 2>&1; then
+        Log "❌ ${_domain}: 远端证书已过期, 保留本地证书"
+        rm -rf "$_tmp"; return 1
+    fi
+
+    # 防降级 2: 远端证书剩余天数不得少于本地 (本地缺失/损坏时 _days<0, 不拦)
+    _new_days=$(DaysLeft "${_tmp}/${_domain}.pem")
+    if [ "$_days" -ge 0 ] && [ "$_new_days" -lt "$_days" ]; then
+        Log "❌ ${_domain}: 远端证书剩余 ${_new_days} 天 < 本地 ${_days} 天, 疑似源未续期, 保留本地证书"
+        rm -rf "$_tmp"; return 1
+    fi
+
     # 远端无更新则保持现状
     if [ -f "$_dest_pem" ] && cmp -s "${_tmp}/${_domain}.pem" "$_dest_pem" \
                             && cmp -s "${_tmp}/${_domain}.key" "$_dest_key"; then
