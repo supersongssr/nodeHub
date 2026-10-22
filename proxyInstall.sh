@@ -1132,6 +1132,39 @@ MODLOAD_EOF
     fi
 }
 
+# ============================================================
+# BBR 拥塞控制启用 — 检测未启用时下载并执行独立脚本 scripts/bbr_install.sh
+#   * 检测: 运行时拥塞控制算法是否为 bbr (已启用 → 直接跳过, 不发起网络请求)
+#   * 安装: FetchValidated 下载 ${NODEHUB_URL}/scripts/bbr_install.sh
+#           (非空 + #! 开头内容校验, 脏文件强制重下) 后 sh 执行
+#   * 子脚本职责: 内核版本/tcp_bbr 模块支持检测 → modprobe → sysctl.d 覆盖式
+#     持久化 (fq + bbr, 不产生重复行) → 清理 sysctl.conf 旧追加行 →
+#     sysctl -w 即时生效 → 复验 (详见 scripts/bbr_install.sh, 亦可人工单跑)
+#   * 失败不中断安装: BBR 是传输优化而非节点运行必需 (老内核/OpenVZ 共享
+#     内核等场景无法启用), log error 告警 (推 Telegram) 后继续主流程
+# ============================================================
+EnsureBBR() {
+    # 1. 已启用 → 幂等跳过 (不下载脚本, 不发起网络请求)
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+        log info "BBR 已启用，跳过"
+        return 0
+    fi
+
+    log info "检测到 BBR 未启用, 下载独立安装脚本 bbr_install.sh..."
+
+    _bbr_script=/tmp/bbr_install.sh
+    FetchValidated script "${_bbr_script}" "${NODEHUB_URL}/scripts/bbr_install.sh" \
+        || { log error "bbr_install.sh 下载或校验失败 (非空+#! 开头, 已尝试强制重下): ${NODEHUB_URL}/scripts/bbr_install.sh — BBR 未启用, 继续安装"; return 0; }
+    chmod +x "${_bbr_script}"
+
+    # 2. 执行独立脚本 (子进程内独立 set -eu; 失败仅告警不中断主流程)
+    if sh "${_bbr_script}"; then
+        log info "BBR 已由独立脚本 bbr_install.sh 启用"
+    else
+        log error "bbr_install.sh 执行失败 — BBR 未启用 (内核 < 4.9 / OpenVZ 共享内核 / sysctl 只读?), 节点仍可正常运行 (详见上方脚本日志)"
+    fi
+}
+
 InitSystem() {
     log info "开始系统基础调优"
     log debug "系统信息: $(uname -a)"
@@ -1145,16 +1178,9 @@ InitSystem() {
         ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
     log info "时区已设为 Asia/Shanghai"
 
-    if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-        {
-            echo "net.core.default_qdisc=fq"
-            echo "net.ipv4.tcp_congestion_control=bbr"
-        } >> /etc/sysctl.conf
-        sysctl -p 2>/dev/null || true
-        log info "BBR 已启用"
-    else
-        log info "BBR 已启用，跳过"
-    fi
+    # BBR 拥塞控制 — 未启用时由独立脚本 bbr_install.sh 安装
+    # (检测/持久化/清理 sysctl.conf 旧行/复验均在该子脚本, 亦可人工单跑)
+    EnsureBBR
 
     if [ "$(ulimit -n)" -lt 65535 ]; then
         {
