@@ -7,7 +7,7 @@
 
 set -eu
 
-VERSION="v2.9.7-20260930"
+VERSION="v2.9.8-20261020"
 ARIANG_VERSION="1.3.13"
 ARIANG_URL="https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip"
 ARIANG_DIR="/var/www/ariang"
@@ -523,10 +523,63 @@ WaitForAptLock() {
 # APT 安全包装器 — 先等待锁释放，再执行 apt-get 命令
 # 用法: AptGet <apt-get 的所有参数>
 # 例:   AptGet install -y -qq jq
+# 增强: install/upgrade 类命令因包索引过期或镜像不同步
+#       (404 Not Found / Failed to fetch / Unable to fetch /
+#        Unable to locate package / Hash Sum mismatch) 失败时,
+#       自动 apt-get update 刷新索引后原样重试一次 (2026-10-18 实例:
+#       security.debian.org 池中 ca-certificates 旧版 .deb 已下架,
+#       本地索引仍指向它 → 404, 重装即愈, 但当时无自愈逻辑直接中断);
+#       重试仍失败则如实返回非零 — 刻意不用 --fix-missing, 缺包宁可
+#       失败也不静默跳过 (避免 nginx 升级被 hold back 假成功)
 AptGet() {
     WaitForAptLock
-    DEBIAN_FRONTEND=noninteractive \
-    apt-get -o Dpkg::Options::="--force-confold" "$@"
+    _apt_out=$(DEBIAN_FRONTEND=noninteractive \
+        apt-get -o Dpkg::Options::="--force-confold" "$@" 2>&1) && _apt_rc=0 || _apt_rc=$?
+    if [ -n "$_apt_out" ]; then
+        printf '%s\n' "$_apt_out"
+    fi
+    if [ "$_apt_rc" -eq 0 ]; then
+        return 0
+    fi
+
+    # 仅对会下载 .deb 的命令做"刷新索引重试"; update 自身失败重试无意义
+    case "$1" in
+        install | reinstall | upgrade | full-upgrade | dist-upgrade) ;;
+        *) return "$_apt_rc" ;;
+    esac
+
+    # 命中"索引过期/镜像不同步"特征才值得刷新索引重试, 其余错误原样上抛
+    if ! printf '%s\n' "$_apt_out" | grep -qE \
+        'Failed to fetch|Unable to fetch|Unable to locate|Hash Sum mismatch|Size mismatch|404[[:space:]]+Not Found'; then
+        return "$_apt_rc"
+    fi
+
+    _apt_errs=$(printf '%s\n' "$_apt_out" | grep -E '^E:' | head -n 3 | tr '\n' ' ')
+    log warn "apt-get $* 失败 (退出码=${_apt_rc}): ${_apt_errs:-未知错误}"
+    log info "疑似包索引过期/镜像不同步, apt-get update 刷新索引后重试一次 ..."
+
+    # 刷新索引; 若仍失败则清空 lists 强制全量重建 (镜像边缘节点元数据不一致时需要)
+    WaitForAptLock
+    if ! DEBIAN_FRONTEND=noninteractive \
+        apt-get -o Dpkg::Options::="--force-confold" update -qq >/dev/null 2>&1; then
+        log warn "apt-get update 失败, 清空 /var/lib/apt/lists 后强制重建 ..."
+        rm -rf /var/lib/apt/lists/*
+        WaitForAptLock
+        DEBIAN_FRONTEND=noninteractive \
+            apt-get -o Dpkg::Options::="--force-confold" update -qq >/dev/null 2>&1 || true
+    fi
+
+    # 原样重试 (不加 --fix-missing)
+    WaitForAptLock
+    _apt_out=$(DEBIAN_FRONTEND=noninteractive \
+        apt-get -o Dpkg::Options::="--force-confold" "$@" 2>&1) && _apt_rc=0 || _apt_rc=$?
+    if [ -n "$_apt_out" ]; then
+        printf '%s\n' "$_apt_out"
+    fi
+    if [ "$_apt_rc" -ne 0 ]; then
+        log error "apt-get $* 刷新索引后重试仍失败 (退出码=${_apt_rc})"
+    fi
+    return "$_apt_rc"
 }
 
 # ============================================================
@@ -1015,7 +1068,7 @@ TuneKernelForProxy() {
     log info "开始代理节点内核网络调优"
 
     _tune_file=/etc/sysctl.d/99-nodehub-proxy.conf
-    mkdir -p /etc/sysctl.d /etc/modprobe.d
+    mkdir -p /etc/sysctl.d /etc/modprobe.d /etc/modules-load.d
 
     # ---- 1) conntrack + 网络栈调优 (覆盖式写入, 幂等) ----
     cat > "$_tune_file" <<'SYSCTL_EOF'
@@ -1042,10 +1095,39 @@ SYSCTL_EOF
 options nf_conntrack hashsize=65536
 MODPROBE_EOF
 
+    # ---- 1.5) 显式加载 nf_conntrack 模块 ----
+    # net.netfilter.nf_conntrack_* 的 sysctl 键仅在模块加载后才存在; 全新 KVM 节点
+    # 上模块按需加载未被触发 (本脚本只加 plain ACCEPT 规则, 不依赖 conntrack; 亦无
+    # Docker/TPROXY) → sysctl -p 因 6 个 conntrack 键不存在而退出 1 (其余键已应用,
+    # sysctl -p 是"全量尝试, 任一缺失即非零") → 逐条回退时 6 行全 warn
+    # (2026-10-20 节点1324 告警根因; 逐条 warn 又被 TG 节流吞掉, 只见第一条)。
+    #   * modprobe 立即拉起 → 键就位, 本轮 sysctl -p 即成功; hashsize 参数同时生效
+    #   * /etc/modules-load.d 保证重启后 systemd-modules-load 先于 systemd-sysctl
+    #     加载 (sysctl.service After=modules-load.service), 开机即应用调优 —
+    #     否则模块在 systemd-sysctl 之后才被按需加载时, sysctl.d 中的值无人补应用
+    #     → conntrack_max 回落默认值, "conntrack 打满死锁" 防护失效
+    # 容器/OpenVZ (共享内核, 模块不可加载): modprobe 失败仅 debug 留痕,
+    # 下方逐条回退按 "键不存在 → debug 跳过" 分流, 不按 warn 刷 TG (环境限制, 非故障)
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe nf_conntrack 2>/dev/null \
+            || log debug "modprobe nf_conntrack 失败 (容器/共享内核?), conntrack 调优将按可用性跳过"
+    fi
+    cat > /etc/modules-load.d/nodehub-nf_conntrack.conf <<'MODLOAD_EOF'
+# NodeHub: 开机由 systemd-modules-load 加载, 先于 systemd-sysctl 运行,
+# 保证 /etc/sysctl.d/99-nodehub-proxy.conf 的 conntrack 键开机即可应用
+nf_conntrack
+MODLOAD_EOF
+
     # 应用 sysctl — 单独加载本文件 (不碰 sysctl.conf, 避免被其中的空值/坏行影响)
     if ! sysctl -p "$_tune_file" >/dev/null 2>&1; then
         log warn "sysctl -p $_tune_file 失败, 逐条应用"
-        grep -vE '^\s*#|^\s*$' "$_tune_file" 2>/dev/null | while IFS= read -r _line; do
+        grep -vE '^[[:space:]]*#|^[[:space:]]*$' "$_tune_file" 2>/dev/null | while IFS= read -r _line; do
+            _k=${_line%%=*}
+            _proc_k=$(printf '%s' "$_k" | tr '.' '/')
+            if [ ! -e "/proc/sys/${_proc_k}" ]; then
+                log debug "sysctl 键不存在, 跳过: ${_k} (模块未加载/容器环境; sysctl.d 已持久化, 模块可用后 sysctl --system 可补应用)"
+                continue
+            fi
             sysctl -w "$_line" >/dev/null 2>&1 || log warn "sysctl 应用失败: $_line"
         done
     fi
@@ -1103,6 +1185,39 @@ MODPROBE_EOF
     fi
 }
 
+# ============================================================
+# BBR 拥塞控制启用 — 检测未启用时下载并执行独立脚本 scripts/bbr_install.sh
+#   * 检测: 运行时拥塞控制算法是否为 bbr (已启用 → 直接跳过, 不发起网络请求)
+#   * 安装: FetchValidated 下载 ${NODEHUB_URL}/scripts/bbr_install.sh
+#           (非空 + #! 开头内容校验, 脏文件强制重下) 后 sh 执行
+#   * 子脚本职责: 内核版本/tcp_bbr 模块支持检测 → modprobe → sysctl.d 覆盖式
+#     持久化 (fq + bbr, 不产生重复行) → 清理 sysctl.conf 旧追加行 →
+#     sysctl -w 即时生效 → 复验 (详见 scripts/bbr_install.sh, 亦可人工单跑)
+#   * 失败不中断安装: BBR 是传输优化而非节点运行必需 (老内核/OpenVZ 共享
+#     内核等场景无法启用), log error 告警 (推 Telegram) 后继续主流程
+# ============================================================
+EnsureBBR() {
+    # 1. 已启用 → 幂等跳过 (不下载脚本, 不发起网络请求)
+    if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+        log info "BBR 已启用，跳过"
+        return 0
+    fi
+
+    log info "检测到 BBR 未启用, 下载独立安装脚本 bbr_install.sh..."
+
+    _bbr_script=/tmp/bbr_install.sh
+    FetchValidated script "${_bbr_script}" "${NODEHUB_URL}/scripts/bbr_install.sh" \
+        || { log error "bbr_install.sh 下载或校验失败 (非空+#! 开头, 已尝试强制重下): ${NODEHUB_URL}/scripts/bbr_install.sh — BBR 未启用, 继续安装"; return 0; }
+    chmod +x "${_bbr_script}"
+
+    # 2. 执行独立脚本 (子进程内独立 set -eu; 失败仅告警不中断主流程)
+    if sh "${_bbr_script}"; then
+        log info "BBR 已由独立脚本 bbr_install.sh 启用"
+    else
+        log error "bbr_install.sh 执行失败 — BBR 未启用 (内核 < 4.9 / OpenVZ 共享内核 / sysctl 只读?), 节点仍可正常运行 (详见上方脚本日志)"
+    fi
+}
+
 InitSystem() {
     log info "开始系统基础调优"
     log debug "系统信息: $(uname -a)"
@@ -1116,16 +1231,9 @@ InitSystem() {
         ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
     log info "时区已设为 Asia/Shanghai"
 
-    if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
-        {
-            echo "net.core.default_qdisc=fq"
-            echo "net.ipv4.tcp_congestion_control=bbr"
-        } >> /etc/sysctl.conf
-        sysctl -p 2>/dev/null || true
-        log info "BBR 已启用"
-    else
-        log info "BBR 已启用，跳过"
-    fi
+    # BBR 拥塞控制 — 未启用时由独立脚本 bbr_install.sh 安装
+    # (检测/持久化/清理 sysctl.conf 旧行/复验均在该子脚本, 亦可人工单跑)
+    EnsureBBR
 
     if [ "$(ulimit -n)" -lt 65535 ]; then
         {
